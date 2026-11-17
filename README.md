@@ -126,6 +126,17 @@ tilth install codex            # ~/.codex/config.toml
 tilth install amp              # ~/.config/amp/settings.json
 tilth install droid            # ~/.factory/mcp.json
 tilth install antigravity      # ~/.gemini/antigravity/mcp_config.json
+tilth install zed              # ~/.config/zed/settings.json
+tilth install copilot-cli      # ~/.copilot/mcp-config.json
+tilth install augment          # ~/.augment/settings.json
+tilth install kiro             # ~/.kiro/settings/mcp.json
+tilth install kilo-code        # VS Code globalStorage (extension)
+tilth install cline            # VS Code globalStorage (extension)
+tilth install roo-code         # VS Code globalStorage (extension)
+tilth install trae             # .trae/mcp.json (project scope)
+tilth install qwen-code        # ~/.qwen/settings.json
+tilth install crush            # ~/.config/crush/crush.json
+tilth install pi               # ~/.pi/agent/mcp.json
 ```
 
 Add `--edit` to enable hash-anchored file editing (see [Edit mode](#edit-mode)):
