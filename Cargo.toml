@@ -12,7 +12,7 @@
 [package]
 edition = "2021"
 name = "tilth"
-version = "0.7.0"
+version = "0.8.0"
 build = false
 autolib = false
 autobins = false
@@ -86,6 +86,9 @@ version = "1"
 [dependencies.streaming-iterator]
 version = "0.1"
 
+[dependencies.terminal_size]
+version = "0.4"
+
 [dependencies.toml]
 version = "0.8"
 
@@ -115,6 +118,9 @@ version = "0.23"
 
 [dependencies.tree-sitter-kotlin-ng]
 version = "1.1"
+
+[dependencies.tree-sitter-md]
+version = "0.5"
 
 [dependencies.tree-sitter-php]
 version = "0.24"
