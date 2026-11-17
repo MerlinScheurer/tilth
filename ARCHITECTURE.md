@@ -16,7 +16,7 @@ configs, and an npm wrapper that fetches a prebuilt binary on
 
 The repository is a Cargo workspace of two crates:
 
-- **`crates/tilth-core`** is the parsing substrate as a library:
+- **`crates/tilth-core-fork`** is the parsing substrate as a library:
   language detection and the per-language spec table, tree-sitter
   outline entries, test structure, import resolution, the shared
   directory walker, call sites, callees, enclosing scopes, file-level
@@ -28,11 +28,11 @@ The repository is a Cargo workspace of two crates:
   search, ranking, editing and install.
 
 The line between them is data versus rendering, so a change to what a
-tool prints stays in the binary. Other crates depend on `tilth-core`,
+tool prints stays in the binary. Other crates depend on `tilth-core-fork`,
 so the items re-exported at its root are a public API, pinned by
-`crates/tilth-core/tests/api.rs`. Its modules are `#[doc(hidden)]`:
+`crates/tilth-core-fork/tests/api.rs`. Its modules are `#[doc(hidden)]`:
 the binary reaches into them, nothing else should. The two crates
-share one version; `release.yml` publishes `tilth-core` first.
+share one version; `release.yml` publishes `tilth-core-fork` first.
 
 The single most useful function for orienting yourself is
 `lib.rs::run_inner` — every search query funnels through it.
@@ -40,7 +40,7 @@ The single most useful function for orienting yourself is
 ## Layout map
 
 ```
-crates/tilth-core/src/
+crates/tilth-core-fork/src/
 ├── lib.rs           The public API: re-exports at the crate root
 ├── types.rs         Shared types: Lang, FileType, OutlineEntry, OutlineKind
 ├── error.rs         TilthError (NotFound, PermissionDenied,
@@ -408,12 +408,12 @@ and one rule. The ordering encodes the precedence policy ("globs
 before paths," "regex first if metachars present," "filesystem only
 checked when the shape suggests a file").
 
-## Search subsystem (`src/search/`, `crates/tilth-core/src/search/`)
+## Search subsystem (`src/search/`, `crates/tilth-core-fork/src/search/`)
 
 The search subsystem is the largest area of code. Symbol search,
 content search, ranking, faceting and every formatter live in the
 binary's `src/search/`. The cross-file queries that return data live in
-`tilth-core`'s `search/`: the walker, call sites, callees, enclosing
+`tilth-core-fork`'s `search/`: the walker, call sites, callees, enclosing
 scopes and dependency analysis. The walker preamble (size gating +
 mtime + bloom filter) is factored into `bloom_walk.rs` so all
 relational paths share it; AST-scope walking is in `scope.rs`; the
@@ -426,7 +426,7 @@ and leaks it, so it hands out a `&'static Query` and the lock covers only
 the lookup. Threads in a parallel walk then match side by side. The leak
 is one query per grammar and query text, a fixed set.
 
-### Walker and ignore policy (`tilth-core` `search/walk.rs`)
+### Walker and ignore policy (`tilth-core-fork` `search/walk.rs`)
 
 `walker(walk)` builds an `ignore::WalkParallel` with tilth's opinionated
 defaults from a `Walk`: the scope, an optional glob, and the run's
@@ -594,7 +594,7 @@ These produce derived views from the same walker + tree-sitter
 machinery:
 
 - **Callers** (`callers.rs`, both crates). `find_callers_batch`
-  (`tilth-core`) is the single tree-sitter walk that resolves call sites for any number of target
+  (`tilth-core-fork`) is the single tree-sitter walk that resolves call sites for any number of target
   symbols (1 to N) — `search_callers_expanded` calls it with a
   one-element set, the deps / blast / 2nd-hop paths call it with the
   full set. The walk runs to the end unless the caller passes a
@@ -632,7 +632,7 @@ machinery:
 - **Siblings** (`siblings.rs`) — extract the surrounding outline
   context (the entries immediately before and after the matched
   definition).
-- **Deps** (`deps.rs`, both crates) — `analyze_deps` (`tilth-core`)
+- **Deps** (`deps.rs`, both crates) — `analyze_deps` (`tilth-core-fork`)
   is what `tilth_deps` runs. Returns a `DepsResult` with `Uses` (local
   + external) and every dependent in `Used by`. A dependent calls one
   of the file's names (at most `MAX_EXPORTED_SYMBOLS`, chosen by what
@@ -782,13 +782,13 @@ Two helpers feed the MCP layer:
   (`and 4 more`). `read::related_hint` writes the line for the CLI and
   MCP reads alike. Deps and callee resolution use the full list.
 
-## Language layer (`crates/tilth-core/src/lang/`)
+## Language layer (`crates/tilth-core-fork/src/lang/`)
 
 `Lang` and `FileType` are carried through the type system so downstream
 code never re-detects file kind. Adding a language is mechanical — the
 compiler tells you every site to update:
 
-- Add an arm to the `Lang` enum (`tilth-core`'s `types.rs`).
+- Add an arm to the `Lang` enum (`tilth-core-fork`'s `types.rs`).
 - Add an extension match to `lang::detect_file_type`.
 - Add a tree-sitter binding to `lang::outline::outline_language` (or
   return `None` to skip outlines).
@@ -835,7 +835,7 @@ Tilth keeps three pieces of state across calls. Lifetimes are
 deliberately scoped — only `OutlineCache`, `Session`, and
 `BloomFilterCache` survive between MCP requests.
 
-### `OutlineCache` (`tilth-core` `cache.rs`)
+### `OutlineCache` (`tilth-core-fork` `cache.rs`)
 
 Two `DashMap` tables, both keyed by path, each value carrying the
 file's `mtime`:
@@ -894,7 +894,7 @@ maps. Poison handling is uniform via
 try to handle a poisoned mutex specially; the data is best-effort
 telemetry.
 
-### `BloomFilterCache` (`tilth-core` `index/bloom.rs`)
+### `BloomFilterCache` (`tilth-core-fork` `index/bloom.rs`)
 
 Per-file Bloom filters that answer "does file X contain symbol Y?" in
 constant time. Used by `callers.rs` and `callees.rs` to skip files
@@ -1111,13 +1111,13 @@ A handful of small files cut across every subsystem.
   text is git's own words after the command that failed; nothing parses
   git's stderr, because git translates it. `tests/git_runner.rs` fails
   on a `Command::new("git")` anywhere else outside test code.
-- **`error.rs`** (`tilth-core`) — `TilthError` enum (`NotFound`, `PermissionDenied`,
+- **`error.rs`** (`tilth-core-fork`) — `TilthError` enum (`NotFound`, `PermissionDenied`,
   `InvalidQuery`, `IoError`, `ParseError`) with `Display` impls that
   format human-readable messages and include suggestions where
   relevant.
 - **`types.rs`** — already covered above; the type alphabet that every
   module speaks. `Lang` / `FileType` / `OutlineEntry` / `OutlineKind`
-  live in `tilth-core`; `Match` / `SearchResult` / `FacetTotals` /
+  live in `tilth-core-fork`; `Match` / `SearchResult` / `FacetTotals` /
   `ViewMode` / `QueryType` live in the binary.
 
 ## Auxiliary modules
@@ -1150,7 +1150,7 @@ user-facing.
 
 Concrete "if you wanted to change X, edit Y":
 
-- **Add a new language.** `Lang` arm in `tilth-core`'s `types.rs` → extension match in
+- **Add a new language.** `Lang` arm in `tilth-core-fork`'s `types.rs` → extension match in
   `lang::detect_file_type` → tree-sitter binding in
   `lang::outline::outline_language`. The compiler will tell you what
   else needs touching (the `match` over `Lang` in
@@ -1169,7 +1169,7 @@ Concrete "if you wanted to change X, edit Y":
   per-facet limit in `search/truncate.rs` → renderer entry in
   `search/mod.rs::format_search_result`.
 - **Add a new outline strategy** (e.g. for a non-code structured
-  format). `FileType` arm in `tilth-core`'s `types.rs` → extension match in
+  format). `FileType` arm in `tilth-core-fork`'s `types.rs` → extension match in
   `lang::detect_file_type` → outline file in `read/outline/` →
   dispatch arm in `read/outline/mod.rs`.
 - **Add a new edit policy** (e.g. structured-edit instead of

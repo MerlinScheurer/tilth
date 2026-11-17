@@ -12,8 +12,8 @@ env:
 
 jobs:
   # Fail fast if any version in the release disagrees with the tag. tilth and
-  # tilth-core move in lockstep: the crate versions and the version tilth
-  # requires of tilth-core all equal the tag.
+  # tilth-core-fork move in lockstep: the crate versions and the version tilth
+  # requires of tilth-core-fork all equal the tag.
   version-check:
     runs-on: ubuntu-latest
     steps:
@@ -22,20 +22,20 @@ jobs:
         run: |
           TAG="${GITHUB_REF#refs/tags/v}"
           CARGO_VER=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
-          CORE_VER=$(grep '^version' crates/tilth-core/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
-          CORE_REQS=$(grep '^tilth-core = ' Cargo.toml | sed 's/.*version = "\([^"]*\)".*/\1/' | sort -u)
+          CORE_VER=$(grep '^version' crates/tilth-core-fork/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          CORE_REQS=$(grep '^tilth-core-fork = ' Cargo.toml | sed 's/.*version = "\([^"]*\)".*/\1/' | sort -u)
           NPM_VER=$(node -p "require('./npm/package.json').version")
-          echo "Tag: $TAG  Cargo: $CARGO_VER  tilth-core: $CORE_VER  tilth-core required: $CORE_REQS  npm: $NPM_VER"
+          echo "Tag: $TAG  Cargo: $CARGO_VER  tilth-core-fork: $CORE_VER  tilth-core-fork required: $CORE_REQS  npm: $NPM_VER"
           if [ "$CARGO_VER" != "$TAG" ]; then
             echo "::error::Cargo.toml version ($CARGO_VER) does not match tag ($TAG)"
             exit 1
           fi
           if [ "$CORE_VER" != "$TAG" ]; then
-            echo "::error::crates/tilth-core/Cargo.toml version ($CORE_VER) does not match tag ($TAG)"
+            echo "::error::crates/tilth-core-fork/Cargo.toml version ($CORE_VER) does not match tag ($TAG)"
             exit 1
           fi
           if [ "$CORE_REQS" != "$TAG" ]; then
-            echo "::error::Cargo.toml requires tilth-core $CORE_REQS, not the tag's version ($TAG)"
+            echo "::error::Cargo.toml requires tilth-core-fork $CORE_REQS, not the tag's version ($TAG)"
             exit 1
           fi
           if [ "$NPM_VER" != "$TAG" ]; then
@@ -124,7 +124,7 @@ jobs:
           # matrix leg adds another "What's Changed" copy (#189).
           generate_release_notes: ${{ matrix.target == 'x86_64-unknown-linux-musl' }}
 
-  # After all builds, publish to crates.io. tilth depends on tilth-core by
+  # After all builds, publish to crates.io. tilth depends on tilth-core-fork by
   # version, so the library goes first; cargo waits until the registry serves
   # it before the binary's publish resolves the dependency.
   publish-crate:
@@ -133,8 +133,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # ratchet:actions/checkout@v6
       - run: rustup toolchain install --no-self-update
-      - name: Publish tilth-core
-        run: cargo publish --locked -p tilth-core
+      - name: Publish tilth-core-fork
+        run: cargo publish --locked -p tilth-core-fork
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
       - name: Publish tilth

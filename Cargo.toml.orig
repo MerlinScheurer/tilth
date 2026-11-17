@@ -11,7 +11,7 @@ keywords = ["mcp", "code-search", "tree-sitter", "developer-tools"]
 categories = ["command-line-utilities", "development-tools"]
 
 [workspace]
-members = ["crates/tilth-core"]
+members = ["crates/tilth-core-fork"]
 exclude = ["fuzz"]
 
 # Each dependency both crates use is declared here once, so the two can
@@ -79,7 +79,7 @@ workspace = true
 
 [dependencies]
 # The parsing substrate: language detection, outlines, imports, callers, deps
-tilth-core = { path = "crates/tilth-core", version = "0.15.0" }
+tilth-core-fork = { path = "crates/tilth-core-fork", version = "0.15.0" }
 
 # CLI
 clap = { version = "4", features = ["derive"] }
@@ -141,7 +141,7 @@ libc = "0.2"
 tempfile = { workspace = true }
 # tests/expect_reasons.rs parses every source file to read its #[expect] reasons
 syn = { version = "2", features = ["full", "visit"] }
-tilth-core = { path = "crates/tilth-core", version = "0.15.0", features = ["test-fixtures"] }
+tilth-core-fork = { path = "crates/tilth-core-fork", version = "0.15.0", features = ["test-fixtures"] }
 
 [profile.release]
 opt-level = 3

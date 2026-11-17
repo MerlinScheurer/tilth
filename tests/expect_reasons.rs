@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use syn::visit::Visit;
 
 /// Both packages, relative to this one's manifest directory.
-const PACKAGES: &[&str] = &[".", "crates/tilth-core"];
+const PACKAGES: &[&str] = &[".", "crates/tilth-core-fork"];
 
 /// The directories Cargo builds a package's targets from.
 const TARGET_DIRS: &[&str] = &["src", "tests", "benches", "examples"];

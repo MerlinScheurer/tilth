@@ -20,7 +20,7 @@ use std::process::Command;
 use syn::visit::Visit;
 
 /// Both packages, relative to this one's manifest directory.
-const PACKAGES: &[&str] = &[".", "crates/tilth-core"];
+const PACKAGES: &[&str] = &[".", "crates/tilth-core-fork"];
 
 /// The one file allowed to start git, relative to the manifest directory.
 const RUNNER: &str = "src/git.rs";

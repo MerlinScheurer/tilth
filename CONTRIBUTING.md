@@ -18,7 +18,7 @@ Thanks for your interest. tilth is small and intentionally so — clean, focused
    ```
 3. Open a PR. Describe what changed and how to test it.
 
-CI runs the same three checks on every push, plus a publish dry-run of `tilth-core`.
+CI runs the same three checks on every push, plus a publish dry-run of `tilth-core-fork`.
 
 ## What helps
 

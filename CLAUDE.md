@@ -4,10 +4,10 @@ Rust MCP server + CLI for AST-aware code intelligence. Tree-sitter outlines, sym
 
 ## Project structure
 
-A Cargo workspace of two crates. The root package is the `tilth` binary: CLI, MCP server, and the rendering of every tool's output. `crates/tilth-core` is the parsing substrate as a library: it returns data, and the binary renders it. Other crates depend on `tilth-core` too, so its root re-exports are a public API (`crates/tilth-core/tests/api.rs` pins them).
+A Cargo workspace of two crates. The root package is the `tilth` binary: CLI, MCP server, and the rendering of every tool's output. `crates/tilth-core-fork` is the parsing substrate as a library: it returns data, and the binary renders it. Other crates depend on `tilth-core-fork` too, so its root re-exports are a public API (`crates/tilth-core-fork/tests/api.rs` pins them).
 
 ```
-crates/tilth-core/src/
+crates/tilth-core-fork/src/
   lib.rs               Public API: the re-exports at the crate root. Every module is #[doc(hidden)] and shared with the binary.
   lang/
     mod.rs             Shared language infrastructure: detect_file_type(), package_root().
@@ -110,11 +110,11 @@ Dockerfile, Make detected but have no tree-sitter grammar (outline returns None)
 
 ```bash
 cargo build --release        # release build of the tilth binary
-cargo test --workspace       # unit tests of both crates + tilth-core's tests/api.rs
+cargo test --workspace       # unit tests of both crates + tilth-core-fork's tests/api.rs
 cargo clippy --workspace --all-targets -- -D warnings  # lint (incl. tests)
 cargo fmt --all --check      # format check
 cargo install --path .       # install to ~/.cargo/bin/tilth
-cargo publish --dry-run -p tilth-core  # the library packages on its own
+cargo publish --dry-run -p tilth-core-fork  # the library packages on its own
 python3 scripts/check/output_parity.py --base OLD --new NEW --repos <fixture repos>  # byte-for-byte output parity of two tilth builds
 ```
 
@@ -122,11 +122,11 @@ The toolchain is pinned in `rust-toolchain.toml`, and CI and the release build i
 
 Lints live in `[workspace.lints]` in the root `Cargo.toml` (pedantic, a nursery subset, and restrictions on unwrap, expect, print and unsafe). `clippy.toml` exempts `#[test]` functions and `#[cfg(test)]` modules from the unwrap, expect, print and dbg lints, and nothing else: a helper function in `tests/*.rs` needs its own `#[expect]`. An exception is an `#[expect(lint, reason = "...")]` on the item or statement it excuses, never an `allow`: `allow_attributes` fails the build. A temporary exception's reason names its tracking issue, as in `reason = "split by responsibility in #315"`. A permanent one starts with `by design: `. `tests/expect_reasons.rs` fails on any other reason. Results go to stdout through `write_stdout` (CLI) or the MCP transport's writer, and diagnostics through `diag::emit`; `clippy.toml` forbids `std::io::stdout` and `std::io::stderr` everywhere else. The environment is read only through `config::env_var` and never written; `clippy.toml` forbids `std::env::var`, `var_os`, `vars`, `vars_os`, `set_var` and `remove_var`. The working directory is read only through `config::launch_dir` and never changed; the project root travels as a value, and `clippy.toml` forbids `std::env::current_dir`, `set_current_dir` and `std::path::absolute`. A file's bytes become text only through `tilth_core::source::into_text` (binary on a NUL in the first 512 bytes, else lossy UTF-8); `clippy.toml` forbids `std::str::from_utf8`, `String::from_utf8`, `Read::read_to_string` and `std::io::read_to_string`, and the strict `tilth_core::source::read_to_string` outside the hash-anchored writes and, until #312, the structural diff.
 
-CI runs `fmt --all --check`, `clippy --workspace --all-targets -D warnings`, `cargo test --workspace` and the tilth-core publish dry-run on every push/PR.
+CI runs `fmt --all --check`, `clippy --workspace --all-targets -D warnings`, `cargo test --workspace` and the tilth-core-fork publish dry-run on every push/PR.
 
 ## Version bumps
 
-`tilth` and `tilth-core` share one version. Update it in `Cargo.toml` (the package version and both `tilth-core` dependency lines), `crates/tilth-core/Cargo.toml` and `npm/package.json`. Tag with `v<version>` on main. `release.yml` refuses a tag that any of these disagree with, and publishes `tilth-core` to crates.io before `tilth`, because the binary depends on it by version.
+`tilth` and `tilth-core-fork` share one version. Update it in `Cargo.toml` (the package version and both `tilth-core-fork` dependency lines), `crates/tilth-core-fork/Cargo.toml` and `npm/package.json`. Tag with `v<version>` on main. `release.yml` refuses a tag that any of these disagree with, and publishes `tilth-core-fork` to crates.io before `tilth`, because the binary depends on it by version.
 
 Releases publish **two npm names** from the same `npm/` wrapper: the canonical unscoped `tilth` and the org anchor `@plotplot/tilth` (the `publish-npm` job renames the artifact and republishes with `--access public`). Both names have an OIDC trusted publisher on npmjs.com (`jahala/tilth` + `release.yml`), so releases need no token. `@plotplot/tilth` was bootstrapped with a one-time manual publish — npm cannot configure trusted publishing for a package that does not exist yet.
 
