@@ -27,6 +27,8 @@ pub struct DepsResult {
     pub uses_local: Vec<LocalDep>,
     pub uses_external: Vec<String>,
     pub used_by: Vec<Dependent>,
+    /// Total dependents found before truncation.
+    pub total_dependents: usize,
     pub exported_count: usize,
     /// Actual number of symbols searched (may be < `exported_count` if capped).
     pub searched_count: usize,
@@ -41,8 +43,8 @@ pub struct LocalDep {
 /// A file that depends on the target, with symbol-level call detail.
 pub struct Dependent {
     pub path: PathBuf,
-    /// (`calling_function`, `called_symbol`) pairs.
-    pub symbols: Vec<(String, String)>,
+    /// (`calling_function`, `called_symbol`, `line`) triples.
+    pub symbols: Vec<(String, String, u32)>,
     pub is_test: bool,
 }
 
@@ -75,6 +77,7 @@ pub fn analyze_deps(
             uses_local: Vec::new(),
             uses_external: Vec::new(),
             used_by: Vec::new(),
+            total_dependents: 0,
             exported_count: 0,
             searched_count: 0,
         });
@@ -170,21 +173,22 @@ pub fn analyze_deps(
 
     // ── Phase 3: Reverse dependencies ────────────────────────────────────────
 
-    let used_by = if searched_count > 0 {
+    let mut used_by = if searched_count > 0 {
         let symbols_set: HashSet<String> = all_names.iter().cloned().collect();
         let raw_matches = find_callers_batch(&symbols_set, scope, bloom)?;
 
         // Group by file path
-        let mut by_file: HashMap<PathBuf, Vec<(String, String)>> = HashMap::new();
+        let mut by_file: HashMap<PathBuf, Vec<(String, String, u32)>> = HashMap::new();
         for (matched_symbol, caller_match) in raw_matches {
             // Exclude calls from within the target file itself (self-references)
             if caller_match.path == *path {
                 continue;
             }
-            by_file
-                .entry(caller_match.path)
-                .or_default()
-                .push((caller_match.calling_function, matched_symbol));
+            by_file.entry(caller_match.path).or_default().push((
+                caller_match.calling_function,
+                matched_symbol,
+                caller_match.line,
+            ));
         }
 
         // Build Dependent list
@@ -213,18 +217,20 @@ pub fn analyze_deps(
                 .then_with(|| a.path.cmp(&b.path))
         });
 
-        // Cap total shown
-        dependents.truncate(MAX_DEPENDENTS);
         dependents
     } else {
         Vec::new()
     };
+
+    let total_dependents = used_by.len();
+    used_by.truncate(MAX_DEPENDENTS);
 
     Ok(DepsResult {
         target: path.clone(),
         uses_local,
         uses_external,
         used_by,
+        total_dependents,
         exported_count,
         searched_count,
     })
@@ -238,7 +244,7 @@ pub fn analyze_deps(
 /// 3. Truncate "Uses (local)" symbol lists to file paths only
 /// 4. Never truncate the header line
 pub fn format_deps(result: &DepsResult, scope: &Path, budget: Option<usize>) -> String {
-    let dep_count = result.used_by.len();
+    let dep_count = result.total_dependents;
     let (prod_deps, test_deps): (Vec<_>, Vec<_>) = result.used_by.iter().partition(|d| !d.is_test);
 
     // ── Build sections (full fidelity first) ─────────────────────────────────
@@ -287,6 +293,10 @@ pub fn format_deps(result: &DepsResult, scope: &Path, budget: Option<usize>) -> 
     }
     if !used_by_tests_section.is_empty() {
         parts.push(used_by_tests_section.clone());
+    }
+    let truncated = result.total_dependents.saturating_sub(result.used_by.len());
+    if truncated > 0 {
+        parts.push(format!("... and {truncated} more dependents"));
     }
     if !barrel_note.is_empty() {
         parts.push(barrel_note.clone());
@@ -408,19 +418,7 @@ fn is_valid_module_path(source: &str) -> bool {
         .is_some_and(|c| c.is_alphanumeric() || c == '@' || c == '.')
 }
 
-/// Returns true if the path looks like a test file.
-fn is_test_file(path: &Path) -> bool {
-    let s = path.to_string_lossy();
-    s.contains("_test.")
-        || s.contains(".test.")
-        || s.contains(".spec.")
-        || path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with("test_"))
-        || s.contains("/tests/")
-        || s.contains("/test/")
-}
+use crate::types::is_test_file;
 
 /// Format the "Uses (local)" section.
 fn format_uses_local(deps: &[LocalDep], scope: &Path, with_symbols: bool) -> String {
@@ -469,19 +467,24 @@ fn format_used_by(deps: &[&Dependent], scope: &Path, heading: &str) -> String {
             .unwrap_or(&dep.path)
             .display()
             .to_string();
-        // Group by calling function for readability
-        let mut by_caller: HashMap<&str, Vec<&str>> = HashMap::new();
-        for (caller, symbol) in &dep.symbols {
-            by_caller
+        // Group by (caller, line) for readability — keep the earliest line per caller
+        let mut by_caller: HashMap<&str, (u32, Vec<&str>)> = HashMap::new();
+        for (caller, symbol, line) in &dep.symbols {
+            let entry = by_caller
                 .entry(caller.as_str())
-                .or_default()
-                .push(symbol.as_str());
+                .or_insert((*line, Vec::new()));
+            entry.0 = entry.0.min(*line);
+            entry.1.push(symbol.as_str());
         }
-        let mut callers: Vec<&str> = by_caller.keys().copied().collect();
-        callers.sort_unstable();
-        for caller in callers {
-            let syms = by_caller[caller].join(", ");
-            let _ = write!(out, "\n{rel:<30} {caller:<20} \u{2192} {syms}");
+        let mut callers: Vec<(&str, u32, Vec<&str>)> = by_caller
+            .into_iter()
+            .map(|(caller, (line, syms))| (caller, line, syms))
+            .collect();
+        callers.sort_unstable_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(b.0)));
+        for (caller, line, syms) in callers {
+            let loc = format!("{rel}:{line}");
+            let joined = syms.join(", ");
+            let _ = write!(out, "\n{loc:<30} {caller:<20} \u{2192} {joined}");
         }
     }
     out
@@ -528,8 +531,12 @@ fn apply_budget_truncation(
         |hdr, ul, _ue, _pd, _td, bn, _sc| assemble(&[hdr, ul, bn]),
         // Level 3: local as paths only (no symbols)
         |hdr, ul, _ue, _pd, _td, _bn, _sc| {
-            // Re-extract paths from the full section (strip symbol lists)
-            let local_lines: Vec<&str> = ul.lines().skip(1).collect();
+            // Strip symbol lists: each line is "path_padded  symbols" — take only up to first space run
+            let local_lines: Vec<&str> = ul
+                .lines()
+                .skip(1) // skip heading
+                .map(|l| l.split_whitespace().next().unwrap_or(l))
+                .collect();
             let paths_only = if local_lines.is_empty() {
                 String::new()
             } else {
