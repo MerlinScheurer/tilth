@@ -1,5 +1,7 @@
 # tilth
 
+# Public Archive of the recently deleted: https://github.com/jahala/tilth
+
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/jahala/tilth/badge)](https://scorecard.dev/viewer/?uri=github.com/jahala/tilth)
 
 **Smart code reading for humans and AI agents.** tilth parses your code with tree-sitter and answers questions that text search can't. It shows where a symbol is defined, who calls it, what it calls, what depends on a file, and what changed at function level.
@@ -278,13 +280,13 @@ claude --disallowedTools "Bash,Grep,Glob"
 
 ## How it decides what to show
 
-| Input | Behaviour |
-|-------|-----------|
-| 0 bytes | `[empty]` |
-| Binary | `[skipped]` with mime type |
-| Generated (lockfiles, .min.js) | `[generated]` |
-| Up to ~6,000 tokens | Full content with line numbers |
-| Over ~6,000 tokens | Structural outline with line ranges |
+| Input                          | Behaviour                           |
+| ------------------------------ | ----------------------------------- |
+| 0 bytes                        | `[empty]`                           |
+| Binary                         | `[skipped]` with mime type          |
+| Generated (lockfiles, .min.js) | `[generated]`                       |
+| Up to ~6,000 tokens            | Full content with line numbers      |
+| Over ~6,000 tokens             | Structural outline with line ranges |
 
 The rule counts tokens, so a 1-line minified bundle gets outlined and a 120-line module prints whole.
 
@@ -345,16 +347,16 @@ tilth --map --scope <dir>         # codebase skeleton (CLI only)
 
 Median of 15 runs of the release build (main after v0.10.1) on an Apple M5 Pro. Each time includes process startup. MCP mode pays startup once.
 
-| Operation | Gin (130 files) | FastAPI (2,700 files) |
-|-----------|-----------------|-----------------------|
-| File read | 3 ms | 3 ms |
-| Glob | 5 ms | 9 ms |
-| Callers | 13 ms | 64 ms |
-| Deps | 17 ms | 28 ms |
-| Symbol search | 20 ms | 77 ms |
-| Content search | 37 ms | 80 ms |
-| Grok | 37 ms | 91 ms |
-| Map | 52 ms | 184 ms |
+| Operation      | Gin (130 files) | FastAPI (2,700 files) |
+| -------------- | --------------- | --------------------- |
+| File read      | 3 ms            | 3 ms                  |
+| Glob           | 5 ms            | 9 ms                  |
+| Callers        | 13 ms           | 64 ms                 |
+| Deps           | 17 ms           | 28 ms                 |
+| Symbol search  | 20 ms           | 77 ms                 |
+| Content search | 37 ms           | 80 ms                 |
+| Grok           | 37 ms           | 91 ms                 |
+| Map            | 52 ms           | 184 ms                |
 
 Search walks the whole tree, so time grows with the size of the repository.
 
