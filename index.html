@@ -731,7 +731,7 @@
     $referrer: r || '$direct', $referring_domain: d, $raw_user_agent: navigator.userAgent.slice(0, 1000),
     $timezone: Intl.DateTimeFormat().resolvedOptions().timeZone, $browser_language: navigator.language,
     $screen_width: screen.width, $screen_height: screen.height, $viewport_width: innerWidth, $viewport_height: innerHeight };
-  fetch('https://e.plotplot.ai/i/v0/e/', { method: 'POST', keepalive: true,
+  fetch('https://localhost/i/v0/e/', { method: 'POST', keepalive: true,
     body: JSON.stringify({ api_key: t, batch: [{ event: '$pageview', properties: p, timestamp: now }], sent_at: now }) })
     .catch(function(){});
 })();
