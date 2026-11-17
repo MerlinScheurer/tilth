@@ -2,9 +2,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::lang::detect_file_type;
-use crate::lang::outline::get_outline_entries;
-use crate::types::{FileType, OutlineEntry, OutlineKind};
+use tilth_core::lang::detect_file_type;
+use tilth_core::lang::outline::get_outline_entries;
+use tilth_core::types::{FileType, OutlineEntry, OutlineKind};
 
 use super::matching::{build_diff_symbols, match_symbols};
 use super::{
@@ -438,13 +438,19 @@ fn on_disk(repo: Option<&Path>, path: &Path) -> PathBuf {
     }
 }
 
-fn git_show(spec: &str, repo: Option<&Path>) -> Result<String, String> {
+pub(super) fn git_show(spec: &str, repo: Option<&Path>) -> Result<String, String> {
     let mut cmd = Command::new("git");
     if let Some(dir) = repo {
         cmd.current_dir(dir);
     }
     let output = cmd
-        .args(["-c", "core.quotePath=false", "show", spec])
+        .args([
+            "-c",
+            "core.quotePath=false",
+            "show",
+            "--end-of-options",
+            spec,
+        ])
         .output()
         .map_err(|e| format!("git show failed: {e}"))?;
     if output.status.success() {

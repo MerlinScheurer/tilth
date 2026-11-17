@@ -5,10 +5,10 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::cache::OutlineCache;
-use crate::index::bloom::BloomFilterCache;
 use crate::session::Session;
 use crate::timeout::{self, spawn_with_timeout, SpawnFailure, ThreadTracker};
+use tilth_core::cache::OutlineCache;
+use tilth_core::index::bloom::BloomFilterCache;
 
 mod tools;
 pub(crate) mod tree;
@@ -88,7 +88,7 @@ pub fn run(edit_mode: bool, scope: Option<&Path>) -> io::Result<()> {
         }
     } else {
         let cwd = std::env::current_dir().unwrap_or_default();
-        if let Some(root) = crate::lang::package_root(&cwd) {
+        if let Some(root) = tilth_core::lang::package_root(&cwd) {
             let _ = std::env::set_current_dir(root);
         }
     }
@@ -318,28 +318,26 @@ fn handle_request(req: &JsonRpcRequest, services: &Services) -> JsonRpcResponse 
 /// Execute a tool by name with the given arguments. Returns formatted output or error string.
 /// No classifier involved — the caller specifies the tool explicitly.
 fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String, String> {
-    let edit_mode = services.edit_mode();
-    match tool {
-        "tilth_read" => tool_read(args, services.cache(), services.session(), edit_mode),
-        "tilth_search" => tool_search(args, services.cache(), services.session(), services.bloom()),
-        "tilth_list" => tool_list(args),
-        // Dispatch-only alias for one release: mid-session agents hold a
-        // pre-upgrade tool list that still names tilth_files. Never advertised
-        // (tools/list absence is pinned by `tilth_files_folded_into_tilth_list`);
-        // remove in the next minor.
-        "tilth_files" => tool_list(args).map(|out| {
-            format!(
-                "{}\nnote: tilth_files is now tilth_list — update your call",
-                out.trim_end_matches('\n')
-            )
-        }),
-        "tilth_deps" => tool_deps(args, services.bloom()),
-        "tilth_grok" => tool_grok(args, services.bloom(), services.session()),
-        "tilth_diff" => tool_diff(args),
-        "tilth_session" => tool_session(args, services.session()),
-        "tilth_write" if edit_mode => tool_write(args, services.session(), services.bloom()),
-        _ => Err(format!("unknown tool: {tool}")),
-    }
+    let gitignore = match args.get("gitignore") {
+        None => None,
+        Some(value) => Some(value.as_bool().ok_or("gitignore must be a boolean")?),
+    };
+    tilth_core::search::walk::with_gitignore_override(gitignore, || {
+        let edit_mode = services.edit_mode();
+        match tool {
+            "tilth_read" => tool_read(args, services.cache(), services.session(), edit_mode),
+            "tilth_search" => {
+                tool_search(args, services.cache(), services.session(), services.bloom())
+            }
+            "tilth_list" => tool_list(args),
+            "tilth_deps" => tool_deps(args, services.bloom()),
+            "tilth_grok" => tool_grok(args, services.bloom(), services.session()),
+            "tilth_diff" => tool_diff(args),
+            "tilth_session" => tool_session(args, services.session()),
+            "tilth_write" if edit_mode => tool_write(args, services.session(), services.bloom()),
+            _ => Err(format!("unknown tool: {tool}")),
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -530,7 +528,7 @@ mod tests {
         std::fs::create_dir_all(&subdir).unwrap();
 
         // package_root from the nested subdir should find the project root
-        let root = crate::lang::package_root(&subdir);
+        let root = tilth_core::lang::package_root(&subdir);
         assert!(root.is_some(), "package_root should find the project");
         // Compare canonicalized paths to handle macOS /var -> /private/var symlinks
         let root_canon = root.unwrap().canonicalize().unwrap();
@@ -613,47 +611,26 @@ mod tests {
         ));
     }
 
-    // -- dispatch_tool: tilth_files alias --------------------------------------
-
-    /// Mid-session upgrade compatibility: agents that fetched the tool list
-    /// before an upgrade still call `tilth_files`. Dispatch accepts the old
-    /// name for one release, serves the list handler, and appends a rename
-    /// note. The old name stays out of tools/list (pinned by
-    /// `tilth_files_folded_into_tilth_list`).
-    #[test]
-    fn dispatch_accepts_tilth_files_as_list_alias() {
-        let project = tempfile::tempdir().unwrap();
-        let p = project.path();
-        std::fs::create_dir(p.join("src")).unwrap();
-        std::fs::write(p.join("src/main.rs"), "fn main() {}").unwrap();
-        let args = serde_json::json!({
-            "patterns": ["*.rs"],
-            "scope": p.to_str().unwrap(),
-        });
-        let services = Services::new(false);
-
-        let out = dispatch_tool("tilth_files", &args, &services)
-            .expect("tilth_files must dispatch to the list handler");
-        assert!(out.contains("main.rs"), "expected tree output: {out}");
-        assert!(out.contains("tokens"), "expected token rollups: {out}");
-        assert!(
-            out.ends_with("note: tilth_files is now tilth_list — update your call"),
-            "rename note must close the response: {out}"
-        );
-
-        let canonical =
-            dispatch_tool("tilth_list", &args, &services).expect("tilth_list must dispatch");
-        assert!(
-            !canonical.contains("note: tilth_files"),
-            "canonical tilth_list must not carry the rename note: {canonical}"
-        );
-    }
-
     // -- dispatch_tool: removed tools ----------------------------------------
 
     /// The token-accounting tool was removed outright, with no alias: a call by
     /// its old name gets the generic unknown-tool error. Absence from
     /// tools/list is pinned by `tilth_savings_is_not_advertised`.
+    /// `tilth_files` was folded into `tilth_list` in v0.10.0 and kept a
+    /// dispatch alias for one release. The alias is gone; the old name gets the
+    /// generic unknown-tool error.
+    #[test]
+    fn tilth_files_is_not_dispatched() {
+        let args = serde_json::json!({ "patterns": ["*.rs"] });
+        let services = Services::new(false);
+        let err = dispatch_tool("tilth_files", &args, &services)
+            .expect_err("tilth_files must not dispatch");
+        assert!(
+            err.contains("unknown tool"),
+            "expected unknown-tool error: {err}"
+        );
+    }
+
     #[test]
     fn tilth_savings_is_not_dispatched() {
         let args = serde_json::json!({});
