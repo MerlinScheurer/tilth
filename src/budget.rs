@@ -45,7 +45,7 @@ pub fn apply(output: &str, budget: u64) -> String {
         .rfind("\n\n##")
         .filter(|&p| p > 0)
         .or_else(|| truncated.rfind("\n\n").filter(|&p| p > 0))
-        .or_else(|| truncated.rfind('\n'))
+        .or_else(|| truncated.rfind('\n').filter(|&p| p > 0))
         .unwrap_or(safe_max);
 
     let clean_body = &body[..cut_point];
@@ -60,6 +60,7 @@ pub fn apply(output: &str, budget: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
 
     #[test]
     fn apply_roomy_budget_returns_input_unchanged() {
@@ -73,7 +74,7 @@ mod tests {
         // Build a multi-line body large enough to force truncation.
         let mut input = String::from("# header\n");
         for i in 1..=200 {
-            input.push_str(&format!("line {i}\n"));
+            let _ = writeln!(input, "line {i}");
         }
         let out = apply(&input, 80);
         assert!(out.contains("... truncated"), "marker line missing: {out}");
@@ -92,6 +93,26 @@ mod tests {
     }
 
     #[test]
+    fn single_long_line_body_does_not_collapse() {
+        // Regression: a body that is one very long line with no interior \n has no
+        // `\n\n` to land on, so rfind('\n') finds only the leading separator at
+        // offset 0. Without the `filter(|&p| p > 0)` guard on that arm, cut_point
+        // becomes 0, clean_body is empty, and the response collapses to
+        // `header\n\n... truncated` with zero content.
+        let long_line = "x".repeat(10_000);
+        let input = format!("# header\n{long_line}");
+        let out = apply(&input, 400);
+        // The truncation marker must appear (body is 10k+ chars).
+        assert!(out.contains("truncated"), "marker line missing: {out:.80?}");
+        // The body content must survive — the output must contain some 'x' chars.
+        // If cut_point landed at 0, clean_body would be empty and no 'x' survives.
+        assert!(
+            out.contains('x'),
+            "body content collapsed to empty — single-long-line truncation bug: {out:.80?}"
+        );
+    }
+
+    #[test]
     fn apply_code_format_survives_header_separator() {
         // Code-rendered output has `<n>:<hash>|<content>\n` on every line, so
         // the only `\n\n` in the body is the header/body separator at position
@@ -101,7 +122,7 @@ mod tests {
         // real content survives.
         let mut input = String::from("# src/foo.rs (200 lines, ~2k tokens) [full]\n\n");
         for i in 1..=200 {
-            input.push_str(&format!("{i}:abc|let x_{i} = {i};\n"));
+            let _ = writeln!(input, "{i}:abc|let x_{i} = {i};");
         }
         // Tight budget — must truncate, but should leave room for many lines.
         let out = apply(&input, 400);

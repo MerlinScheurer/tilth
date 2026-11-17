@@ -7,7 +7,7 @@ use crate::lang::outline::{get_outline_entries, outline_language};
 use crate::types::{Lang, OutlineEntry};
 
 /// A resolved callee: a function/method called from within an expanded definition.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ResolvedCallee {
     pub name: String,
     pub file: PathBuf,
@@ -106,7 +106,7 @@ pub fn extract_callee_names(
 
 /// Keywords that should not appear as callee names in Elixir.
 /// These are definition and import forms that are syntactically `call` nodes.
-/// Superset of `ELIXIR_DEFINITION_TARGETS` (treesitter.rs) plus import keywords
+/// Superset of `ELIXIR_DEFINITION_TARGETS` (elixir.rs) plus import keywords
 /// (`use`, `import`, `alias`, `require`) and `defoverridable`.
 fn is_elixir_keyword(name: &str) -> bool {
     matches!(
@@ -438,14 +438,14 @@ mod tests {
 
     #[test]
     fn extract_php_callee_names() {
-        let php = r#"<?php
+        let php = r"<?php
 function run($svc): void {
     local_helper();
     Foo\Bar::staticCall();
     $svc->methodCall();
     $svc?->nullableCall();
 }
-"#;
+";
 
         let names = extract_callee_names(php, Lang::Php, None);
 

@@ -367,44 +367,7 @@ fn is_placeholder_name(name: &str) -> bool {
 /// Returns true if the import source is a standard library module.
 /// Agents can't navigate into stdlib — showing these is noise.
 fn is_stdlib(source: &str, lang: crate::types::Lang) -> bool {
-    use crate::types::Lang;
-    match lang {
-        Lang::Rust => {
-            source.starts_with("std::")
-                || source.starts_with("core::")
-                || source.starts_with("alloc::")
-        }
-        Lang::Python => {
-            // Common stdlib modules — not exhaustive but covers the noisy ones
-            matches!(
-                source.split('.').next().unwrap_or(""),
-                "os" | "sys"
-                    | "re"
-                    | "json"
-                    | "math"
-                    | "time"
-                    | "datetime"
-                    | "pathlib"
-                    | "typing"
-                    | "collections"
-                    | "functools"
-                    | "itertools"
-                    | "abc"
-                    | "io"
-                    | "logging"
-                    | "unittest"
-                    | "dataclasses"
-                    | "enum"
-                    | "copy"
-                    | "hashlib"
-                    | "subprocess"
-                    | "threading"
-                    | "asyncio"
-            )
-        }
-        Lang::Go => source.starts_with("fmt") || !source.contains('.'),
-        _ => false,
-    }
+    crate::lang::spec::spec(lang).stdlib.matches(source)
 }
 
 /// Returns true if the string looks like a valid module/package path.
@@ -579,4 +542,74 @@ fn assemble(parts: &[&str]) -> String {
         .copied()
         .collect::<Vec<_>>()
         .join("\n\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn go_stdlib_fmt_is_stdlib() {
+        assert!(is_stdlib("fmt", crate::types::Lang::Go));
+    }
+
+    #[test]
+    fn go_stdlib_fmtlib_is_not_stdlib() {
+        // "fmtlib" is not a Go stdlib package—previously matched via starts_with("fmt")
+        assert!(!is_stdlib("fmtlib", crate::types::Lang::Go));
+    }
+
+    #[test]
+    fn go_stdlib_fmtutil_is_not_stdlib() {
+        assert!(!is_stdlib("fmtutil", crate::types::Lang::Go));
+    }
+
+    #[test]
+    fn go_stdlib_multi_segment_paths_are_stdlib() {
+        // Regression: multi-segment stdlib imports (single-line form
+        // `import "net/http"`) must classify as stdlib via their root segment.
+        // The exact-match allowlist briefly regressed these to "external".
+        for path in [
+            "net/http",
+            "encoding/json",
+            "path/filepath",
+            "crypto/sha256",
+            "text/template",
+            "container/list",
+            "database/sql",
+        ] {
+            assert!(
+                is_stdlib(path, crate::types::Lang::Go),
+                "{path} should be classified as Go stdlib"
+            );
+        }
+    }
+
+    #[test]
+    fn go_local_multi_segment_path_is_not_stdlib() {
+        // A local/third-party multi-segment package whose root isn't stdlib.
+        assert!(!is_stdlib("mypackage/sub", crate::types::Lang::Go));
+    }
+
+    #[test]
+    fn go_local_package_without_dot_is_not_stdlib() {
+        // A local package like "mypackage" has no dot but is NOT stdlib—
+        // the old !source.contains('.') rule wrongly classified it as stdlib.
+        assert!(!is_stdlib("mypackage", crate::types::Lang::Go));
+    }
+
+    #[test]
+    fn go_external_dotted_path_is_not_stdlib() {
+        assert!(!is_stdlib(
+            "github.com/gin-gonic/gin",
+            crate::types::Lang::Go
+        ));
+    }
+
+    #[test]
+    fn go_stdlib_cmp_and_maps_are_stdlib() {
+        // Go 1.21+ added `cmp` and `maps` to the standard library.
+        assert!(is_stdlib("cmp", crate::types::Lang::Go));
+        assert!(is_stdlib("maps", crate::types::Lang::Go));
+    }
 }

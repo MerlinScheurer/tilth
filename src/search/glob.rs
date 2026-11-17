@@ -20,7 +20,8 @@ pub struct GlobResult {
     pub available_extensions: Vec<String>,
 }
 
-/// Glob search using `ignore::WalkBuilder` (parallel, .gitignore-aware).
+/// Glob search using `ignore::WalkBuilder` (parallel via `super::walker` —
+/// deliberately NOT .gitignore-aware, see `walker`'s doc comment).
 pub fn search(pattern: &str, scope: &Path) -> Result<GlobResult, TilthError> {
     let glob = Glob::new(pattern).map_err(|e| TilthError::InvalidQuery {
         query: pattern.to_string(),
@@ -28,16 +29,14 @@ pub fn search(pattern: &str, scope: &Path) -> Result<GlobResult, TilthError> {
     })?;
     let matcher = glob.compile_matcher();
 
-    let files: std::sync::Mutex<Vec<GlobFileEntry>> = std::sync::Mutex::new(Vec::new());
-    let total_found = std::sync::atomic::AtomicUsize::new(0);
+    let matched: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
     let extensions: std::sync::Mutex<HashSet<String>> = std::sync::Mutex::new(HashSet::new());
 
     let walker = super::walker(scope, None)?;
 
     walker.run(|| {
         let matcher = &matcher;
-        let files = &files;
-        let total_found = &total_found;
+        let matched = &matched;
         let extensions = &extensions;
 
         Box::new(move |entry| {
@@ -64,31 +63,36 @@ pub fn search(pattern: &str, scope: &Path) -> Result<GlobResult, TilthError> {
             let rel = path.strip_prefix(scope).unwrap_or(path);
 
             if matcher.is_match(name) || matcher.is_match(rel) {
-                total_found.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                // Compute preview outside the lock, then check-and-push in one acquisition
-                let preview = file_preview(path);
-                let mut locked = files
+                matched
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if locked.len() < MAX_FILES {
-                    locked.push(GlobFileEntry {
-                        path: path.to_path_buf(),
-                        preview,
-                    });
-                }
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(path.to_path_buf());
             }
 
             ignore::WalkState::Continue
         })
     });
 
-    let total = total_found.load(std::sync::atomic::Ordering::Relaxed);
-    let files = files
+    let mut matched = matched
         .into_inner()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let extensions = extensions
         .into_inner()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let total = matched.len();
+
+    // WalkParallel visits files in nondeterministic order; sort before capping
+    // so the selected subset is stable. Previews are computed only for survivors.
+    matched.sort();
+    matched.truncate(MAX_FILES);
+    let files: Vec<GlobFileEntry> = matched
+        .into_iter()
+        .map(|path| {
+            let preview = file_preview(&path);
+            GlobFileEntry { path, preview }
+        })
+        .collect();
 
     let available_extensions: Vec<String> = if files.is_empty() {
         let mut exts: Vec<String> = extensions.into_iter().collect();
@@ -107,9 +111,125 @@ pub fn search(pattern: &str, scope: &Path) -> Result<GlobResult, TilthError> {
     })
 }
 
-/// Quick preview: token estimate, or "test file", or "module" based on exports.
+/// Quick preview: binary type + size, or a token estimate.
 fn file_preview(path: &Path) -> Option<String> {
     let meta = std::fs::metadata(path).ok()?;
+    // A byte/4 token estimate is meaningless for binary content (a PNG is not
+    // ~N tokens of text). Classify like the read path and show size + type.
+    if is_binary_file(path) {
+        let mime = crate::read::mime_from_ext(path);
+        return Some(crate::format::binary_summary(meta.len(), mime));
+    }
     let tokens = estimate_tokens(meta.len());
     Some(format!("~{tokens} tokens"))
+}
+
+/// Classify by content the way the read path does: a null byte in the first
+/// 512 bytes marks binary.
+fn is_binary_file(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    // A bare read() may legally return fewer than 512 bytes before EOF;
+    // take + read_to_end retries until the cap or EOF, guaranteeing the window.
+    let mut head = Vec::with_capacity(512);
+    if file.take(512).read_to_end(&mut head).is_err() {
+        return false;
+    }
+    crate::lang::detection::is_binary(&head)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_preview_renders_binary_type_not_tokens() {
+        let tmp = tempfile::tempdir().unwrap();
+        let png = tmp.path().join("logo.png");
+        std::fs::write(&png, b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0d").unwrap();
+        let src = tmp.path().join("main.rs");
+        std::fs::write(&src, "fn main() {}\n").unwrap();
+
+        assert_eq!(
+            file_preview(&png).as_deref(),
+            Some("binary, 12B, image/png"),
+            "binary files show size + MIME, not a token estimate"
+        );
+        assert!(
+            file_preview(&src).unwrap().ends_with("tokens"),
+            "text files still show a token estimate"
+        );
+    }
+
+    #[test]
+    fn binary_probe_window_is_exactly_512_bytes() {
+        // 600 bytes with the first NUL at byte 550 — beyond the probe window.
+        // The probe must cover exactly the first 512 bytes: never fewer (a
+        // short read must not shrink it), never more (a NUL past 512 must not
+        // flip the classification).
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("late_nul.dat");
+        let mut content = vec![b'a'; 600];
+        content[550] = 0;
+        std::fs::write(&path, &content).unwrap();
+
+        assert!(
+            !is_binary_file(&path),
+            "a NUL beyond the 512-byte window must not mark the file binary"
+        );
+        assert!(
+            file_preview(&path).unwrap().ends_with("tokens"),
+            "the preview must stay on the text path"
+        );
+    }
+
+    #[test]
+    fn glob_selection_is_deterministic_and_sorted() {
+        // More matches than MAX_FILES so the cap engages.
+        let tmp = tempfile::tempdir().unwrap();
+        for i in 0..(MAX_FILES + 15) {
+            std::fs::write(tmp.path().join(format!("f{i:03}.rs")), "fn main() {}").unwrap();
+        }
+
+        let first: Vec<PathBuf> = search("*.rs", tmp.path())
+            .unwrap()
+            .files
+            .into_iter()
+            .map(|f| f.path)
+            .collect();
+        let second: Vec<PathBuf> = search("*.rs", tmp.path())
+            .unwrap()
+            .files
+            .into_iter()
+            .map(|f| f.path)
+            .collect();
+
+        // The cap must select the lexicographically smallest matches, sorted —
+        // the same set every run, regardless of parallel walk order.
+        let expected: Vec<PathBuf> = (0..MAX_FILES)
+            .map(|i| tmp.path().join(format!("f{i:03}.rs")))
+            .collect();
+        assert_eq!(
+            first, expected,
+            "capped set must be deterministic and sorted"
+        );
+        assert_eq!(first, second, "two identical runs must return the same set");
+    }
+
+    #[test]
+    fn glob_total_found_counts_every_match() {
+        let tmp = tempfile::tempdir().unwrap();
+        for i in 0..(MAX_FILES + 5) {
+            std::fs::write(tmp.path().join(format!("g{i:03}.rs")), "fn main() {}").unwrap();
+        }
+        let result = search("*.rs", tmp.path()).unwrap();
+        assert_eq!(result.files.len(), MAX_FILES, "file list stays capped");
+        assert_eq!(
+            result.total_found,
+            MAX_FILES + 5,
+            "total_found reports the full match count"
+        );
+    }
 }

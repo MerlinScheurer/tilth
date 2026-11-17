@@ -38,6 +38,7 @@ pub enum Lang {
     Kotlin,
     CSharp,
     Elixir,
+    Bash,
     Dockerfile,
     Make,
 }
@@ -49,26 +50,7 @@ impl Lang {
     /// Lexers that scan `'` must disambiguate a lifetime from a single-quoted
     /// literal; only Rust needs the lifetime branch.
     pub(crate) fn has_lifetimes(self) -> bool {
-        match self {
-            Lang::Rust => true,
-            Lang::TypeScript
-            | Lang::Tsx
-            | Lang::JavaScript
-            | Lang::Python
-            | Lang::Go
-            | Lang::Java
-            | Lang::Scala
-            | Lang::C
-            | Lang::Cpp
-            | Lang::Ruby
-            | Lang::Php
-            | Lang::Swift
-            | Lang::Kotlin
-            | Lang::CSharp
-            | Lang::Elixir
-            | Lang::Dockerfile
-            | Lang::Make => false,
-        }
+        crate::lang::spec::spec(self).has_lifetimes
     }
 }
 
@@ -90,13 +72,16 @@ pub enum ViewMode {
     Outline,
     Signature,
     Keys,
+    // Reserved/roadmap: planned head+tail view mode, not yet wired.
     #[allow(dead_code)]
     HeadTail,
     Empty,
     Generated,
     Minified,
+    // Reserved/roadmap: binary file view variant, not yet wired.
     #[allow(dead_code)]
     Binary,
+    // Reserved/roadmap: error view variant, not yet wired.
     #[allow(dead_code)]
     Error,
     Section,
@@ -196,11 +181,13 @@ pub enum OutlineKind {
     Variable,
     ImmutableVariable,
     Export,
-    #[allow(dead_code)]
+    // Property is constructed in lang/outline.rs (property_declaration nodes).
     Property,
     Module,
+    // Reserved/roadmap: no tree-sitter grammar currently emits TestSuite nodes.
     #[allow(dead_code)]
     TestSuite,
+    // Reserved/roadmap: no tree-sitter grammar currently emits TestCase nodes.
     #[allow(dead_code)]
     TestCase,
 }

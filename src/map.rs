@@ -2,11 +2,10 @@ use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
-use ignore::WalkBuilder;
-
 use crate::cache::OutlineCache;
 use crate::lang::detect_file_type;
 use crate::read::outline;
+use crate::search::base_walk_builder;
 use crate::types::{estimate_tokens, FileType};
 
 /// Generate a structural codebase map.
@@ -16,24 +15,7 @@ use crate::types::{estimate_tokens, FileType};
 pub fn generate(scope: &Path, depth: usize, budget: Option<u64>, cache: &OutlineCache) -> String {
     let mut tree: BTreeMap<PathBuf, Vec<FileEntry>> = BTreeMap::new();
 
-    let walker = WalkBuilder::new(scope)
-        .follow_links(true)
-        .hidden(false)
-        .git_ignore(false)
-        .git_global(false)
-        .git_exclude(false)
-        .ignore(false)
-        .parents(false)
-        .filter_entry(|entry| {
-            if entry.file_type().is_some_and(|ft| ft.is_dir()) {
-                if let Some(name) = entry.file_name().to_str() {
-                    return !crate::search::SKIP_DIRS.contains(&name);
-                }
-            }
-            true
-        })
-        .max_depth(Some(depth + 1))
-        .build();
+    let walker = base_walk_builder(scope).max_depth(Some(depth + 1)).build();
 
     for entry in walker.flatten() {
         if !entry.file_type().is_some_and(|ft| ft.is_file()) {
@@ -68,6 +50,8 @@ pub fn generate(scope: &Path, depth: usize, budget: Option<u64>, cache: &Outline
                     .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
 
                 let outline_str = cache.get_or_compute(path, mtime, || {
+                    // Best-effort: an unreadable file contributes no outline symbols rather than
+                    // aborting the map. Errors are intentionally swallowed here.
                     let content = std::fs::read_to_string(path).unwrap_or_default();
                     let buf = content.as_bytes();
                     outline::generate(path, file_type, &content, buf, true)
@@ -131,7 +115,7 @@ fn compute_dir_totals(tree: &BTreeMap<PathBuf, Vec<FileEntry>>) -> BTreeMap<Path
 }
 
 /// Compact human token count for directory rollups.
-/// Uses the same scale as `tilth_files` output (`12.3k`, `1.2M`).
+/// Uses the same scale as `tilth_list` output (`12.3k`, `1.2M`).
 ///
 /// The k→M switchover triggers at `999_950` rather than `1_000_000` so values
 /// that would round to `"1000.0k"` under `{:.1}` formatting roll cleanly into

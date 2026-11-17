@@ -15,13 +15,19 @@ use crate::lang::outline::{heading_level, heading_text, parse_markdown};
 use crate::types::{estimate_tokens, FileType, ViewMode};
 
 pub(crate) const TOKEN_THRESHOLD: u64 = 6_000;
+/// Minimum compression ratio required to prefer the outline over full content.
+/// If `outline_tokens >= full_tokens * OUTLINE_MIN_COMPRESSION / 100`, the
+/// outline saves too few tokens to be worth the information loss, so the full
+/// file is returned instead. Integer arithmetic: 80 means 80%.
+const OUTLINE_MIN_COMPRESSION: u64 = 80;
 const FILE_SIZE_CAP: u64 = 500_000; // 500KB
 
 /// Max file size for `full=true` reads. Files above this threshold get a
 /// warning header + outline instead of raw content, preventing multi-megabyte
-/// responses that cause MCP client timeouts.
+/// responses that cause MCP client timeouts. Grok shares this cap to bound
+/// its lossy decode + outline parse of code files.
 /// Override with `TILTH_FULL_SIZE_CAP` env var (bytes). Default: 2MB.
-fn full_read_size_cap() -> u64 {
+pub(crate) fn full_read_size_cap() -> u64 {
     std::env::var("TILTH_FULL_SIZE_CAP")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -145,14 +151,20 @@ pub fn read_file(
         ));
     }
 
-    // Full mode or small file → return full content (skip smart view)
-    if full || tokens <= TOKEN_THRESHOLD {
+    // Canonical full-content view — shared by the small-file gate and OGATE below.
+    let full_view = || {
         let header = format::file_header(path, byte_len, line_count, ViewMode::Full);
         if edit_mode {
             let numbered = format::hashlines(&content, 1);
-            return Ok(format!("{header}\n\n{numbered}"));
+            format!("{header}\n\n{numbered}")
+        } else {
+            format!("{header}\n\n{content}")
         }
-        return Ok(format!("{header}\n\n{content}"));
+    };
+
+    // Full mode or small file → return full content (skip smart view)
+    if full || tokens <= TOKEN_THRESHOLD {
+        return Ok(full_view());
     }
 
     // Large file → smart view by file type
@@ -164,6 +176,14 @@ pub fn read_file(
     let outline = cache.get_or_compute(path, mtime, || {
         outline::generate(path, file_type, &content, buf, capped)
     });
+
+    // OGATE: if the outline is not meaningfully smaller than the full file,
+    // return the full file — same token cost with less information is strictly
+    // worse and forces the caller to do a second read.
+    let outline_tokens = estimate_tokens(outline.len() as u64);
+    if outline_tokens >= tokens * OUTLINE_MIN_COMPRESSION / 100 {
+        return Ok(full_view());
+    }
 
     let mode = match file_type {
         FileType::StructuredData => ViewMode::Keys,
@@ -614,7 +634,7 @@ fn edit_distance(a: &str, b: &str) -> usize {
 }
 
 /// Guess MIME type from extension for binary file headers.
-fn mime_from_ext(path: &Path) -> &'static str {
+pub(crate) fn mime_from_ext(path: &Path) -> &'static str {
     match path.extension().and_then(|e| e.to_str()) {
         Some("png") => "image/png",
         Some("jpg" | "jpeg") => "image/jpeg",
@@ -780,7 +800,7 @@ mod tests {
         assert!(suggest_headings(input, "###", 5).is_empty());
     }
 
-    /// CommonMark allows `~~~` as a fence delimiter. Headings inside
+    /// `CommonMark` allows `~~~` as a fence delimiter. Headings inside
     /// must not be treated as suggestable.
     #[test]
     fn suggest_headings_skips_tilde_fenced_blocks() {
@@ -796,7 +816,7 @@ mod tests {
         );
     }
 
-    /// CommonMark §4.6.1 limits ATX headings to 1–6 `#`s. Lines with 7+
+    /// `CommonMark` §4.6.1 limits ATX headings to 1–6 `#`s. Lines with 7+
     /// hashes are not headings, even with a space after.
     #[test]
     fn suggest_headings_rejects_seven_or_more_hashes() {
@@ -808,7 +828,7 @@ mod tests {
         );
     }
 
-    /// CommonMark §4.6.1: hashes must be followed by a space (or EOL).
+    /// `CommonMark` §4.6.1: hashes must be followed by a space (or EOL).
     /// `##foo` (no space) is not a heading.
     #[test]
     fn suggest_headings_rejects_hashes_without_space() {
@@ -994,8 +1014,12 @@ mod tests {
 
     #[test]
     fn budgeted_omits_later_sections_when_exhausted() {
+        use std::fmt::Write as _;
         let big_line = "x".repeat(200);
-        let body: String = (0..30).map(|_| format!("{big_line}\n")).collect();
+        let body = (0..30).fold(String::new(), |mut s, _| {
+            let _ = writeln!(s, "{big_line}");
+            s
+        });
         let path = write_temp("tilth_test_budgeted_omit.txt", &body);
         let budget = 240u64;
         let out =
@@ -1020,9 +1044,11 @@ mod tests {
 
     #[test]
     fn budgeted_truncates_first_section_when_too_large() {
-        let body: String = (0..200)
-            .map(|i| format!("line-{i}-padding-padding-padding\n"))
-            .collect();
+        use std::fmt::Write as _;
+        let body = (0..200).fold(String::new(), |mut s, i| {
+            let _ = writeln!(s, "line-{i}-padding-padding-padding");
+            s
+        });
         let path = write_temp("tilth_test_budgeted_first_too_large.txt", &body);
         let budget = 100u64;
         let out = read_ranges_with_budget(&path, &["1-150"], false, budget).unwrap();
@@ -1040,8 +1066,12 @@ mod tests {
 
     #[test]
     fn budgeted_preserves_user_order_until_exhaustion() {
+        use std::fmt::Write as _;
         let big_line = "y".repeat(200);
-        let body: String = (0..30).map(|_| format!("{big_line}\n")).collect();
+        let body = (0..30).fold(String::new(), |mut s, _| {
+            let _ = writeln!(s, "{big_line}");
+            s
+        });
         let path = write_temp("tilth_test_budgeted_order.txt", &body);
         let budget = 240u64;
         let out =
@@ -1067,8 +1097,12 @@ mod tests {
 
     #[test]
     fn budgeted_never_exceeds_budget_even_when_markers_do_not_fit() {
+        use std::fmt::Write as _;
         let big_line = "z".repeat(50);
-        let body: String = (0..30).map(|_| format!("{big_line}\n")).collect();
+        let body = (0..30).fold(String::new(), |mut s, _| {
+            let _ = writeln!(s, "{big_line}");
+            s
+        });
         let path = write_temp("tilth_test_budgeted_strict_cap.txt", &body);
         let budget = 80u64;
         let out =
@@ -1078,6 +1112,94 @@ mod tests {
             "output {} tokens > budget {budget}: {out}",
             estimate_tokens(out.len() as u64)
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // OGATE: "never-worse outline gate" — if the outline barely compresses
+    // (outline_tokens >= 80% of full-file tokens), return full content instead.
+    #[test]
+    fn ogate_flat_file_returns_full_when_outline_barely_compresses() {
+        use std::fmt::Write as _;
+        // A file of empty-body one-liner fns. The signature IS essentially the
+        // whole source line (only ` {}` is dropped), so any signature-bearing
+        // outline is ≥80% of the full-file tokens and OGATE must fire. This holds
+        // regardless of the outline's per-entry formatting overhead, so the test
+        // does not silently break if that format is ever tightened. Enough lines
+        // to clear TOKEN_THRESHOLD (6k) — otherwise the small-file gate returns
+        // full before OGATE is even consulted, passing for the wrong reason.
+        let mut src = String::new();
+        for i in 0..2000 {
+            writeln!(src, "pub fn flat_{i}() {{}}").unwrap();
+        }
+        // ~2000 * ~21 bytes ≈ 43 KB ≈ 10.7k tokens (> TOKEN_THRESHOLD = 6k).
+        // Assert it so the test provably exercises OGATE rather than the
+        // small-file gate (which would also return `[full]`).
+        assert!(
+            estimate_tokens(src.len() as u64) > TOKEN_THRESHOLD,
+            "fixture must exceed TOKEN_THRESHOLD so OGATE, not the small-file gate, returns full"
+        );
+        let path = write_temp("tilth_ogate_flat.rs", &src);
+
+        let cache = OutlineCache::new();
+        let result = read_file(&path, None, false, &cache, false).unwrap();
+
+        // Gate fired → full view. The header tag records the decision directly
+        // (an outline would read `[outline]`), and the trailing fn's body braces
+        // `() {}` only appear in verbatim full content — an outline renders the
+        // signature without the body.
+        assert!(
+            result.contains("[full]"),
+            "OGATE must return the full view; header was: {}",
+            result.lines().next().unwrap_or("")
+        );
+        assert!(
+            result.contains("flat_1999() {}"),
+            "expected verbatim full content (last fn body present)"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Contrasting test: a large file with big function bodies compresses well
+    /// and must still return the OUTLINE (gate must NOT fire).
+    #[test]
+    fn ogate_large_compressible_file_returns_outline() {
+        use std::fmt::Write as _;
+        // Each function has a large body (many comment lines) so the outline
+        // (which only shows the `fn` signature) is a tiny fraction of the
+        // full-file token count.
+        let mut src = String::new();
+        for i in 0..40 {
+            writeln!(src, "pub fn heavy_{i}() {{").unwrap();
+            // 200 lines of body per function → ~200 * 30 = 6 000 bytes each
+            for j in 0..200 {
+                writeln!(
+                    src,
+                    "    let _x_{j}: u64 = {j}_{i}_padding_value_that_fills_space;"
+                )
+                .unwrap();
+            }
+            writeln!(src, "}}").unwrap();
+        }
+        // Total ≈ 40 * 202 lines * ~50 bytes = ~400 KB → well over TOKEN_THRESHOLD
+        let path = write_temp("tilth_ogate_heavy.rs", &src);
+
+        let cache = OutlineCache::new();
+        let result = read_file(&path, None, false, &cache, false).unwrap();
+
+        // Gate must NOT have fired: the output should be an outline, not full content.
+        // An outline shows signatures but omits the body.
+        assert!(
+            result.contains("heavy_0"),
+            "expected outline to mention function name heavy_0: {}",
+            &result[..result.len().min(400)]
+        );
+        // Body variable lines are only in the full file, not in an outline
+        assert!(
+            !result.contains("_x_0: u64"),
+            "outline must not contain body variables; got full content instead"
+        );
+
         let _ = std::fs::remove_file(&path);
     }
 }

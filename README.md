@@ -218,6 +218,21 @@ Add `--edit` to enable hash-anchored file editing (see [Edit mode](#edit-mode)):
 tilth install claude-code --edit
 ```
 
+For any MCP client not in the list, the server entry is the same everywhere — only the config file location and top-level key vary (`mcpServers` for most hosts, `amp.mcpServers` for Amp, TOML syntax for Codex):
+
+```json
+{
+  "mcpServers": {
+    "tilth": {
+      "command": "tilth",
+      "args": ["--mcp"]
+    }
+  }
+}
+```
+
+For edit mode, use `"args": ["--mcp", "--edit"]`.
+
 Or call it from bash — see [AGENTS.md](./AGENTS.md) for the MCP agent prompt, or [skills/SKILL.md](./skills/SKILL.md) for a Claude Code skill prompt.
 
 ### Smaller models
@@ -310,7 +325,7 @@ Search, content search, and glob use early termination — time is roughly const
 
 Rust. ~20,000 lines. No runtime dependencies.
 
-- **tree-sitter** — AST parsing for 14 languages (Rust, TypeScript, TSX, JavaScript, Python, Go, Java, Scala, C, C++, Ruby, PHP, C#, Swift). Used for definition detection, callee extraction, callers query, and structural outlines.
+- **tree-sitter** — AST parsing for 16 languages (Rust, TypeScript, TSX, JavaScript, Python, Go, Java, Scala, C, C++, Ruby, PHP, C#, Swift, Kotlin, Elixir). Used for definition detection, callee extraction, callers query, and structural outlines.
 - **ripgrep internals** (`grep-regex`, `grep-searcher`) — fast content search
 - **ignore** crate — parallel directory walking, searches all files including gitignored
 - **memmap2** — memory-mapped file reads (no buffers)

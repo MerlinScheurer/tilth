@@ -11,11 +11,12 @@ use crate::session::Session;
 use crate::timeout::{self, spawn_with_timeout, SpawnFailure, ThreadTracker};
 
 mod tools;
+pub(crate) mod tree;
 pub(crate) mod write;
 
 use tools::{
-    tool_definitions, tool_deps, tool_diff, tool_files, tool_grok, tool_read, tool_search,
-    tool_session, tool_write,
+    tool_definitions, tool_deps, tool_diff, tool_grok, tool_list, tool_read, tool_savings,
+    tool_search, tool_session, tool_write,
 };
 
 /// Shared dependencies passed through the request → dispatch pipeline.
@@ -69,7 +70,9 @@ const SERVER_INSTRUCTIONS: &str = include_str!("../../prompts/mcp-base.md");
 const EDIT_MODE_EXTRA: &str = include_str!("../../prompts/mcp-edit.md");
 
 /// MCP server over stdio. When `edit_mode` is true, exposes `tilth_write` and
-/// switches `tilth_read` to hashline output format.
+/// switches `tilth_read` to hashline output format. Read-only deployments
+/// (no `--edit`) omit `tilth_write` and its large schema entirely, so they pay
+/// no edit-protocol context tax.
 ///
 /// `scope` overrides the default search root. When provided, tilth chdir's to it
 /// at startup so all tools, git commands, and searches use the correct project root.
@@ -97,6 +100,8 @@ pub fn run(edit_mode: bool, scope: Option<&Path>) -> io::Result<()> {
 
     // Track pending roots/list request (for MCP roots protocol)
     let mut pending_roots_id: Option<Value> = None;
+    // Set once any tool has been dispatched — see `roots_handoff_allowed`.
+    let mut tool_dispatched = false;
 
     for line in stdin.lock().lines() {
         let line = line?;
@@ -118,9 +123,14 @@ pub fn run(edit_mode: bool, scope: Option<&Path>) -> io::Result<()> {
             if msg.get("id") == Some(roots_id) {
                 pending_roots_id = None;
                 // Only apply roots on success and if --scope was NOT explicitly provided
-                if !scope_is_explicit {
-                    if let Some(root_path) = extract_root_from_response(&msg) {
+                if let Some(root_path) = extract_root_from_response(&msg) {
+                    if roots_handoff_allowed(scope_is_explicit, tool_dispatched) {
                         let _ = std::env::set_current_dir(&root_path);
+                    } else if !scope_is_explicit {
+                        eprintln!(
+                            "tilth: warning: ignoring roots/list response that arrived after \
+                             tools started; searches keep resolving against the launch directory."
+                        );
                     }
                 }
                 continue;
@@ -149,6 +159,7 @@ pub fn run(edit_mode: bool, scope: Option<&Path>) -> io::Result<()> {
             params,
         };
 
+        tool_dispatched |= method == "tools/call";
         let response = handle_request(&req, &services);
         serde_json::to_writer(&mut stdout, &response)?;
         stdout.write_all(b"\n")?;
@@ -174,6 +185,19 @@ pub fn run(edit_mode: bool, scope: Option<&Path>) -> io::Result<()> {
     }
 
     Ok(())
+}
+
+/// Whether a roots/list response may still move the server's working
+/// directory.
+///
+/// The handoff mutates process-global state that every in-flight tool reads,
+/// and a tool that outlived its timeout keeps running after the main loop has
+/// moved on — so it would resolve its relative paths against a directory that
+/// changed underneath it. Honoring the handoff only before the first tool call
+/// keeps the mutation inside initialization, where nothing else is running.
+/// An explicit `--scope` outranks roots entirely.
+fn roots_handoff_allowed(scope_is_explicit: bool, tool_dispatched: bool) -> bool {
+    !scope_is_explicit && !tool_dispatched
 }
 
 /// Extract the first root directory path from a roots/list response.
@@ -298,11 +322,22 @@ fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String
     match tool {
         "tilth_read" => tool_read(args, services.cache(), services.session(), edit_mode),
         "tilth_search" => tool_search(args, services.cache(), services.session(), services.bloom()),
-        "tilth_files" => tool_files(args),
+        "tilth_list" => tool_list(args),
+        // Dispatch-only alias for one release: mid-session agents hold a
+        // pre-upgrade tool list that still names tilth_files. Never advertised
+        // (tools/list absence is pinned by `tilth_files_folded_into_tilth_list`);
+        // remove in the next minor.
+        "tilth_files" => tool_list(args).map(|out| {
+            format!(
+                "{}\nnote: tilth_files is now tilth_list — update your call",
+                out.trim_end_matches('\n')
+            )
+        }),
         "tilth_deps" => tool_deps(args, services.bloom()),
         "tilth_grok" => tool_grok(args, services.bloom(), services.session()),
         "tilth_diff" => tool_diff(args),
         "tilth_session" => tool_session(args, services.session()),
+        "tilth_savings" => tool_savings(args, services.session()),
         "tilth_write" if edit_mode => tool_write(args, services.session(), services.bloom()),
         _ => Err(format!("unknown tool: {tool}")),
     }
@@ -399,6 +434,23 @@ mod tests {
     use super::*;
 
     // -- extract_root_from_response -------------------------------------------
+
+    #[test]
+    fn roots_handoff_is_confined_to_initialization() {
+        assert!(
+            roots_handoff_allowed(false, false),
+            "the handoff is the whole point before any tool runs"
+        );
+        assert!(
+            !roots_handoff_allowed(false, true),
+            "a chdir after tools start moves ground under an in-flight tool"
+        );
+        assert!(
+            !roots_handoff_allowed(true, false),
+            "an explicit --scope outranks roots"
+        );
+        assert!(!roots_handoff_allowed(true, true));
+    }
 
     #[test]
     fn extract_root_valid_file_uri() {
@@ -498,7 +550,7 @@ mod tests {
     fn server_instructions_byte_lock() {
         assert_eq!(
             SERVER_INSTRUCTIONS.len(),
-            3466,
+            1399,
             "SERVER_INSTRUCTIONS byte count drifted from baseline"
         );
         assert!(SERVER_INSTRUCTIONS
@@ -509,12 +561,26 @@ mod tests {
             !SERVER_INSTRUCTIONS.contains("\n\n\n"),
             "SERVER_INSTRUCTIONS must not introduce triple newlines (likely a trailing-newline drift in prompts/mcp-base.md)"
         );
-        assert!(SERVER_INSTRUCTIONS.contains("For multi-symbol lookup, separate each with a comma"));
-        assert!(SERVER_INSTRUCTIONS
-            .contains("Re-expanding a previously shown definition returns [shown earlier]"));
         assert!(
-            SERVER_INSTRUCTIONS.contains("tilth_grok: Everything structural about a symbol"),
-            "tilth_grok description must remain in SERVER_INSTRUCTIONS"
+            SERVER_INSTRUCTIONS.contains(
+                "DO NOT pass a relative path or scope without also setting root (absolute)"
+            ),
+            "require-root path discipline must lead the file-I/O guidance"
+        );
+        assert!(
+            SERVER_INSTRUCTIONS.contains("DO NOT pass a file as scope — scope is a directory"),
+            "file-valued-scope steering (#195) must stay in the PATHS guidance"
+        );
+        // De-dup (R1) moved per-tool usage into the schemas. Lock that the
+        // native-vs-tilth steering for weaker models stays verbatim, and that the
+        // per-tool parameter manuals are gone from the always-on instructions field.
+        assert!(SERVER_INSTRUCTIONS.contains("DO NOT use Grep, Read, or Glob."));
+        assert!(SERVER_INSTRUCTIONS
+            .contains("To check what changed, use tilth_diff instead of Bash(git diff/git log)."));
+        assert!(SERVER_INSTRUCTIONS.contains("DO NOT use Bash(git diff) or Bash(git log --patch)."));
+        assert!(
+            !SERVER_INSTRUCTIONS.contains("expand (default 2)"),
+            "per-tool parameter manuals belong in the tool schemas, not the instructions field"
         );
     }
 
@@ -522,11 +588,11 @@ mod tests {
     fn edit_mode_extra_byte_lock() {
         assert_eq!(
             EDIT_MODE_EXTRA.len(),
-            2108,
+            314,
             "EDIT_MODE_EXTRA byte count drifted from refactor baseline"
         );
         assert!(
-            EDIT_MODE_EXTRA.starts_with("\n\ntilth_write: Batch write"),
+            EDIT_MODE_EXTRA.starts_with("\n\ntilth_write replaces the host Edit and Write tools."),
             "EDIT_MODE_EXTRA must keep its leading blank-line separator so format!(\"{{S}}{{E}}\") emits one blank line between sections"
         );
         assert!(EDIT_MODE_EXTRA
@@ -535,7 +601,6 @@ mod tests {
             !EDIT_MODE_EXTRA.contains("\n\n\n"),
             "EDIT_MODE_EXTRA must not introduce triple newlines"
         );
-        assert!(EDIT_MODE_EXTRA.contains("(BOTH line and hash required)"));
     }
 
     #[test]
@@ -545,7 +610,43 @@ mod tests {
         // This asserts the composition still has that shape.
         let combined = format!("{SERVER_INSTRUCTIONS}{EDIT_MODE_EXTRA}");
         assert!(combined.contains(
-            "DO NOT re-read files already shown in expanded search results.\n\ntilth_write: Batch write"
+            "DO NOT re-read files already shown in expanded search results.\n\ntilth_write replaces"
         ));
+    }
+
+    // -- dispatch_tool: tilth_files alias --------------------------------------
+
+    /// Mid-session upgrade compatibility: agents that fetched the tool list
+    /// before an upgrade still call `tilth_files`. Dispatch accepts the old
+    /// name for one release, serves the list handler, and appends a rename
+    /// note. The old name stays out of tools/list (pinned by
+    /// `tilth_files_folded_into_tilth_list`).
+    #[test]
+    fn dispatch_accepts_tilth_files_as_list_alias() {
+        let project = tempfile::tempdir().unwrap();
+        let p = project.path();
+        std::fs::create_dir(p.join("src")).unwrap();
+        std::fs::write(p.join("src/main.rs"), "fn main() {}").unwrap();
+        let args = serde_json::json!({
+            "patterns": ["*.rs"],
+            "scope": p.to_str().unwrap(),
+        });
+        let services = Services::new(false);
+
+        let out = dispatch_tool("tilth_files", &args, &services)
+            .expect("tilth_files must dispatch to the list handler");
+        assert!(out.contains("main.rs"), "expected tree output: {out}");
+        assert!(out.contains("tokens"), "expected token rollups: {out}");
+        assert!(
+            out.ends_with("note: tilth_files is now tilth_list — update your call"),
+            "rename note must close the response: {out}"
+        );
+
+        let canonical =
+            dispatch_tool("tilth_list", &args, &services).expect("tilth_list must dispatch");
+        assert!(
+            !canonical.contains("note: tilth_files"),
+            "canonical tilth_list must not carry the rename note: {canonical}"
+        );
     }
 }
