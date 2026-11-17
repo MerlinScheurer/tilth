@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use ignore::WalkBuilder;
 
 use crate::cache::OutlineCache;
-use crate::read::{detect_file_type, outline};
+use crate::lang::detect_file_type;
+use crate::read::outline;
 use crate::types::{estimate_tokens, FileType};
 
 /// Generate a structural codebase map.
@@ -16,6 +17,7 @@ pub fn generate(scope: &Path, depth: usize, budget: Option<u64>, cache: &Outline
     let mut tree: BTreeMap<PathBuf, Vec<FileEntry>> = BTreeMap::new();
 
     let walker = WalkBuilder::new(scope)
+        .follow_links(true)
         .hidden(false)
         .git_ignore(false)
         .git_global(false)
