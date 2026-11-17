@@ -59,6 +59,7 @@ src/
 │   │                    kind:callers`); enclosing-scope annotation
 │   ├── callees.rs       Resolve function calls inside a definition
 │   ├── deps.rs          Blast-radius analysis (`tilth_deps`)
+│   ├── grok.rs          One-call symbol bundle (`tilth_grok`)
 │   ├── glob.rs          Glob query → file list (`tilth_files`)
 │   ├── blast.rs         Symbol-level blast radius
 │   ├── bloom_walk.rs    Shared walker preamble (size gating, mtime,
@@ -160,9 +161,10 @@ methods worth describing in detail:
 
 - `initialize` — emits `protocolVersion`, capabilities, `serverInfo`,
   and an `instructions` string. The instructions are the
-  `SERVER_INSTRUCTIONS` constant (recently rewritten on `fd3de77` as a
-  pre-flight gate naming the exact Bash commands and host tools to
-  avoid, with concrete `<bad>→<good>` rewrites). When
+  `SERVER_INSTRUCTIONS` constant, loaded at compile time via
+  `include_str!("../../prompts/mcp-base.md")` and rewritten on `fd3de77`
+  as a pre-flight gate naming the exact Bash commands and host tools to
+  avoid, with concrete `<bad>→<good>` rewrites. When
   `TILTH_NO_OVERVIEW` is unset, `overview::fingerprint(cwd)` is
   prepended — a project summary built in <250ms (a stderr warning fires
   if it overruns).
@@ -187,7 +189,7 @@ process-wide `ABANDONED_THREADS` counter logs to stderr once
 accumulation hits 3.
 
 Edit mode (`--edit`) appends an `EDIT_MODE_EXTRA` instruction block
-describing `tilth_edit` and unlocks the `tilth_edit` dispatch arm.
+describing `tilth_write` and unlocks the `tilth_write` dispatch arm.
 
 ## Query pipeline
 
@@ -555,7 +557,7 @@ Make.
 - `is_generated_by_name`, `is_generated_by_content` — lockfile names
   and `@generated`/`DO NOT EDIT`-style markers (12 variants).
 - `is_minified_by_name`, `is_minified_by_content` — naming convention
-  + density check.
+  - density check.
 
 `lang::treesitter::DEFINITION_KINDS` is the canonical list of
 tree-sitter node kinds tilth treats as definitions across all
@@ -726,19 +728,24 @@ shapes; the in-process `dispatch_tool` and the per-tool functions
 lookups rather than typed structs.
 
 **Instructions injection.** The `SERVER_INSTRUCTIONS` constant is the
-strategic guidance every host gets at `initialize`. It names exact bad
-commands (`Bash(grep/cat/find)`) and provides `<bad>→<good>` rewrites
-because agents kept reaching for those despite earlier "DO NOT use
+strategic guidance every host gets at `initialize`. It lives in
+`prompts/mcp-base.md` and is wired in at compile time via
+`include_str!`. The text names exact bad commands
+(`Bash(grep/cat/find)`) and provides `<bad>→<good>` rewrites because
+agents kept reaching for those despite earlier "DO NOT use
 Grep/Read/Glob" rules. Edit mode appends an `EDIT_MODE_EXTRA` block
-with the `tilth_edit` instructions. `overview::fingerprint(cwd)` is
-prepended unless `TILTH_NO_OVERVIEW` is set — a brief summary of
-language counts, manifests, hot files, and git context.
+from `prompts/mcp-edit.md` with the `tilth_write` instructions.
+`overview::fingerprint(cwd)` is prepended unless `TILTH_NO_OVERVIEW`
+is set — a brief summary of language counts, manifests, hot files,
+and git context.
 
 `AGENTS.md` at the repo root is the user-facing copy of these
 instructions for hosts that read prompts from disk rather than via
-the MCP `instructions` field. It must stay in sync with
-`SERVER_INSTRUCTIONS`; that's a manual discipline, not enforced by
-tooling.
+the MCP `instructions` field. It is regenerated from the same
+`prompts/*.md` files via `scripts/regen-agents-md.sh`, so editing the
+markdown and re-running the script keeps both surfaces in lockstep.
+Byte-equality tests in `src/mcp/mod.rs` lock the runtime strings to
+their refactor baseline and flag accidental drift.
 
 ## Cross-cutting modules
 

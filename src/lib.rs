@@ -18,6 +18,7 @@ pub mod cache;
 pub(crate) mod classify;
 pub mod diff;
 pub(crate) mod edit;
+pub(crate) mod edit_parse_check;
 pub mod error;
 pub(crate) mod format;
 pub mod index;
@@ -182,6 +183,22 @@ pub fn run_deps(
     let result = search::deps::analyze_deps(path, scope, &bloom)?;
     let budget_usize = budget_tokens.map(|b| b as usize);
     Ok(search::deps::format_deps(&result, scope, budget_usize))
+}
+
+/// Grok a symbol: return def + doc + callees + callers + siblings + tests in one call.
+///
+/// `target_spec` accepts a bare symbol name (`parse_unified_diff`), a path:line
+/// pair (`src/diff/parse.rs:7`), or a `Type::method` reference.
+pub fn run_grok(target_spec: &str, scope: &Path, full: bool) -> Result<String, TilthError> {
+    let bloom = index::bloom::BloomFilterCache::new();
+    let session = session::Session::default();
+    let caps = if full {
+        search::grok::GrokCaps::full()
+    } else {
+        search::grok::GrokCaps::default()
+    };
+    let result = search::grok::grok(target_spec, scope, &bloom, &session, caps)?;
+    Ok(search::grok::format_grok(&result, scope))
 }
 
 fn run_inner(

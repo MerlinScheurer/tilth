@@ -48,7 +48,7 @@ struct Cli {
     #[arg(long)]
     mcp: bool,
 
-    /// Enable edit mode: hashline output + tilth_edit tool.
+    /// Enable edit mode: hashline output + tilth_write tool.
     #[arg(long)]
     edit: bool,
 
@@ -94,7 +94,7 @@ enum Command {
         /// MCP host to configure.
         host: String,
 
-        /// Enable edit mode (hashline output + tilth_edit tool).
+        /// Enable edit mode (hashline output + tilth_write tool).
         #[arg(long)]
         edit: bool,
     },
@@ -142,6 +142,22 @@ enum Command {
     },
     /// Show the project fingerprint (what MCP init would inject).
     Overview,
+    /// Grok a symbol — one call returns def + doc + callees + callers + siblings + tests.
+    ///
+    /// Target accepts: bare symbol (`parse_unified_diff`), path:line
+    /// (`src/diff/parse.rs:7`), or qualified name (`Type::method`).
+    Grok {
+        /// Symbol name or path:line.
+        target: String,
+
+        /// Restrict search to a subdirectory.
+        #[arg(long, default_value = ".")]
+        scope: PathBuf,
+
+        /// Widen output caps (more callers, callees, siblings, tests).
+        #[arg(long)]
+        full: bool,
+    },
 }
 
 fn main() {
@@ -171,6 +187,20 @@ fn main() {
                     process::exit(1);
                 }
                 println!("{output}");
+            }
+            Command::Grok {
+                target,
+                scope,
+                full,
+            } => {
+                let scope = scope.canonicalize().unwrap_or(scope);
+                match tilth::run_grok(&target, &scope, full) {
+                    Ok(output) => emit_output(&output, io::stdout().is_terminal()),
+                    Err(e) => {
+                        eprintln!("grok error: {e}");
+                        process::exit(e.exit_code());
+                    }
+                }
             }
             Command::Diff {
                 source,

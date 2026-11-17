@@ -8,7 +8,7 @@ Rust MCP server + CLI for AST-aware code intelligence. Tree-sitter outlines, sym
 src/
   main.rs              CLI entry (clap). Dispatches to MCP, map, or single-query mode.
   lib.rs               Public API: classify query → read/search/glob → formatted output.
-  mcp.rs               MCP server (JSON-RPC on stdio). SERVER_INSTRUCTIONS + EDIT_MODE_EXTRA.
+  mcp/mod.rs           MCP server (JSON-RPC on stdio). Embeds SERVER_INSTRUCTIONS + EDIT_MODE_EXTRA via include_str! from prompts/.
   classify.rs          Query type detection (file path, glob, symbol, content, fallthrough).
   lang/
     mod.rs             Shared language infrastructure: detect_file_type(), package_root().
@@ -36,6 +36,7 @@ src/
     callers.rs         Structural call-site detection (tree-sitter + memchr pre-filter).
     callees.rs         Callee extraction and resolution for expanded definitions.
     siblings.rs        Sibling symbol surfacing in search results.
+    grok.rs            One-call symbol bundle (def + body + callers + callees + siblings + tests).
     deps.rs            File-level dependency analysis (imports + dependents with symbols).
     rank.rs            Result ranking (definition weight, basename boost, context proximity).
     facets.rs          Faceted result grouping (definitions, usages, implementations).
@@ -48,7 +49,7 @@ src/
     bloom.rs           Bloom filter cache for fast "file contains symbol?" pre-check.
   cache.rs             OutlineCache — DashMap of path → (mtime, outline). Shared across tools.
   session.rs           MCP session state — tracks previously expanded definitions for dedup.
-  edit.rs              Hash-anchored editing (tilth_edit). Hashline verification + atomic apply.
+  edit.rs              Hash-anchored editing (tilth_write hash mode). Hashline verification + atomic apply.
   install.rs           `tilth install <host>` — writes MCP config for 6 hosts.
   format.rs            Output formatting helpers.
   budget.rs            Token budget enforcement.
@@ -57,7 +58,8 @@ src/
   error.rs             Error types with exit codes.
 npm/                   npm wrapper — postinstall downloads binary, run.js proxies to it.
 benchmark/             Evaluation harness (see Benchmarks section below).
-AGENTS.md              MCP tool usage instructions shipped to users (read by Claude Code).
+prompts/               MCP server instruction source (mcp-base.md + mcp-edit.md). Embedded into the binary at compile time and regenerated into AGENTS.md.
+AGENTS.md              User-facing copy of the MCP instructions. Generated from prompts/*.md via scripts/regen-agents-md.sh — do not edit directly.
 ```
 
 ## Languages supported
@@ -86,11 +88,13 @@ Update version in **both** `Cargo.toml` and `npm/package.json`. Tag with `v<vers
 26 code navigation tasks across 4 repos (Express/JS, FastAPI/Python, Gin/Go, ripgrep/Rust). Each task runs headless `claude -p` with a question, checks answer against ground-truth strings.
 
 **Setup** (one-time — clones repos at pinned commits):
+
 ```bash
 python benchmark/fixtures/setup.py
 ```
 
 **Run** (from project root — works inside Conductor/Claude Code sessions, `run.py` strips `CLAUDECODE` env var):
+
 ```bash
 # Full suite: all tasks, baseline + tilth, 3 reps per task
 python benchmark/run.py --models sonnet --reps 3 --tasks all --modes all
@@ -106,6 +110,7 @@ python benchmark/run.py --models haiku --reps 3 --tasks rg_search_dispatch,rg_tr
 Hard tasks take 2-5 min each. Run in background for multi-task suites. Do NOT pipe output through `head` or similar — it breaks the pipe and causes timeouts.
 
 **Analyze**:
+
 ```bash
 python benchmark/analyze.py benchmark/results/benchmark_<timestamp>_<model>.jsonl
 python benchmark/compare_versions.py old.jsonl new.jsonl
@@ -122,13 +127,15 @@ Task definitions are in `benchmark/tasks/*.py`. Each has `name`, `prompt`, `grou
 
 ## MCP instructions
 
-Server instructions sent via MCP protocol live in `src/mcp.rs`:
-- `SERVER_INSTRUCTIONS` — base instructions for all modes
-- `EDIT_MODE_EXTRA` — appended in edit mode (hashline format, edit workflow)
+Server instructions sent via MCP protocol live in `prompts/`:
 
-`AGENTS.md` is the user-facing copy read directly by Claude Code (not via MCP protocol). Both should stay in sync.
+- `prompts/mcp-base.md` — base instructions for all modes (wired in as `SERVER_INSTRUCTIONS`)
+- `prompts/mcp-edit.md` — appended in edit mode (wired in as `EDIT_MODE_EXTRA`)
+
+`src/mcp/mod.rs` embeds both at compile time via `include_str!`. `AGENTS.md` is the user-facing copy; regenerate it via `./scripts/regen-agents-md.sh` after any change so both surfaces stay in lockstep. The byte-lock tests in `src/mcp/mod.rs` (`server_instructions_byte_lock`, `edit_mode_extra_byte_lock`) flag accidental drift and must be updated alongside intentional prompt edits.
 
 Changes to MCP instructions must be surgical — no bloat. Haiku is sensitive to:
+
 - Instruction positioning (top-weighted — put important guidance first)
 - Framing ("DO NOT" works better than "IMPORTANT:" for weaker models)
 - Concrete examples (tool call patterns, not abstract descriptions)

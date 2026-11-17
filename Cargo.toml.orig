@@ -1,6 +1,6 @@
 [package]
 name = "tilth"
-version = "0.8.4"
+version = "0.9.0"
 edition = "2021"
 description = "Tree-sitter indexed lookups — smart code reading for AI agents"
 license = "MIT"
@@ -88,6 +88,9 @@ home = "0.5"
 # Terminal size detection (TIOCGWINSZ ioctl, falls back to env vars)
 terminal_size = "0.4"
 
+# O_NOFOLLOW open flag for tilth_write's overwrite path (refuse symlink follow)
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

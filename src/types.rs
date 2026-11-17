@@ -42,6 +42,36 @@ pub enum Lang {
     Make,
 }
 
+impl Lang {
+    /// Returns `true` if the language uses `'` for lifetime ticks (`'a`,
+    /// `'static`) rather than as a string/char delimiter.
+    ///
+    /// Lexers that scan `'` must disambiguate a lifetime from a single-quoted
+    /// literal; only Rust needs the lifetime branch.
+    pub(crate) fn has_lifetimes(self) -> bool {
+        match self {
+            Lang::Rust => true,
+            Lang::TypeScript
+            | Lang::Tsx
+            | Lang::JavaScript
+            | Lang::Python
+            | Lang::Go
+            | Lang::Java
+            | Lang::Scala
+            | Lang::C
+            | Lang::Cpp
+            | Lang::Ruby
+            | Lang::Php
+            | Lang::Swift
+            | Lang::Kotlin
+            | Lang::CSharp
+            | Lang::Elixir
+            | Lang::Dockerfile
+            | Lang::Make => false,
+        }
+    }
+}
+
 /// File type as detected by extension. Determines outline strategy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileType {
@@ -58,6 +88,7 @@ pub enum FileType {
 pub enum ViewMode {
     Full,
     Outline,
+    Signature,
     Keys,
     #[allow(dead_code)]
     HeadTail,
@@ -69,6 +100,7 @@ pub enum ViewMode {
     #[allow(dead_code)]
     Error,
     Section,
+    Stripped,
 }
 
 impl std::fmt::Display for ViewMode {
@@ -76,6 +108,7 @@ impl std::fmt::Display for ViewMode {
         match self {
             Self::Full => write!(f, "full"),
             Self::Outline => write!(f, "outline"),
+            Self::Signature => write!(f, "signature"),
             Self::Keys => write!(f, "keys"),
             Self::HeadTail => write!(f, "head+tail"),
             Self::Empty => write!(f, "empty"),
@@ -84,6 +117,7 @@ impl std::fmt::Display for ViewMode {
             Self::Binary => write!(f, "skipped"),
             Self::Error => write!(f, "error"),
             Self::Section => write!(f, "section"),
+            Self::Stripped => write!(f, "stripped"),
         }
     }
 }
