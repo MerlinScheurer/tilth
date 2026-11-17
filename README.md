@@ -118,6 +118,7 @@ tilth install cursor           # ~/.cursor/mcp.json
 tilth install windsurf         # ~/.codeium/windsurf/mcp_config.json
 tilth install vscode           # .vscode/mcp.json (project scope)
 tilth install claude-desktop
+tilth install opencode         # ~/.opencode.json
 ```
 
 Add `--edit` to enable hash-anchored file editing (see [Edit mode](#edit-mode)):
@@ -223,6 +224,10 @@ The search output format is informed by wavelet multi-resolution (outline header
 ## Name
 
 **tilth** — the state of soil that's been prepared for planting. Your codebase is the soil; tilth gives it structure so you can find where to dig.
+
+## Support
+
+[!["Buy Me A Coffee"](https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png)](https://buymeacoffee.com/jahala)
 
 ## License
 
