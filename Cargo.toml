@@ -12,7 +12,7 @@
 [package]
 edition = "2021"
 name = "tilth"
-version = "0.6.1"
+version = "0.6.2"
 build = false
 autolib = false
 autobins = false
@@ -100,6 +100,9 @@ version = "0.23"
 
 [dependencies.tree-sitter-cpp]
 version = "0.23"
+
+[dependencies.tree-sitter-elixir]
+version = "0.3"
 
 [dependencies.tree-sitter-go]
 version = "0.23"
