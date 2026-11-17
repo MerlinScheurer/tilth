@@ -37,10 +37,12 @@ pub fn outline_language(lang: Lang) -> Option<tree_sitter::Language> {
         Lang::C => tree_sitter_c::LANGUAGE,
         Lang::Cpp => tree_sitter_cpp::LANGUAGE,
         Lang::Ruby => tree_sitter_ruby::LANGUAGE,
+        Lang::Php => tree_sitter_php::LANGUAGE_PHP,
         // Languages without shipped grammars — fall back
         Lang::CSharp => tree_sitter_c_sharp::LANGUAGE,
         Lang::Swift => tree_sitter_swift::LANGUAGE,
-        Lang::Kotlin | Lang::Dockerfile | Lang::Make => {
+        Lang::Kotlin => tree_sitter_kotlin_ng::LANGUAGE,
+        Lang::Dockerfile | Lang::Make => {
             return None;
         }
     };
@@ -117,6 +119,7 @@ fn node_to_entry(
         "interface_declaration"
         | "type_alias_declaration"
         | "trait_item"
+        | "trait_declaration"
         | "trait_definition"
         | "protocol_declaration" => {
             let name = find_child_text(node, "name", lines).unwrap_or_else(|| "<anonymous>".into());
@@ -139,8 +142,8 @@ fn node_to_entry(
             (OutlineKind::Module, format!("impl {name}"), None)
         }
 
-        // Objects (Scala companion objects, singletons)
-        "object_definition" => {
+        // Objects (Scala companion objects, singletons; Kotlin object declarations)
+        "object_declaration" | "object_definition" => {
             let name = find_child_text(node, "name", lines)
                 .or_else(|| find_child_text(node, "identifier", lines))
                 .unwrap_or_else(|| "<anonymous>".into());
@@ -148,8 +151,10 @@ fn node_to_entry(
         }
 
         // Constants and variables
-        "const_item" | "static_item" => {
-            let name = find_child_text(node, "name", lines).unwrap_or_else(|| "<const>".into());
+        "const_item" | "const_declaration" | "static_item" => {
+            let name = find_child_text(node, "name", lines)
+                .or_else(|| first_identifier_text(node, lines))
+                .unwrap_or_else(|| "<const>".into());
             (OutlineKind::Constant, name, None)
         }
         "val_definition" => {
@@ -161,15 +166,22 @@ fn node_to_entry(
             (OutlineKind::Variable, name, None)
         }
 
-        // Properties (C#, Swift)
+        // Properties (C#, Swift, Kotlin)
         "property_declaration" | "protocol_property_declaration" => {
-            let name = find_child_text(node, "name", lines).unwrap_or_else(|| "<property>".into());
+            let name = find_child_text(node, "name", lines)
+                .or_else(|| first_identifier_text(node, lines))
+                .unwrap_or_else(|| "<property>".into());
             let sig = extract_signature(node, lines);
             (OutlineKind::Property, name, Some(sig))
         }
 
         // Imports — collect as a group
-        "import_statement" | "import_declaration" | "use_declaration" | "use_item"
+        "import_statement"
+        | "import_declaration"
+        | "import"
+        | "use_declaration"
+        | "namespace_use_declaration"
+        | "use_item"
         | "using_directive" => {
             let text = node_text(node, lines);
             (OutlineKind::Import, text, None)
@@ -182,7 +194,11 @@ fn node_to_entry(
         }
 
         // Module declarations
-        "mod_item" | "module" | "namespace_declaration" | "file_scoped_namespace_declaration" => {
+        "mod_item"
+        | "module"
+        | "namespace_declaration"
+        | "namespace_definition"
+        | "file_scoped_namespace_declaration" => {
             let name = find_child_text(node, "name", lines).unwrap_or_else(|| "<module>".into());
             (OutlineKind::Module, name, None)
         }
@@ -193,7 +209,7 @@ fn node_to_entry(
     // Collect children for classes, impls, modules, traits/interfaces
     let is_namespace = matches!(
         kind_str,
-        "namespace_declaration" | "file_scoped_namespace_declaration"
+        "namespace_declaration" | "namespace_definition" | "file_scoped_namespace_declaration"
     );
     let children = if matches!(
         kind,
@@ -306,16 +322,21 @@ fn node_text(node: tree_sitter::Node, lines: &[&str]) -> String {
 }
 
 /// Find the first identifier-like child.
+/// Recurses one level through declarators and `variable_declaration` nodes to find
+/// the actual identifier inside wrapper nodes (e.g. Kotlin `property_declaration`
+/// → `variable_declaration` → `simple_identifier`).
 fn first_identifier_text(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         let kind = child.kind();
-        if kind.contains("identifier") || kind.contains("name") || kind.contains("declarator") {
+        if kind.contains("identifier") || kind.contains("name") {
             let text = node_text(child, lines);
             if !text.is_empty() {
                 return Some(text);
             }
-            // Recurse one level for variable_declarator → identifier
+        }
+        // Recurse one level through wrapper nodes (variable_declarator, variable_declaration)
+        if kind.contains("declarator") || kind.contains("declaration") {
             let mut inner = child.walk();
             for grandchild in child.children(&mut inner) {
                 if grandchild.kind().contains("identifier") {
@@ -527,6 +548,8 @@ fn format_entry(entry: &OutlineEntry, indent: usize, lang: Lang) -> String {
         OutlineKind::Function => {
             if lang == Lang::Scala {
                 "def"
+            } else if lang == Lang::Kotlin {
+                "fun"
             } else {
                 "fn"
             }
@@ -554,7 +577,7 @@ fn format_entry(entry: &OutlineEntry, indent: usize, lang: Lang) -> String {
         OutlineKind::Export => "export",
         OutlineKind::Property => "prop",
         OutlineKind::Module => {
-            if lang == Lang::Scala {
+            if lang == Lang::Scala || lang == Lang::Kotlin {
                 "object"
             } else {
                 "mod"
@@ -635,5 +658,124 @@ type UserId = String
         assert!(outline.contains("def load"));
         assert!(outline.contains("def connect"));
         assert!(outline.contains("def create"));
+    }
+
+    #[test]
+    fn php_outline_constructs() {
+        let php_code = r#"<?php
+namespace App\Services;
+
+use App\Support\Client;
+
+trait LogsQueries {
+    public function log(string $query): void {}
+}
+
+class UserService {
+    use LogsQueries;
+
+    public function __construct(private Client $client) {}
+
+    public function findUser(int $id): array {
+        return $this->client->loadUser($id);
+    }
+}
+"#;
+
+        let outline = outline(php_code, Lang::Php, 1000);
+
+        assert!(outline.contains("mod App\\Services"));
+        assert!(outline.contains("imports: App\\Support\\Client"));
+        assert!(outline.contains("interface LogsQueries"));
+        assert!(outline.contains("class UserService"));
+        assert!(outline.contains("fn findUser"));
+    }
+
+    #[test]
+    fn kotlin_outline_constructs() {
+        let kotlin_code = r#"
+package com.example
+
+import kotlin.collections.List
+import kotlin.io.println
+
+interface Drawable {
+    fun draw()
+}
+
+data class Point(val x: Int, val y: Int)
+
+class Canvas : Drawable {
+    val width = 800
+    var height = 600
+
+    override fun draw() {
+        println("Drawing")
+    }
+
+    fun resize(w: Int, h: Int) {}
+
+    companion object {
+        fun create(): Canvas = Canvas()
+    }
+}
+
+object Registry {
+    fun register(item: Drawable) {}
+}
+
+enum class Color {
+    RED, GREEN, BLUE
+}
+
+fun String.isPalindrome(): Boolean = this == this.reversed()
+
+fun main() {
+    val canvas = Canvas()
+    canvas.draw()
+}
+"#;
+
+        let outline = outline(kotlin_code, Lang::Kotlin, 1000);
+
+        // Imports
+        assert!(
+            outline.contains("imports:"),
+            "should have collapsed imports"
+        );
+        // Interface (shown as class since Kotlin grammar uses class_declaration)
+        assert!(outline.contains("class Drawable"), "should have Drawable");
+        // Data class
+        assert!(outline.contains("class Point"), "should have Point");
+        // Regular class with methods
+        assert!(outline.contains("class Canvas"), "should have Canvas");
+        assert!(outline.contains("fun draw"), "should have draw method");
+        assert!(outline.contains("fun resize"), "should have resize method");
+        // Properties inside classes
+        assert!(outline.contains("prop width"), "should have width property");
+        assert!(
+            outline.contains("prop height"),
+            "should have height property"
+        );
+        // Object declaration
+        assert!(
+            outline.contains("object Registry"),
+            "should have Registry object"
+        );
+        assert!(
+            outline.contains("fun register"),
+            "should have register method"
+        );
+        // Enum class
+        assert!(outline.contains("class Color"), "should have Color enum");
+        // Top-level functions
+        assert!(
+            outline.contains("fun isPalindrome"),
+            "should have extension fun"
+        );
+        assert!(outline.contains("fun main"), "should have main");
+        // Kotlin-specific labels
+        assert!(outline.contains("fun "), "should use 'fun' not 'fn'");
+        assert!(!outline.contains("fn "), "should not use 'fn' for Kotlin");
     }
 }

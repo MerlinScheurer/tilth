@@ -13,7 +13,7 @@ src/
   read/
     mod.rs             File reading with smart view (full vs outline based on token count).
     outline/
-      code.rs          Tree-sitter outlines for 12 languages. outline_language() maps Lang → grammar.
+      code.rs          Tree-sitter outlines for 14 languages. outline_language() maps Lang → grammar.
       markdown.rs      Markdown heading-based outlines.
       structured.rs    JSON/YAML/TOML structured outlines.
       test_file.rs     Test file detection (suppresses outline noise).
@@ -34,6 +34,7 @@ src/
     truncate.rs        Smart truncation to fit budget constraints.
     glob.rs            File glob search.
     treesitter.rs      Shared tree-sitter query patterns (callee/caller/sibling).
+    blast.rs           Blast radius — find callers of definitions touched by edits.
   index/
     symbol.rs          In-memory symbol index (built on first search, cached).
     bloom.rs           Bloom filter cache for fast "file contains symbol?" pre-check.
@@ -53,7 +54,7 @@ AGENTS.md              MCP tool usage instructions shipped to users (read by Cla
 
 ## Languages supported
 
-Rust, TypeScript, TSX, JavaScript, Python, Go, Java, C, C++, Ruby, C#, Swift.
+Rust, TypeScript, TSX, JavaScript, Python, Go, Java, C, C++, Ruby, PHP, C#, Swift.
 Kotlin, Dockerfile, Make detected but have no tree-sitter grammar (outline returns None).
 
 ## Build, test, install

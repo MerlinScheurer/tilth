@@ -1,3 +1,4 @@
+pub mod blast;
 pub mod callees;
 pub mod callers;
 pub mod content;
@@ -100,6 +101,13 @@ pub(crate) fn package_root(path: &Path) -> Option<&Path> {
 /// Build a parallel directory walker that searches ALL files except known junk directories.
 /// Does NOT respect .gitignore — ensures gitignored but locally-relevant files are found.
 pub(crate) fn walker(scope: &Path) -> ignore::WalkParallel {
+    let threads = std::env::var("TILTH_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism().map_or(4, |n| (n.get() / 2).clamp(2, 6))
+        });
+
     WalkBuilder::new(scope)
         .hidden(false)
         .git_ignore(false)
@@ -107,6 +115,7 @@ pub(crate) fn walker(scope: &Path) -> ignore::WalkParallel {
         .git_exclude(false)
         .ignore(false)
         .parents(false)
+        .threads(threads)
         .filter_entry(|entry| {
             if entry.file_type().is_some_and(|ft| ft.is_dir()) {
                 if let Some(name) = entry.file_name().to_str() {
@@ -229,6 +238,16 @@ pub fn search_content(
 ) -> Result<String, TilthError> {
     let (pattern, is_regex) = parse_pattern(query);
     let result = content::search(pattern, scope, is_regex, None)?;
+    let bloom = crate::index::bloom::BloomFilterCache::new();
+    format_search_result(&result, cache, None, &bloom, 0)
+}
+
+pub fn search_regex(
+    pattern: &str,
+    scope: &Path,
+    cache: &OutlineCache,
+) -> Result<String, TilthError> {
+    let result = content::search(pattern, scope, true, None)?;
     let bloom = crate::index::bloom::BloomFilterCache::new();
     format_search_result(&result, cache, None, &bloom, 0)
 }
