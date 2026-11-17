@@ -12,7 +12,7 @@
 [package]
 edition = "2021"
 name = "tilth"
-version = "0.2.1"
+version = "0.3.2"
 build = false
 autolib = false
 autobins = false
@@ -83,11 +83,14 @@ features = ["derive"]
 [dependencies.serde_json]
 version = "1"
 
+[dependencies.streaming-iterator]
+version = "0.1"
+
 [dependencies.toml]
 version = "0.8"
 
 [dependencies.tree-sitter]
-version = "0.24"
+version = "0.25"
 
 [dependencies.tree-sitter-c]
 version = "0.24"
