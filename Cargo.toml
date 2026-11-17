@@ -12,7 +12,7 @@
 [package]
 edition = "2021"
 name = "tilth"
-version = "0.5.3"
+version = "0.5.4"
 build = false
 autolib = false
 autobins = false
