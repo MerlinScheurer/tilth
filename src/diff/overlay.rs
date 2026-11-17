@@ -10,6 +10,7 @@ use super::{
     ChangeType, Conflict, DiffLine, DiffLineKind, FileDiff, FileOverlay, FileStatus, Hunk,
     MatchConfidence, Side, Sides, SymbolChange,
 };
+use crate::git::{Git, GitError};
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -19,14 +20,10 @@ use super::{
 ///
 /// Reads the old and new content from `sides`, outlines both versions, runs
 /// three-phase symbol matching, and gives every patch line to the innermost
-/// changed symbol that holds it. Lines outside every changed symbol, and all
-/// lines of a file with no outline, stay visible in `other_lines`. `repo`
-/// anchors git commands and working-tree reads.
-pub(crate) fn compute_overlay(
-    file_diff: &FileDiff,
-    sides: &Sides,
-    repo: Option<&Path>,
-) -> FileOverlay {
+/// symbol that holds it (see `attribute_lines`). Lines no symbol takes, and
+/// all lines of a file with no outline, stay visible in `other_lines`.
+/// `repo` anchors git commands and working-tree reads.
+pub(crate) fn compute_overlay(file_diff: &FileDiff, sides: &Sides, repo: &Path) -> FileOverlay {
     let (added, removed) = count_changed_lines(&file_diff.hunks);
     let mut overlay = FileOverlay {
         path: file_diff.path.clone(),
@@ -36,9 +33,9 @@ pub(crate) fn compute_overlay(
         added,
         removed,
         conflicts: Vec::new(),
-        new_content: None,
         is_generated: file_diff.is_generated,
         is_binary: file_diff.is_binary,
+        read_error: None,
     };
 
     // Binary or generated files: counts only, the formatter summarizes them.
@@ -48,15 +45,15 @@ pub(crate) fn compute_overlay(
 
     let mut changes = match file_contents(file_diff, sides, repo) {
         // When either side cannot be read, matching would report every
-        // symbol as added or deleted. Skip it; the lines still show.
-        Err(_) => Vec::new(),
+        // symbol as added or deleted. Skip it and keep the reason; the lines
+        // still show.
+        Err(e) => {
+            overlay.read_error = Some(e);
+            Vec::new()
+        }
         Ok((old, new)) => {
             let old_path = file_diff.old_path.as_deref().unwrap_or(&file_diff.path);
-            let changes = symbol_changes(old_path, &file_diff.path, &old, &new);
-            if file_diff.status != FileStatus::Deleted {
-                overlay.new_content = Some(new);
-            }
-            changes
+            symbol_changes(old_path, &file_diff.path, &old, &new)
         }
     };
     // A whole added or deleted file lists its declarations, not its imports.
@@ -164,8 +161,12 @@ pub(crate) fn signature_warnings<'a>(
 }
 
 /// Scan a file for merge conflict markers and extract conflict blocks.
-pub(crate) fn detect_conflicts(path: &Path, repo: Option<&Path>) -> Vec<Conflict> {
-    let disk = on_disk(repo, path);
+pub(crate) fn detect_conflicts(path: &Path, repo: &Path) -> Vec<Conflict> {
+    let disk = repo.join(path);
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the structural diff reads strictly until #312"
+    )]
     let Ok(content) = tilth_core::source::read_to_string(&disk) else {
         return Vec::new();
     };
@@ -250,16 +251,19 @@ fn symbol_changes(old_path: &Path, path: &Path, old: &str, new: &str) -> Vec<Sym
     match_symbols(&old_syms.unwrap_or_default(), &new_syms.unwrap_or_default())
 }
 
-/// Give each patch line to the innermost changed symbol whose span holds it:
-/// a removed line by its old line number, any other line by its new one.
-/// Returns the lines no changed symbol holds. Within one hunk, a symbol (or
-/// the outside) that receives only context lines receives none.
+/// Give each patch line to the innermost symbol whose span holds it: a
+/// removed line by its old line number, any other line by its new one. A
+/// changed line goes only to a changed symbol; a context line goes to any
+/// symbol, so the context inside an unchanged symbol stays with it. Returns
+/// the lines no symbol takes. Within one hunk, a symbol (or the outside)
+/// that receives only context lines receives none, so an unchanged symbol
+/// never receives any.
 fn attribute_lines(hunks: &[Hunk], changes: &mut [SymbolChange]) -> Vec<DiffLine> {
     let mut other = Vec::new();
     for hunk in hunks {
         let mut groups: Vec<(Option<usize>, Vec<DiffLine>)> = Vec::new();
         for line in &hunk.lines {
-            let owner = innermost_change(changes, line);
+            let owner = innermost_owner(changes, line);
             match groups.iter_mut().find(|(o, _)| *o == owner) {
                 Some((_, lines)) => lines.push(line.clone()),
                 None => groups.push((owner, vec![line.clone()])),
@@ -278,11 +282,13 @@ fn attribute_lines(hunks: &[Hunk], changes: &mut [SymbolChange]) -> Vec<DiffLine
     other
 }
 
-fn innermost_change(changes: &[SymbolChange], line: &DiffLine) -> Option<usize> {
+fn innermost_owner(changes: &[SymbolChange], line: &DiffLine) -> Option<usize> {
     changes
         .iter()
         .enumerate()
-        .filter(|(_, c)| !matches!(c.change, ChangeType::Unchanged))
+        .filter(|(_, c)| {
+            line.kind == DiffLineKind::Context || !matches!(c.change, ChangeType::Unchanged)
+        })
         .filter_map(|(i, c)| {
             let (start, end) = if line.kind == DiffLineKind::Removed {
                 c.old_span?
@@ -304,7 +310,7 @@ fn innermost_change(changes: &[SymbolChange], line: &DiffLine) -> Option<usize> 
 fn file_contents(
     file_diff: &FileDiff,
     sides: &Sides,
-    repo: Option<&Path>,
+    repo: &Path,
 ) -> Result<(String, String), String> {
     let old = if file_diff.status == FileStatus::Added {
         String::new()
@@ -320,48 +326,53 @@ fn file_contents(
     Ok((old, new))
 }
 
-/// Read `path` (repository-relative) from one side of a diff.
-fn read_side(side: &Side, path: &Path, repo: Option<&Path>) -> Result<String, String> {
+/// Read the file the patch names `path` from one side of a diff. Git runs
+/// in `repo` and names a file from there: from the repository top, or for
+/// a file pair from the side's own root.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the structural diff reads strictly until #312"
+)]
+fn read_side(side: &Side, path: &Path, repo: &Path) -> Result<String, String> {
     let path_str = path.to_string_lossy();
+    let read = |file: &Path| {
+        tilth_core::source::read_to_string(&repo.join(file))
+            .map_err(|e| format!("cannot read {}: {e}", file.display()))
+    };
     match side {
-        Side::Rev(rev) => git_show(&format!("{rev}:{path_str}"), repo),
-        Side::Index => git_show(&format!(":{path_str}"), repo),
-        Side::WorkingTree => {
-            let disk = on_disk(repo, path);
-            tilth_core::source::read_to_string(&disk)
-                .map_err(|e| format!("read {}: {e}", disk.display()))
-        }
-        Side::File(file) => tilth_core::source::read_to_string(file)
-            .map_err(|e| format!("read {}: {e}", file.display())),
+        Side::Rev(rev) => git_show(&format!("{rev}:{path_str}"), repo).map_err(|e| e.to_string()),
+        Side::Index => git_show(&format!(":{path_str}"), repo).map_err(|e| e.to_string()),
+        Side::WorkingTree => read(path),
+        Side::File(root) => read(&file_under(root, path).ok_or_else(|| {
+            format!(
+                "cannot read {}: the patch names it outside {}",
+                path.display(),
+                root.display()
+            )
+        })?),
         Side::Unavailable => Ok(String::new()),
     }
 }
 
-/// Working-tree location of a repo-relative diff path. Git emits paths
-/// relative to the repo top-level; when the diff is anchored to a `repo`
-/// other than the process cwd they must be joined under it before any
-/// filesystem access.
-fn on_disk(repo: Option<&Path>, path: &Path) -> PathBuf {
-    repo.map_or_else(|| path.to_path_buf(), |r| r.join(path))
+/// The file the patch names `path` in one side of a file pair, whose root
+/// is a file or a directory. Git names it as the root followed by its path
+/// inside, and drops an absolute root's leading `/`. A root that is a file
+/// is the file itself.
+fn file_under(root: &Path, path: &Path) -> Option<PathBuf> {
+    fn unrooted(p: &Path) -> &Path {
+        p.strip_prefix("/").unwrap_or(p)
+    }
+    let inside = unrooted(path).strip_prefix(unrooted(root)).ok()?;
+    Some(if inside.as_os_str().is_empty() {
+        root.to_path_buf()
+    } else {
+        root.join(inside)
+    })
 }
 
-pub(super) fn git_show(spec: &str, repo: Option<&Path>) -> Result<String, String> {
-    let output = super::git_command(repo)
-        .args([
-            "-c",
-            "core.quotePath=false",
-            "show",
-            "--end-of-options",
-            spec,
-        ])
-        .output()
-        .map_err(|e| format!("git show failed: {e}"))?;
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(format!("git show {spec}: {}", stderr.trim()))
-    }
+/// The content `spec` (`<rev>:<path>`, or `:<path>` for the index) names.
+pub(super) fn git_show(spec: &str, repo: &Path) -> Result<String, GitError> {
+    Git::new(repo, "show").revision(spec).run()
 }
 
 // ---------------------------------------------------------------------------
@@ -398,13 +409,15 @@ mod tests {
         // A single ref (no `..`) diffs against the working tree, so the new
         // content must come from the file on disk — not `git show HEAD:<path>`,
         // which would return empty here and silently mis-attribute the diff.
-        let content = read_side(&Side::WorkingTree, &file, None).expect("working-tree read");
+        let content = read_side(&Side::WorkingTree, &file, dir.path()).expect("working-tree read");
         assert!(content.contains("worktree_only"), "{content:?}");
     }
 
     #[test]
     fn revision_ranges_pick_both_sides() {
-        let sides = |r: &str| resolve_sides(&DiffSource::GitRef(r.to_string()), None).unwrap();
+        // None of these ranges runs git, so the repository is never entered.
+        let repo = Path::new("/nonexistent");
+        let sides = |r: &str| resolve_sides(&DiffSource::GitRef(r.to_string()), repo).unwrap();
         // A bare ref compares that ref with the working tree.
         assert_eq!(
             sides("HEAD~1"),
@@ -435,20 +448,18 @@ mod tests {
     fn unreadable_side_skips_symbol_analysis_but_keeps_lines() {
         // When one side cannot be read, matching would report every symbol
         // of the other side as added or deleted. The overlay has no symbols
-        // instead, and the patch lines stay visible.
+        // instead and says why, and the patch lines stay visible.
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("foo.rs");
         std::fs::write(&file, "fn new_fn() {}\n").unwrap();
         let missing = dir.path().join("does_not_exist.rs");
         let sides = Sides {
-            old: Side::File(missing),
+            old: Side::File(missing.clone()),
             new: Side::File(file.clone()),
         };
-        assert!(read_side(&sides.old, &file, None).is_err());
-
         let file_diff = FileDiff {
             path: file,
-            old_path: None,
+            old_path: Some(missing.clone()),
             status: FileStatus::Modified,
             hunks: vec![Hunk {
                 old_start: 1,
@@ -471,8 +482,13 @@ mod tests {
             is_generated: false,
             is_binary: false,
         };
-        let overlay = compute_overlay(&file_diff, &sides, None);
+        let overlay = compute_overlay(&file_diff, &sides, dir.path());
         assert!(overlay.symbol_changes.is_empty(), "{overlay:?}");
+        let error = overlay.read_error.as_deref().unwrap_or_default();
+        assert!(
+            error.starts_with(&format!("cannot read {}: ", missing.display())),
+            "{overlay:?}"
+        );
         assert_eq!(overlay.other_lines.len(), 2, "{overlay:?}");
         assert_eq!((overlay.added, overlay.removed), (1, 1));
     }

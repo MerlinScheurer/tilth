@@ -10,6 +10,7 @@ use grep_regex::RegexMatcher;
 use grep_searcher::sinks::UTF8;
 use grep_searcher::Searcher;
 use tilth_core::error::TilthError;
+use tilth_core::search::walk::Walk;
 
 const MAX_MATCHES: usize = 10;
 const FULL_MAX_MATCHES: usize = 100;
@@ -17,22 +18,13 @@ const FULL_MAX_MATCHES: usize = 100;
 /// Content search using ripgrep crates. Literal by default, regex if `is_regex`.
 pub fn search(
     pattern: &str,
-    scope: &Path,
+    walk: Walk<'_>,
     is_regex: bool,
     context: Option<&Path>,
-    glob: Option<&str>,
     full: bool,
 ) -> Result<SearchResult, TilthError> {
     let max_matches = if full { FULL_MAX_MATCHES } else { MAX_MATCHES };
-    search_capped(
-        pattern,
-        scope,
-        is_regex,
-        context,
-        glob,
-        max_matches,
-        max_matches,
-    )
+    search_capped(pattern, walk, is_regex, context, max_matches, max_matches)
 }
 
 /// The display cap and the per-file collection bound are the same number in
@@ -44,10 +36,9 @@ pub fn search(
 )]
 fn search_capped(
     pattern: &str,
-    scope: &Path,
+    walk: Walk<'_>,
     is_regex: bool,
     context: Option<&Path>,
-    glob: Option<&str>,
     max_matches: usize,
     per_file_cap: usize,
 ) -> Result<SearchResult, TilthError> {
@@ -72,7 +63,7 @@ fn search_capped(
     // Relaxed is correct: walker.run() joins all threads before we read the final value.
     let total_found = AtomicUsize::new(0);
 
-    let walker = tilth_core::search::walk::walker(scope, glob)?;
+    let walker = tilth_core::search::walk::walker(walk)?;
     // One clock for the per-file bound and the final sort, so both rank by
     // the same scores.
     let now = std::time::SystemTime::now();
@@ -125,11 +116,15 @@ fn search_capped(
             let Ok(bytes) = tilth_core::source::read(path) else {
                 return ignore::WalkState::Continue;
             };
-            let bytes = tilth_core::source::strip_bom_bytes(&bytes);
+            // A binary file has no matches, by the rule every read uses.
+            let Some(text) = tilth_core::source::into_text(bytes) else {
+                return ignore::WalkState::Continue;
+            };
+            let text = tilth_core::source::strip_bom(&text);
 
             // Catch unmarked minified bundles between 100 KB and the size cap.
             if file_size >= tilth_core::lang::detection::MINIFIED_CHECK_THRESHOLD
-                && tilth_core::lang::detection::is_minified_by_content(bytes)
+                && tilth_core::lang::detection::is_minified_by_content(text.as_bytes())
             {
                 return ignore::WalkState::Continue;
             }
@@ -139,11 +134,11 @@ fn search_capped(
             let mut file_matches = Vec::new();
             let mut searcher = Searcher::new();
 
-            // The UTF8 sink ends this file's search at its first matched line
-            // that is not UTF-8, and the error is dropped here: #308.
+            // The sink fails only on a line that is not UTF-8, and the text
+            // holds none, so the search cannot fail.
             let _ = searcher.search_slice(
                 matcher,
-                bytes,
+                text.as_bytes(),
                 UTF8(|line_num, line| {
                     file_matches.push(Match {
                         path: path.to_path_buf(),
@@ -172,7 +167,7 @@ fn search_capped(
                 rank::retain_top_k(
                     &mut file_matches,
                     pattern,
-                    scope,
+                    walk.scope,
                     context,
                     now,
                     per_file_cap,
@@ -197,12 +192,12 @@ fn search_capped(
         .into_inner()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-    rank::sort(&mut all_matches, pattern, scope, context, now);
+    rank::sort(&mut all_matches, pattern, walk.scope, context, now);
     all_matches.truncate(max_matches);
 
     Ok(SearchResult {
         query: pattern.to_string(),
-        scope: scope.to_path_buf(),
+        scope: walk.scope.to_path_buf(),
         matches: all_matches,
         total_found: total,
         definitions: 0,
@@ -219,6 +214,7 @@ fn search_capped(
 mod completeness_tests {
     use super::*;
     use std::fmt::Write;
+    use tilth_core::search::walk::WalkConfig;
 
     /// One needle per file, in more files than the old shared-counter quit
     /// could ever have read: it stopped at 30 counted hits, and at the default
@@ -245,14 +241,28 @@ mod completeness_tests {
     #[test]
     fn content_search_totals_are_complete_and_deterministic() {
         let d = fixture();
-        let r1 = search("needle_alpha", d.path(), false, None, None, false).unwrap();
+        let r1 = search(
+            "needle_alpha",
+            Walk::new(d.path(), WalkConfig::default()),
+            false,
+            None,
+            false,
+        )
+        .unwrap();
         assert_eq!(
             r1.total_found, FILES,
             "must count the needle in ALL files, not quit mid-walk"
         );
         let first: Vec<_> = r1.matches.iter().map(|m| (&m.path, m.line)).collect();
         for _ in 0..4 {
-            let r = search("needle_alpha", d.path(), false, None, None, false).unwrap();
+            let r = search(
+                "needle_alpha",
+                Walk::new(d.path(), WalkConfig::default()),
+                false,
+                None,
+                false,
+            )
+            .unwrap();
             assert_eq!(
                 r.total_found, r1.total_found,
                 "totals must not vary run-to-run"
@@ -284,8 +294,17 @@ mod completeness_tests {
         let shown = |r: &SearchResult| -> Vec<(u32, String)> {
             r.matches.iter().map(|m| (m.line, m.text.clone())).collect()
         };
-        let run =
-            |cap| search_capped("needle_gamma", d.path(), false, None, None, 10, cap).unwrap();
+        let run = |cap| {
+            search_capped(
+                "needle_gamma",
+                Walk::new(d.path(), WalkConfig::default()),
+                false,
+                None,
+                10,
+                cap,
+            )
+            .unwrap()
+        };
 
         let bounded = run(10);
         let unbounded = run(usize::MAX);
@@ -313,6 +332,66 @@ mod completeness_tests {
         assert_eq!(
             one_per_file.total_found, 12,
             "and the count must still be exact"
+        );
+    }
+
+    /// The matched lines of `pattern` under `dir`, as `(file, line, text)`.
+    fn hits(dir: &Path, pattern: &str) -> Vec<(String, u32, String)> {
+        let result = search(
+            pattern,
+            Walk::new(dir, WalkConfig::default()),
+            false,
+            None,
+            false,
+        )
+        .unwrap();
+        let mut hits: Vec<_> = result
+            .matches
+            .iter()
+            .map(|m| {
+                let name = m.path.file_name().unwrap().to_string_lossy().into_owned();
+                (name, m.line, m.text.clone())
+            })
+            .collect();
+        hits.sort();
+        assert_eq!(result.total_found, hits.len());
+        hits
+    }
+
+    /// A byte that is not UTF-8 reads as U+FFFD and costs nothing else: a
+    /// matched line that holds one does not end the file's search.
+    #[test]
+    fn a_matched_line_that_is_not_utf8_does_not_end_the_search() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(
+            d.path().join("notes.txt"),
+            b"find me caf\xe9\nfind me two\nfind me three\n",
+        )
+        .unwrap();
+        let line = |n: u32, text: &str| ("notes.txt".to_string(), n, text.to_string());
+        assert_eq!(
+            hits(d.path(), "find me"),
+            [
+                line(1, "find me caf\u{fffd}"),
+                line(2, "find me two"),
+                line(3, "find me three"),
+            ]
+        );
+    }
+
+    /// A file is binary when a NUL byte falls in its first 512 bytes, the
+    /// rule a read uses, and a binary file has no matches. A NUL further
+    /// on is a stray byte in a text file.
+    #[test]
+    fn a_binary_file_has_no_matches() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("blob.bin"), b"find me\0\nfind me again\n").unwrap();
+        let mut late = vec![b'x'; 600];
+        late.extend_from_slice(b"\nfind me\0\n");
+        std::fs::write(d.path().join("late.txt"), &late).unwrap();
+        assert_eq!(
+            hits(d.path(), "find me"),
+            [("late.txt".to_string(), 2, "find me\0".to_string())]
         );
     }
 }

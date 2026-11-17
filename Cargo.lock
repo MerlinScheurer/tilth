@@ -849,7 +849,7 @@ dependencies = [
 
 [[package]]
 name = "tilth"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "clap",
  "clap_complete",
@@ -880,9 +880,9 @@ dependencies = [
 
 [[package]]
 name = "tilth-core"
-version = "0.14.0"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e6f6e60a0d907d25498224b9b56de80e48a3415c845d5ce104ea4d43e6d79996"
+checksum = "c4125590907a1d83f55bce77f0b2a494c0b8a34dd39b8997084a0367443bee89"
 dependencies = [
  "dashmap",
  "fastbloom",

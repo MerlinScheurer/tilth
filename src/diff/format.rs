@@ -2,7 +2,7 @@ use std::fmt::Write;
 use std::path::Path;
 
 use crate::budget;
-use crate::format::rel;
+use crate::format::{noun, rel};
 use crate::types::estimate_tokens;
 
 use super::{
@@ -26,12 +26,22 @@ use super::{
 ///   [+]      name                                  L120 (new, 18 lines)
 ///
 /// ## package-lock.json (generated, N lines changed — summarized)
+///
+/// ## path (symbols unavailable: why a side could not be read)
+///
+/// ## [~] path:Type::name — body changed (L88-138)
+///   -  90| removed line (old-file line number)
+///   +  90| added line
 /// ```
 ///
+/// The sections at the end belong to the first `expand` changed symbols, as
+/// [`write_expanded`] picks them. They come after the warnings, so a budget
+/// cut takes them before any file or warning.
 pub(crate) fn format_overview(
     overlays: &[FileOverlay],
     warnings: &[String],
     source_label: &str,
+    expand: usize,
     budget: Option<u64>,
 ) -> String {
     let scope = Path::new(".");
@@ -58,7 +68,7 @@ pub(crate) fn format_overview(
         "# Diff: {} — {} {}, {} modified, {} added",
         source_label,
         file_count,
-        if file_count == 1 { "file" } else { "files" },
+        noun(file_count, "file", "files"),
         fn_modified,
         fn_added,
     );
@@ -77,8 +87,14 @@ pub(crate) fn format_overview(
             let changed_lines = overlay.added + overlay.removed;
             let _ = writeln!(
                 out,
-                "## {rel_path} (generated, {changed_lines} lines changed — summarized)"
+                "## {rel_path} (generated, {changed_lines} {} changed — summarized)",
+                noun(changed_lines, "line", "lines")
             );
+            continue;
+        }
+
+        if let Some(error) = &overlay.read_error {
+            let _ = writeln!(out, "## {rel_path} (symbols unavailable: {error})");
             continue;
         }
 
@@ -90,7 +106,8 @@ pub(crate) fn format_overview(
             .collect();
 
         let sym_count = visible.len();
-        let _ = writeln!(out, "## {rel_path} ({sym_count} symbols)");
+        let symbols = noun(sym_count, "symbol", "symbols");
+        let _ = writeln!(out, "## {rel_path} ({sym_count} {symbols})");
 
         for change in &visible {
             let line = format_symbol_line(change);
@@ -98,8 +115,9 @@ pub(crate) fn format_overview(
         }
     }
 
-    // Warnings at the bottom.
+    // Warnings at the bottom, then the expanded symbols.
     write_warnings(&mut out, warnings);
+    write_expanded(&mut out, overlays, scope, expand);
 
     // Patch in the token count now that we know the full size.
     let token_count = estimate_tokens(out.len() as u64);
@@ -108,7 +126,7 @@ pub(crate) fn format_overview(
             "# Diff: {} — {} {}, {} modified, {} added (~{} tokens)",
             source_label,
             file_count,
-            if file_count == 1 { "file" } else { "files" },
+            noun(file_count, "file", "files"),
             fn_modified,
             fn_added,
             token_count,
@@ -155,10 +173,17 @@ pub(crate) fn format_file_detail(
         .filter(|c| !matches!(c.change, ChangeType::Unchanged))
         .count();
 
+    let symbols = overlay.read_error.as_ref().map_or_else(
+        || {
+            let symbols = noun(sym_touched, "symbol", "symbols");
+            format!("{sym_touched} {symbols} touched")
+        },
+        |error| format!("symbols unavailable: {error}"),
+    );
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "# Diff: {rel_path} — {sym_touched} symbols touched, +{}/\u{2212}{} lines",
+        "# Diff: {rel_path} — {symbols}, +{}/\u{2212}{} lines",
         overlay.added, overlay.removed
     );
 
@@ -171,11 +196,7 @@ pub(crate) fn format_file_detail(
             continue;
         }
 
-        let marker = format_marker(&change.change, &change.match_confidence);
-        let label = change_type_label(&change.change);
-        let _ = writeln!(out, "\n## {marker} {name} — {label} (L{line}-{end_line})");
-        write_signatures(&mut out, change);
-        write_diff_lines(&mut out, &change.lines);
+        write_change(&mut out, &name, change);
     }
 
     // Lines no symbol holds: all of a text file, or imports and comments
@@ -228,8 +249,14 @@ pub(crate) fn format_function_detail(overlay: &FileOverlay, fn_name: &str) -> St
 
     let change = match candidates.as_slice() {
         [] => {
+            let why = overlay
+                .read_error
+                .as_ref()
+                .map_or_else(String::new, |error| {
+                    format!(" (symbols unavailable: {error})")
+                });
             return format!(
-                "# Diff: {} — `{fn_name}` not found in diff",
+                "# Diff: {} — `{fn_name}` not found in diff{why}",
                 overlay.path.display()
             );
         }
@@ -322,9 +349,10 @@ pub(crate) fn format_log(summaries: &[CommitSummary], scope: &str, budget: Optio
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "# Log: {scope} — {n_commits} {}, {total_files} {}, {total_fns} functions touched",
-        if n_commits == 1 { "commit" } else { "commits" },
-        if total_files == 1 { "file" } else { "files" },
+        "# Log: {scope} — {n_commits} {}, {total_files} {}, {total_fns} {} touched",
+        noun(n_commits, "commit", "commits"),
+        noun(total_files, "file", "files"),
+        noun(total_fns, "function", "functions"),
     );
 
     let now = std::time::SystemTime::now()
@@ -423,17 +451,21 @@ fn format_symbol_line(change: &SymbolChange) -> String {
     match &change.change {
         ChangeType::BodyChanged => {
             if let (Some(old), Some(new)) = (change.old_span, change.new_span) {
-                let _ = write!(s, "  (body, {}→{} lines)", span_len(old), span_len(new));
+                let (old, new) = (span_len(old), span_len(new));
+                let lines = noun(new, "line", "lines");
+                let _ = write!(s, "  (body, {old}→{new} {lines})");
             }
         }
         ChangeType::Added => {
             if let Some(new) = change.new_span {
-                let _ = write!(s, "  (new, {} lines)", span_len(new));
+                let new = span_len(new);
+                let _ = write!(s, "  (new, {new} {})", noun(new, "line", "lines"));
             }
         }
         ChangeType::Deleted => {
             if let Some(old) = change.old_span {
-                let _ = write!(s, "  (deleted, {} lines)", span_len(old));
+                let old = span_len(old);
+                let _ = write!(s, "  (deleted, {old} {})", noun(old, "line", "lines"));
             }
         }
         _ => {}
@@ -453,6 +485,33 @@ fn change_type_label(change: &ChangeType) -> &'static str {
         ChangeType::Moved { .. } => "moved",
         ChangeType::RenamedAndMoved { .. } => "renamed and moved",
         ChangeType::Unchanged => "unchanged",
+    }
+}
+
+/// One changed symbol's section, under `name`: its heading, any signature
+/// change, and its patch lines.
+fn write_change(out: &mut String, name: &str, change: &SymbolChange) {
+    let (line, end_line) = change.span();
+    let marker = format_marker(&change.change, &change.match_confidence);
+    let label = change_type_label(&change.change);
+    let _ = writeln!(out, "\n## {marker} {name} — {label} (L{line}-{end_line})");
+    write_signatures(out, change);
+    write_diff_lines(out, &change.lines);
+}
+
+/// The sections of the first `n` changed symbols in overview order, each
+/// named `path:symbol` as a scope names it. A symbol whose changed lines all
+/// sit in smaller changed symbols, such as an `impl` around changed methods,
+/// has nothing of its own to show and is passed over.
+fn write_expanded(out: &mut String, overlays: &[FileOverlay], scope: &Path, n: usize) {
+    let changes = overlays
+        .iter()
+        .flat_map(|o| o.symbol_changes.iter().map(move |c| (o, c)))
+        .filter(|(_, c)| !matches!(c.change, ChangeType::Unchanged) && !c.lines.is_empty())
+        .take(n);
+    for (overlay, change) in changes {
+        let name = format!("{}:{}", rel(&overlay.path, scope), change.qualified_name());
+        write_change(out, &name, change);
     }
 }
 
@@ -530,9 +589,9 @@ mod tests {
             added: 0,
             removed: 0,
             conflicts: Vec::new(),
-            new_content: None,
             is_generated: false,
             is_binary: false,
+            read_error: None,
         }
     }
 
@@ -588,7 +647,7 @@ mod tests {
             ),
         ];
         let overlay = make_overlay("src/lib.rs", changes);
-        let out = format_overview(&[overlay], &[], "HEAD", None);
+        let out = format_overview(&[overlay], &[], "HEAD", 0, None);
         assert!(out.contains("[+]"), "missing [+]:\n{out}");
         assert!(out.contains("[-]"), "missing [-]:\n{out}");
         assert!(out.contains("[~]"), "missing [~]:\n{out}");
@@ -603,7 +662,7 @@ mod tests {
         let mut change = make_change("fn_ambig", ChangeType::Added);
         change.match_confidence = MatchConfidence::Ambiguous(3);
         let overlay = make_overlay("src/lib.rs", vec![change]);
-        let out = format_overview(&[overlay], &[], "HEAD", None);
+        let out = format_overview(&[overlay], &[], "HEAD", 0, None);
         assert!(out.contains("[?→]"), "expected [?→]:\n{out}");
     }
 
@@ -612,7 +671,7 @@ mod tests {
     fn test_overview_warnings() {
         let overlay = make_overlay("src/lib.rs", vec![]);
         let warnings = vec!["warning: foo changed in 2 locations".to_string()];
-        let out = format_overview(&[overlay], &warnings, "HEAD", None);
+        let out = format_overview(&[overlay], &warnings, "HEAD", 0, None);
         assert!(
             out.contains("warning: foo changed"),
             "warnings not appended:\n{out}"
@@ -630,7 +689,7 @@ mod tests {
         overlay.added = 1;
         overlay.removed = 1;
         overlay.is_generated = true;
-        let out = format_overview(&[overlay], &[], "HEAD", None);
+        let out = format_overview(&[overlay], &[], "HEAD", 0, None);
         assert!(out.contains("generated"), "missing 'generated':\n{out}");
         assert!(
             out.contains("lines changed"),
@@ -647,7 +706,7 @@ mod tests {
     fn test_overview_binary() {
         let mut overlay = make_overlay("image.png", vec![]);
         overlay.is_binary = true;
-        let out = format_overview(&[overlay], &[], "HEAD", None);
+        let out = format_overview(&[overlay], &[], "HEAD", 0, None);
         assert!(out.contains("(binary)"), "missing (binary):\n{out}");
     }
 
@@ -660,7 +719,7 @@ mod tests {
             make_change("fn_c", ChangeType::Deleted),
         ];
         let overlay = make_overlay("src/lib.rs", changes);
-        let out = format_overview(&[overlay], &[], "HEAD", Some(5));
+        let out = format_overview(&[overlay], &[], "HEAD", 0, Some(5));
         assert!(out.contains("truncated"), "expected truncation:\n{out}");
     }
 
@@ -672,7 +731,7 @@ mod tests {
             make_change("fn_unchanged", ChangeType::Unchanged),
         ];
         let overlay = make_overlay("src/lib.rs", changes);
-        let out = format_overview(&[overlay], &[], "HEAD", None);
+        let out = format_overview(&[overlay], &[], "HEAD", 0, None);
         assert!(out.contains("fn_changed"), "changed fn missing:\n{out}");
         assert!(
             !out.contains("fn_unchanged"),
@@ -688,7 +747,7 @@ mod tests {
             "src/b.rs",
             vec![make_change("fn_b", ChangeType::BodyChanged)],
         );
-        let out = format_overview(&[overlay_a, overlay_b], &[], "HEAD", None);
+        let out = format_overview(&[overlay_a, overlay_b], &[], "HEAD", 0, None);
         assert!(out.contains("2 files"), "wrong file count:\n{out}");
         assert!(out.contains("src/a.rs"), "missing a.rs:\n{out}");
         assert!(out.contains("src/b.rs"), "missing b.rs:\n{out}");
@@ -699,7 +758,7 @@ mod tests {
     fn test_overview_signature_annotation() {
         let change = make_sig_change("process", "fn process(x: i32)", "fn process(x: i64)");
         let overlay = make_overlay("src/lib.rs", vec![change]);
-        let out = format_overview(&[overlay], &[], "HEAD", None);
+        let out = format_overview(&[overlay], &[], "HEAD", 0, None);
         assert!(out.contains("[~:sig]"), "missing sig marker:\n{out}");
         assert!(
             out.contains("fn process(x: i32)"),
@@ -731,7 +790,7 @@ mod tests {
         overlay.removed = 1;
         let out = format_file_detail(&overlay, &[], None);
         assert!(
-            out.starts_with("# Diff: src/lib.rs — 1 symbols touched, +2/\u{2212}1 lines"),
+            out.starts_with("# Diff: src/lib.rs — 1 symbol touched, +2/\u{2212}1 lines"),
             "bad header:\n{out}"
         );
     }

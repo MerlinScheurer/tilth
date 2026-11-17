@@ -1,5 +1,11 @@
 use std::path::Path;
 
+use crate::format::{capped_list, noun};
+
+/// How many keys of an object two levels down the JSON outline names before
+/// it counts the rest.
+const KEYS_SHOWN: usize = 5;
+
 /// Depth-limited outline for JSON, YAML, TOML.
 pub fn outline(path: &Path, content: &str, max_lines: usize) -> String {
     match path.extension().and_then(|e| e.to_str()) {
@@ -36,7 +42,7 @@ fn walk_json(
         serde_json::Value::Object(map) => {
             if depth >= max_depth {
                 if !prefix.is_empty() {
-                    lines.push(format!("{prefix}: {{{} keys}}", map.len()));
+                    lines.push(format!("{prefix}: {{{}}}", key_count(map.len())));
                 }
                 return;
             }
@@ -52,16 +58,10 @@ fn walk_json(
                 match val {
                     serde_json::Value::Object(inner) => {
                         if depth + 1 >= max_depth {
-                            let keys: Vec<&String> = inner.keys().take(5).collect();
-                            let key_list = keys
-                                .iter()
-                                .map(|k| k.as_str())
-                                .collect::<Vec<_>>()
-                                .join(", ");
-                            let suffix = if inner.len() > 5 { ", ..." } else { "" };
+                            let key_list = capped_list(inner.keys(), KEYS_SHOWN);
                             lines.push(format!(
-                                "{full_key}: {{{} keys}} [{key_list}{suffix}]",
-                                inner.len()
+                                "{full_key}: {{{}}} [{key_list}]",
+                                key_count(inner.len())
                             ));
                         } else {
                             walk_json(val, &full_key, depth + 1, max_depth, max_lines, lines);
@@ -72,7 +72,7 @@ fn walk_json(
                             "[]".to_string()
                         } else {
                             let first = truncate_json_value(&arr[0], 40);
-                            format!("[{} items] [{first}]", arr.len())
+                            format!("[{}] [{first}]", item_count(arr.len()))
                         };
                         lines.push(format!("{full_key}: {preview}"));
                     }
@@ -85,13 +85,23 @@ fn walk_json(
             }
         }
         serde_json::Value::Array(arr) => {
-            lines.push(format!("{prefix}: [{} items]", arr.len()));
+            lines.push(format!("{prefix}: [{}]", item_count(arr.len())));
         }
         _ => {
             let val_str = truncate_json_value(value, 40);
             lines.push(format!("{prefix}: {val_str}"));
         }
     }
+}
+
+/// The size of a collapsed table or object: `3 keys`, `1 key`.
+fn key_count(n: usize) -> String {
+    format!("{n} {}", noun(n, "key", "keys"))
+}
+
+/// The length of a collapsed array: `4 items`, `1 item`.
+fn item_count(n: usize) -> String {
+    format!("{n} {}", noun(n, "item", "items"))
 }
 
 fn json_type_name(v: &serde_json::Value) -> &'static str {
@@ -198,10 +208,10 @@ fn walk_toml(
                     walk_toml(val, depth + 1, max_depth, max_lines, lines);
                 }
                 toml::Value::Table(inner) => {
-                    lines.push(format!("{indent}{key}: {{{} keys}}", inner.len()));
+                    lines.push(format!("{indent}{key}: {{{}}}", key_count(inner.len())));
                 }
                 toml::Value::Array(arr) => {
-                    lines.push(format!("{indent}{key}: [{} items]", arr.len()));
+                    lines.push(format!("{indent}{key}: [{}]", item_count(arr.len())));
                 }
                 _ => {
                     let val_str = val.to_string();
@@ -284,7 +294,7 @@ key = \"deep\"
         let out = toml_outline(content, 100);
         // The collapsed form names the key-count of the inner table.
         assert!(
-            out.contains('{') && out.contains("keys}"),
+            out.contains("c: {1 key}"),
             "deep table should collapse to key-count summary:\n{out}"
         );
     }
@@ -301,6 +311,28 @@ features = [\"a\", \"b\", \"c\", \"d\"]
         assert!(
             out.contains("features: [4 items]"),
             "array should render as item count, got:\n{out}"
+        );
+    }
+
+    /// The JSON outline line of an object nested one level down that holds
+    /// `n` keys.
+    fn nested_object_line(n: usize) -> String {
+        let keys: Vec<String> = (0..n).map(|i| format!("\"k{i}\": {i}")).collect();
+        let content = format!("{{\"a\": {{\"b\": {{{}}}}}}}", keys.join(", "));
+        json_outline(&content, 100)
+    }
+
+    /// A nested object's key list ended with `, ...` when it was cut, which
+    /// says something is missing but not how much (#343).
+    #[test]
+    fn a_cut_json_key_list_counts_the_keys_it_leaves_out() {
+        assert_eq!(
+            nested_object_line(KEYS_SHOWN + 1),
+            "a.b: {6 keys} [k0, k1, k2, k3, k4, and 1 more]"
+        );
+        assert_eq!(
+            nested_object_line(KEYS_SHOWN),
+            "a.b: {5 keys} [k0, k1, k2, k3, k4]"
         );
     }
 

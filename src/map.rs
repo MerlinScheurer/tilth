@@ -2,22 +2,30 @@ use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
-use crate::format::fmt_tokens;
+use crate::format::{fmt_tokens, noun};
 use crate::read::outline;
 use crate::types::estimate_tokens;
 use tilth_core::cache::OutlineCache;
 use tilth_core::lang::{detect_file_type, detect_file_type_with_content};
-use tilth_core::search::walk::base_walk_builder;
+use tilth_core::search::walk::{base_walk_builder, WalkConfig};
 use tilth_core::types::FileType;
 
 /// Generate a structural codebase map.
 /// Code files show symbol names from outline cache.
 /// Non-code files show name + token estimate.
 #[must_use]
-pub fn generate(scope: &Path, depth: usize, budget: Option<u64>, cache: &OutlineCache) -> String {
+pub fn generate(
+    scope: &Path,
+    depth: usize,
+    budget: Option<u64>,
+    cache: &OutlineCache,
+    walk: WalkConfig,
+) -> String {
     let mut tree: BTreeMap<PathBuf, Vec<FileEntry>> = BTreeMap::new();
 
-    let walker = base_walk_builder(scope).max_depth(Some(depth + 1)).build();
+    let walker = base_walk_builder(scope, walk)
+        .max_depth(Some(depth + 1))
+        .build();
 
     for entry in walker.flatten() {
         if !entry.file_type().is_some_and(|ft| ft.is_file()) {
@@ -54,10 +62,12 @@ pub fn generate(scope: &Path, depth: usize, budget: Option<u64>, cache: &Outline
                 let outline_str = cache.get_or_compute(path, mtime, || {
                     // Best-effort: an unreadable file contributes no outline symbols rather than
                     // aborting the map. Errors are intentionally swallowed here.
-                    let content = tilth_core::source::read_source(path).unwrap_or_default();
-                    let buf = content.as_bytes();
+                    let content = tilth_core::source::read_source(path)
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default();
                     let file_type = detect_file_type_with_content(path, &content);
-                    outline::generate(path, file_type, &content, buf, true)
+                    outline::generate(path, file_type, &content, true)
                 });
 
                 Some(extract_symbol_names(&outline_str))
@@ -201,7 +211,8 @@ fn format_tree(
         for f in files {
             if let Some(ref symbols) = f.symbols {
                 if symbols.is_empty() {
-                    let _ = writeln!(out, "{prefix}{} (~{} tokens)", f.name, f.tokens);
+                    let tokens = noun(f.tokens, "token", "tokens");
+                    let _ = writeln!(out, "{prefix}{} (~{} {tokens})", f.name, f.tokens);
                 } else {
                     let syms = symbols.join(", ");
                     let truncated = if syms.len() > 80 {
@@ -212,7 +223,8 @@ fn format_tree(
                     let _ = writeln!(out, "{prefix}{}: {truncated}", f.name);
                 }
             } else {
-                let _ = writeln!(out, "{prefix}{} (~{} tokens)", f.name, f.tokens);
+                let tokens = noun(f.tokens, "token", "tokens");
+                let _ = writeln!(out, "{prefix}{} (~{} {tokens})", f.name, f.tokens);
             }
         }
     }
@@ -222,7 +234,8 @@ fn format_tree(
     for subdir in subdirs {
         let dir_name = subdir.file_name().and_then(|n| n.to_str()).unwrap_or("?");
         let total = totals.get(subdir).copied().unwrap_or(0);
-        let _ = writeln!(out, "{prefix}{dir_name}/ (~{} tokens)", fmt_tokens(total));
+        let tokens = noun(total, "token", "tokens");
+        let _ = writeln!(out, "{prefix}{dir_name}/ (~{} {tokens})", fmt_tokens(total));
         format_tree(tree, totals, subdir, indent + 1, out);
     }
 }

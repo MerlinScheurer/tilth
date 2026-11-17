@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
+use crate::config::Config;
+use crate::format::noun;
 use crate::session::Session;
 use crate::types::ViewMode;
 use tilth_core::cache::OutlineCache;
@@ -19,6 +21,7 @@ pub(in crate::mcp) fn tool_read(
     cache: &OutlineCache,
     session: &Session,
     edit_mode: bool,
+    config: &Config,
 ) -> Result<String, String> {
     let budget = args.get("budget").and_then(serde_json::Value::as_u64);
     // The budget every read is fitted to. With no `budget` argument it is
@@ -47,6 +50,7 @@ pub(in crate::mcp) fn tool_read(
     // before falling back to force_full, so `full:true` + `mode:signature` yields a
     // signature view, not a full dump. Pinned by tool_read_signature_beats_full_flag.
     let force_full = full_flag || mode_str == "full";
+    let full_cap = force_full.then_some(config.full_size_cap);
     let force_signature = mode_str == "signature";
     let force_stripped = mode_str == "stripped";
 
@@ -59,14 +63,10 @@ pub(in crate::mcp) fn tool_read(
             ));
         }
 
-        // Aggregate deadline for batch reads: 60s default, override with TILTH_BATCH_TIMEOUT
-        // Note: deadline is checked between files, so a single massive file could still
-        // exceed it. The per-request timeout (handle_tool_call) catches that case.
-        let batch_timeout = std::env::var("TILTH_BATCH_TIMEOUT")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(60);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(batch_timeout);
+        // The deadline is checked between files, so a single massive file can
+        // still exceed it. The per-request timeout (handle_tool_call) catches
+        // that case.
+        let deadline = std::time::Instant::now() + config.batch_timeout;
 
         // Every file is read at its own size first. Only when the batch is
         // over the budget do the biggest files shrink, each to a fair share
@@ -78,10 +78,10 @@ pub(in crate::mcp) fn tool_read(
             // Check deadline before each file
             if std::time::Instant::now() > deadline {
                 results.push(format!(
-                    "# batch read stopped — deadline exceeded after {}/{} files. \
+                    "# batch read stopped — deadline exceeded after {i}/{} {}. \
                      Reduce batch size or set TILTH_BATCH_TIMEOUT=<seconds>.",
-                    i,
-                    paths_arr.len()
+                    paths_arr.len(),
+                    noun(paths_arr.len(), "file", "files")
                 ));
                 break;
             }
@@ -97,7 +97,7 @@ pub(in crate::mcp) fn tool_read(
                 let read = crate::read::read_file(
                     &path,
                     None,
-                    force_full,
+                    full_cap,
                     cache,
                     edit_mode,
                     Some(read_budget),
@@ -121,7 +121,7 @@ pub(in crate::mcp) fn tool_read(
                     if let Ok(view) = crate::read::read_file(
                         &path,
                         None,
-                        force_full,
+                        full_cap,
                         cache,
                         edit_mode,
                         // One token of the share is the separator's.
@@ -184,23 +184,12 @@ pub(in crate::mcp) fn tool_read(
     // The related-file hint for outlined code files (not section reads, not
     // batch). It is built first, so the read is fitted to the room it leaves
     // and the final cut never removes the note that says what a fit left out.
-    let mut related_hint = String::new();
-    if section.is_none() && crate::read::would_outline(&path) {
+    let related_hint = if section.is_none() && crate::read::would_outline(&path) {
         let related = tilth_core::imports::resolve_related_files(&path, cache);
-        if !related.is_empty() {
-            related_hint.push_str("\n\n> Related: ");
-            for (i, p) in related
-                .iter()
-                .take(crate::read::RELATED_HINT_LIMIT)
-                .enumerate()
-            {
-                if i > 0 {
-                    related_hint.push_str(", ");
-                }
-                let _ = write!(related_hint, "{}", p.display());
-            }
-        }
-    }
+        crate::read::related_hint(related.iter().map(PathBuf::as_path))
+    } else {
+        String::new()
+    };
     let file_budget =
         read_budget.saturating_sub(crate::types::estimate_tokens(related_hint.len() as u64));
 
@@ -212,7 +201,7 @@ pub(in crate::mcp) fn tool_read(
         crate::read::read_file(
             &path,
             section,
-            force_full,
+            full_cap,
             cache,
             edit_mode,
             Some(file_budget),
@@ -232,11 +221,11 @@ fn read_signature_file(path: &Path, cache: &OutlineCache) -> Result<String, Tilt
     // The path says whether a file is code; its content only settles which
     // language a `.h` is. Any other file gets its default view, streamed.
     let FileType::Code(lang) = detect_file_type(path) else {
-        return crate::read::non_code_view(path, cache);
+        return crate::read::default_view(path, cache);
     };
-    // A pipe, socket or device has no fixed contents and shows as empty.
+    // A binary file, and a pipe, socket or device, show as a read shows them.
     let Some((content, byte_len)) = crate::read::read_text(path)? else {
-        return Ok(crate::read::empty_view(path));
+        return crate::read::default_view(path, cache);
     };
     let lang = tilth_core::lang::refine_lang(lang, path, &content);
     let line_count = u32::try_from(content.lines().count()).unwrap_or(u32::MAX);
@@ -282,11 +271,11 @@ fn render_signature_entries(entries: &[OutlineEntry], lines: &[&str], out: &mut 
 fn read_stripped_file(path: &Path, cache: &OutlineCache) -> Result<String, TilthError> {
     // Any file that is not code gets its default view, streamed.
     if !matches!(detect_file_type(path), FileType::Code(_)) {
-        return crate::read::non_code_view(path, cache);
+        return crate::read::default_view(path, cache);
     }
-    // A pipe, socket or device has no fixed contents and shows as empty.
+    // A binary file, and a pipe, socket or device, show as a read shows them.
     let Some((raw, byte_len)) = crate::read::read_text(path)? else {
-        return Ok(crate::read::empty_view(path));
+        return crate::read::default_view(path, cache);
     };
     // A non-editable view, so it reads like search does: without the mark.
     let content = tilth_core::source::strip_bom(&raw);
@@ -308,7 +297,8 @@ fn read_stripped_file(path: &Path, cache: &OutlineCache) -> Result<String, Tilth
     let stripped = total_lines.saturating_sub(kept);
     let header = crate::format::file_header(path, byte_len, total_lines, ViewMode::Stripped);
     let note = format!(
-        "// stripped {stripped} of {total_lines} lines (plain comments, debug logs, blank collapse) — non-editable view"
+        "// stripped {stripped} of {total_lines} {} (plain comments, debug logs, blank collapse) — non-editable view",
+        noun(total_lines, "line", "lines")
     );
     Ok(format!("{header}\n{note}\n\n{}", body.trim_end()))
 }
@@ -335,10 +325,6 @@ fn fair_share(sizes: &[u64], budget: u64) -> Option<u64> {
 }
 
 #[cfg(test)]
-#[expect(
-    clippy::disallowed_methods,
-    reason = "by design: tests read the files they check directly"
-)]
 mod tests {
     use super::*;
 
@@ -370,8 +356,7 @@ mod tests {
     }
 
     /// A file that is not code gets its default view in the signature and
-    /// stripped views. One that is not UTF-8 fails with the error reading
-    /// it to a string gives, as those views always made it fail.
+    /// stripped views, one that is not UTF-8 included.
     #[test]
     fn signature_and_stripped_views_of_a_non_code_file() {
         use std::fmt::Write as _;
@@ -383,24 +368,39 @@ mod tests {
         }
         std::fs::write(&log, &text).unwrap();
         let cache = OutlineCache::new();
-        let default = crate::read::read_file(&log, None, false, &cache, false, None).unwrap();
+        let default = crate::read::read_file(&log, None, None, &cache, false, None).unwrap();
         assert!(default.contains("[outline]"), "{default}");
         assert_eq!(read_signature_file(&log, &cache).unwrap(), default);
         assert_eq!(read_stripped_file(&log, &cache).unwrap(), default);
 
         let bad = dir.path().join("bad.log");
         std::fs::write(&bad, b"ok\n\xff\n").unwrap();
-        let expected = TilthError::IoError {
-            path: bad.clone(),
-            source: std::fs::read_to_string(&bad).unwrap_err(),
-        }
-        .to_string();
-        for view in [
-            read_signature_file(&bad, &cache),
-            read_stripped_file(&bad, &cache),
-        ] {
-            assert_eq!(view.unwrap_err().to_string(), expected);
-        }
+        let default = crate::read::read_file(&bad, None, None, &cache, false, None).unwrap();
+        assert!(default.ends_with("ok\n\u{fffd}\n"), "{default}");
+        assert_eq!(read_signature_file(&bad, &cache).unwrap(), default);
+        assert_eq!(read_stripped_file(&bad, &cache).unwrap(), default);
+    }
+
+    /// The signature and stripped views read a code file that is not UTF-8
+    /// from its lossy text, as search and the default read do, and show a
+    /// binary one as the default read does.
+    #[test]
+    fn signature_and_stripped_views_of_a_code_file_that_is_not_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = OutlineCache::new();
+        let latin1 = dir.path().join("latin1.rs");
+        std::fs::write(&latin1, b"// caf\xe9\nfn alpha() {}\n").unwrap();
+        let signature = read_signature_file(&latin1, &cache).unwrap();
+        assert!(signature.ends_with("|fn alpha() {}"), "{signature}");
+        let stripped = read_stripped_file(&latin1, &cache).unwrap();
+        assert!(stripped.ends_with("2  fn alpha() {}"), "{stripped}");
+
+        let binary = dir.path().join("blob.rs");
+        std::fs::write(&binary, b"fn alpha() {}\n\0\n").unwrap();
+        let default = crate::read::read_file(&binary, None, None, &cache, false, None).unwrap();
+        assert!(default.contains("(binary, "), "{default}");
+        assert_eq!(read_signature_file(&binary, &cache).unwrap(), default);
+        assert_eq!(read_stripped_file(&binary, &cache).unwrap(), default);
     }
 
     use crate::mcp::tools::tool_definitions;
@@ -421,7 +421,8 @@ mod tests {
         let cache = OutlineCache::new();
         let session = Session::new();
 
-        let out = tool_read(&args, &cache, &session, false).expect("signature read");
+        let out =
+            tool_read(&args, &cache, &session, false, &Config::default()).expect("signature read");
 
         assert!(
             out.contains("[signature]"),
@@ -449,8 +450,14 @@ mod tests {
             "path": path.to_str().unwrap(),
             "mode": "signature",
         });
-        let out =
-            tool_read(&args, &OutlineCache::new(), &Session::new(), false).expect("signature read");
+        let out = tool_read(
+            &args,
+            &OutlineCache::new(),
+            &Session::new(),
+            false,
+            &Config::default(),
+        )
+        .expect("signature read");
         assert_eq!(
             out.lines().filter(|l| l.starts_with("1:")).count(),
             1,
@@ -474,7 +481,8 @@ mod tests {
         let cache = OutlineCache::new();
         let session = Session::new();
 
-        let out = tool_read(&args, &cache, &session, true).expect("stripped read");
+        let out =
+            tool_read(&args, &cache, &session, true, &Config::default()).expect("stripped read");
 
         assert!(out.contains("[stripped]"), "stripped header missing: {out}");
         assert!(out.contains("/// keep docs"), "doc comment missing: {out}");
@@ -502,7 +510,8 @@ mod tests {
         let cache = OutlineCache::new();
         let session = Session::new();
 
-        let err = tool_read(&args, &cache, &session, false).expect_err("unknown mode must error");
+        let err = tool_read(&args, &cache, &session, false, &Config::default())
+            .expect_err("unknown mode must error");
         assert!(
             err.starts_with("unknown read mode: outline"),
             "error must name the bad mode: {err}"
@@ -525,7 +534,8 @@ mod tests {
         let cache = OutlineCache::new();
         let session = Session::new();
 
-        let out = tool_read(&args, &cache, &session, false).expect("signature read on text");
+        let out = tool_read(&args, &cache, &session, false, &Config::default())
+            .expect("signature read on text");
 
         // Non-code falls back to the normal read: no signature header, full content.
         assert!(
@@ -548,7 +558,8 @@ mod tests {
         let cache = OutlineCache::new();
         let session = Session::new();
 
-        let out = tool_read(&args, &cache, &session, false).expect("stripped read on text");
+        let out = tool_read(&args, &cache, &session, false, &Config::default())
+            .expect("stripped read on text");
 
         assert!(
             !out.contains("[stripped]"),
@@ -586,6 +597,7 @@ mod tests {
             &cache,
             &session,
             false,
+            &Config::default(),
         )
         .expect("full:true read");
         let via_mode = tool_read(
@@ -593,6 +605,7 @@ mod tests {
             &cache,
             &session,
             false,
+            &Config::default(),
         )
         .expect("mode:full read");
         let via_auto = tool_read(
@@ -600,6 +613,7 @@ mod tests {
             &cache,
             &session,
             false,
+            &Config::default(),
         )
         .expect("auto read");
 
@@ -637,7 +651,8 @@ mod tests {
         let cache = OutlineCache::new();
         let session = Session::new();
 
-        let out = tool_read(&args, &cache, &session, false).expect("signature+full read");
+        let out = tool_read(&args, &cache, &session, false, &Config::default())
+            .expect("signature+full read");
 
         assert!(
             out.contains("[signature]"),
@@ -664,8 +679,8 @@ mod tests {
         let cache = OutlineCache::new();
         let session = Session::new();
 
-        let err =
-            tool_read(&args, &cache, &session, false).expect_err("signature + section must error");
+        let err = tool_read(&args, &cache, &session, false, &Config::default())
+            .expect_err("signature + section must error");
         assert!(
             err.contains("signature") && err.contains("section"),
             "error must name the conflict: {err}"
@@ -706,7 +721,7 @@ mod tests {
             "mode": "full",
             "root": root.to_str().unwrap()
         });
-        let result = tool_read(&args, &cache, &session, false).unwrap();
+        let result = tool_read(&args, &cache, &session, false, &Config::default()).unwrap();
         assert!(
             result.contains("fn hello()"),
             "expected file content via root-anchored path, got: {result}"
@@ -729,7 +744,7 @@ mod tests {
             "mode": "full",
             "root": unrelated_root.path().to_str().unwrap()
         });
-        let result = tool_read(&args, &cache, &session, false).unwrap();
+        let result = tool_read(&args, &cache, &session, false, &Config::default()).unwrap();
         assert!(
             result.contains("fn abs()"),
             "absolute path must resolve independently of root, got: {result}"
@@ -750,7 +765,7 @@ mod tests {
             "paths": [abs_file.to_str().unwrap()],
             "mode": "full"
         });
-        let result = tool_read(&args, &cache, &session, false).unwrap();
+        let result = tool_read(&args, &cache, &session, false, &Config::default()).unwrap();
         assert!(
             result.contains("fn check()"),
             "no-root regression: absolute path must be readable without root, got: {result}"
@@ -765,7 +780,7 @@ mod tests {
         let cache = OutlineCache::new();
         let session = Session::new();
         let args = serde_json::json!({ "paths": ["src/foo.rs"], "mode": "full" });
-        let err = tool_read(&args, &cache, &session, false).unwrap_err();
+        let err = tool_read(&args, &cache, &session, false, &Config::default()).unwrap_err();
         assert!(
             err.contains("src/foo.rs") && err.contains("root"),
             "relative path without root must refuse with an actionable message: {err}"
@@ -775,7 +790,21 @@ mod tests {
     /// A JS file with one function per line: its outline is nearly as long
     /// as the file, and both are far over the default budget.
     fn write_dense_js(dir: &Path, name: &str) -> PathBuf {
-        let mut src = String::from("import { helper } from './helper';\n");
+        write_dense_js_importing(dir, name, &["helper"])
+    }
+
+    /// [`write_dense_js`] that imports one function from each of `helpers`,
+    /// written beside it as `<helper>.js`.
+    fn write_dense_js_importing(dir: &Path, name: &str, helpers: &[&str]) -> PathBuf {
+        let mut src = String::new();
+        for helper in helpers {
+            let _ = writeln!(src, "import {{ {helper} }} from './{helper}';");
+            std::fs::write(
+                dir.join(format!("{helper}.js")),
+                format!("export function {helper}() {{}}\n"),
+            )
+            .unwrap();
+        }
         for i in 0..6000 {
             let _ = writeln!(
                 src,
@@ -784,12 +813,18 @@ mod tests {
         }
         let path = dir.join(name);
         std::fs::write(&path, src).unwrap();
-        std::fs::write(dir.join("helper.js"), "export function helper() {}\n").unwrap();
         path
     }
 
     fn read_args(args: &Value) -> String {
-        tool_read(args, &OutlineCache::new(), &Session::new(), false).unwrap()
+        tool_read(
+            args,
+            &OutlineCache::new(),
+            &Session::new(),
+            false,
+            &Config::default(),
+        )
+        .unwrap()
     }
 
     /// With no `budget`, the read skipped the outline fit: the full view
@@ -826,6 +861,38 @@ mod tests {
         );
         assert!(out.contains("> Related: "), "{}", tail(&out));
         assert!(!out.contains("... truncated"), "{}", tail(&out));
+    }
+
+    /// The `> Related:` line named the first eight local imports and said
+    /// nothing of the rest, so a file with twelve read as one with eight.
+    #[test]
+    fn tool_read_related_line_counts_the_imports_it_leaves_out() {
+        let related_line = |helpers: &[&str]| {
+            let dir = tempfile::tempdir().unwrap();
+            let path = write_dense_js_importing(dir.path(), "dense.js", helpers);
+            let out = read_args(&serde_json::json!({ "path": path.to_str().unwrap() }));
+            let names = |shown: &[&str]| {
+                shown
+                    .iter()
+                    .map(|h| dir.path().join(format!("{h}.js")).display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let line = out
+                .lines()
+                .find(|l| l.starts_with("> Related: "))
+                .unwrap_or_else(|| panic!("no Related line: {}", tail(&out)))
+                .to_string();
+            (line, names(&helpers[..helpers.len().min(8)]))
+        };
+        let helpers: Vec<String> = (0..12).map(|i| format!("helper{i:02}")).collect();
+        let helpers: Vec<&str> = helpers.iter().map(String::as_str).collect();
+
+        let (line, shown) = related_line(&helpers);
+        assert_eq!(line, format!("> Related: {shown}, and 4 more"));
+
+        let (line, shown) = related_line(&helpers[..8]);
+        assert_eq!(line, format!("> Related: {shown}"));
     }
 
     /// A batch gave each file the whole budget, so the first big file used

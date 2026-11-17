@@ -10,6 +10,7 @@ use tilth_core::lang::treesitter::{
     extract_implemented_interfaces, is_local_binding, is_or_body_of, node_text_simple,
     NodeTextMode, NAMESPACE_KINDS, PASS_THROUGH_KINDS, TYPE_KINDS, WRAPPER_KINDS,
 };
+use tilth_core::search::walk::Walk;
 
 use crate::search::rank;
 use crate::types::{Match, OtherOwner, SearchResult};
@@ -60,20 +61,19 @@ fn display_order(
 }
 
 /// Symbol search: find definitions via tree-sitter and usages via ripgrep in
-/// one walk over `scope`. The walk always runs to the end, so the totals are
-/// exact and the result does not depend on thread timing.
+/// one walk. The walk always runs to the end, so the totals are exact and the
+/// result does not depend on thread timing.
 ///
 /// `full` raises the number of matches returned from `MAX_MATCHES` to
 /// `FULL_MAX_MATCHES`. It does not change the totals.
 pub fn search(
     query: &str,
-    scope: &Path,
+    walk: Walk<'_>,
     context: Option<&Path>,
-    glob: Option<&str>,
     full: bool,
 ) -> Result<SearchResult, TilthError> {
     let max_matches = if full { FULL_MAX_MATCHES } else { MAX_MATCHES };
-    search_capped(query, scope, context, glob, max_matches, max_matches)
+    search_capped(query, walk, context, max_matches, max_matches)
 }
 
 /// What a symbol query asks for. A qualified query (`B::run`, `B.run`) asks
@@ -112,9 +112,8 @@ fn word_matcher(query: &str, text: &str) -> Result<RegexMatcher, TilthError> {
 /// the other and show that the bound leaves the result untouched.
 fn search_capped(
     query: &str,
-    scope: &Path,
+    walk: Walk<'_>,
     context: Option<&Path>,
-    glob: Option<&str>,
     max_matches: usize,
     keep: usize,
 ) -> Result<SearchResult, TilthError> {
@@ -126,7 +125,7 @@ fn search_capped(
     // One clock for the per-file bound and the final sort, so both rank by
     // the same scores.
     let now = SystemTime::now();
-    let walked = walk(wanted, &usage, scope, context, glob, now, keep)?;
+    let walked = walk_scope(wanted, &usage, walk, context, now, keep)?;
 
     let definitions: usize = walked.per_file.iter().map(|f| f.definitions).sum();
     let code_definitions: usize = walked
@@ -144,7 +143,7 @@ fn search_capped(
         other_owners.clear();
     }
     other_owners.sort();
-    display_order(&mut merged, name, scope, context, now);
+    display_order(&mut merged, name, walk.scope, context, now);
 
     let file_facets: Vec<super::facets::FileFacets> =
         walked.per_file.into_iter().map(|f| f.facets).collect();
@@ -154,7 +153,7 @@ fn search_capped(
 
     Ok(SearchResult {
         query: query.to_string(),
-        scope: scope.to_path_buf(),
+        scope: walk.scope.to_path_buf(),
         matches: merged,
         total_found: total,
         definitions,
@@ -201,18 +200,17 @@ struct FileDefs {
     others: Vec<OtherOwner>,
 }
 
-/// Walk `scope` once and collect the definitions and usages of `query`.
+/// Walk once and collect the definitions and usages of `query`.
 /// Every file is visited and counted, so the totals are exact. Only the
 /// first `keep` matches in display order are held: each file's first `keep`
 /// are merged into the running first `keep` as the file is read. The display
 /// order is total across files, since it ends on path and line, so what is
 /// kept does not depend on the order files arrive in.
-fn walk(
+fn walk_scope(
     wanted: Wanted,
     usage: &RegexMatcher,
-    scope: &Path,
+    walk: Walk<'_>,
     context: Option<&Path>,
-    glob: Option<&str>,
     now: SystemTime,
     keep: usize,
 ) -> Result<Walked, TilthError> {
@@ -223,7 +221,7 @@ fn walk(
         other_owners: Vec::new(),
     });
 
-    let walker = tilth_core::search::walk::walker(scope, glob)?;
+    let walker = tilth_core::search::walk::walker(walk)?;
 
     walker.run(|| {
         let found = &found;
@@ -262,14 +260,14 @@ fn walk(
                 ),
                 facets: super::facets::count_file(path, &file_matches),
             };
-            display_order(&mut file_matches, wanted.name, scope, context, now);
+            display_order(&mut file_matches, wanted.name, walk.scope, context, now);
             file_matches.truncate(keep);
 
             let mut found = found
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             found.kept.extend(file_matches);
-            display_order(&mut found.kept, wanted.name, scope, context, now);
+            display_order(&mut found.kept, wanted.name, walk.scope, context, now);
             found.kept.truncate(keep);
             found.per_file.push(count);
             found.other_owners.extend(others);
@@ -287,8 +285,9 @@ fn walk(
 /// definition's line dropped in favour of the definition.
 ///
 /// Single-read design: reads the file once, checks for the symbol via
-/// `memchr::memmem` (SIMD), then reuses the buffer for both the tree-sitter
-/// definition pass and the word-boundary usage pass. Definitions fall back
+/// `memchr::memmem` (SIMD), then decodes it once by the text rule of
+/// `tilth_core::source::into_text` for both the tree-sitter definition pass
+/// and the word-boundary usage pass. Definitions fall back
 /// to a keyword heuristic for code without a grammar.
 fn matches_in_file(path: &Path, wanted: Wanted, usage: &RegexMatcher) -> Scan {
     let none = || Scan::Matches(FileDefs::default());
@@ -320,42 +319,44 @@ fn matches_in_file(path: &Path, wanted: Wanted, usage: &RegexMatcher) -> Scan {
         Err(_) => 0,
     };
 
-    let Ok(raw) = tilth_core::source::read(path) else {
+    let Ok(bytes) = tilth_core::source::read(path) else {
         return none();
     };
-    let bytes = tilth_core::source::strip_bom_bytes(&raw);
 
     // Fast byte check — a word-boundary usage or a definition both need the
     // name's bytes somewhere in the file.
-    if memchr::memmem::find(bytes, wanted.name.as_bytes()).is_none() {
+    if memchr::memmem::find(&bytes, wanted.name.as_bytes()).is_none() {
         return none();
     }
 
+    // A binary file has no definitions and no usages, by the rule every
+    // read uses.
+    let Some(text) = tilth_core::source::into_text(bytes) else {
+        return none();
+    };
+    let content = tilth_core::source::strip_bom(&text);
+
     // Catch unmarked minified bundles that slipped past the filename check.
     if file_size >= tilth_core::lang::detection::MINIFIED_CHECK_THRESHOLD
-        && tilth_core::lang::detection::is_minified_by_content(bytes)
+        && tilth_core::lang::detection::is_minified_by_content(content.as_bytes())
     {
         return none();
     }
 
     let (file_lines, mtime) = file_metadata(path);
 
-    // A file that is not UTF-8 yields no definitions; one decoding rule in #308.
     let FileDefs {
         mut matches,
         others,
-    } = std::str::from_utf8(bytes).map_or_else(
-        |_| FileDefs::default(),
-        |content| definitions_in(path, wanted, content, file_lines, mtime),
-    );
+    } = definitions_in(path, wanted, content, file_lines, mtime);
     let def_count = matches.len();
 
     let mut searcher = Searcher::new();
-    // The UTF8 sink ends this file's usage scan at its first matching line
-    // that is not UTF-8, and the error is dropped here: #308.
+    // The sink fails only on a line that is not UTF-8, and the text holds
+    // none, so the scan cannot fail.
     let _ = searcher.search_slice(
         usage,
-        bytes,
+        content.as_bytes(),
         UTF8(|line_num, line| {
             let line_num = line_num as u32;
             let on_definition = matches[..def_count].iter().any(|d| d.line == line_num);
@@ -1030,6 +1031,7 @@ mod tests {
     use std::fmt::Write as _;
     use std::path::PathBuf;
     use std::time::SystemTime;
+    use tilth_core::search::walk::WalkConfig;
 
     /// The definitions of bare `name` the tree-sitter walker finds in `code`.
     fn ts_defs(
@@ -1575,7 +1577,13 @@ Body to end.
             )
             .expect("write");
         }
-        let first = search("exact_needle", dir.path(), None, None, false).expect("search");
+        let first = search(
+            "exact_needle",
+            Walk::new(dir.path(), WalkConfig::default()),
+            None,
+            false,
+        )
+        .expect("search");
         assert_eq!(first.definitions, 80, "every definition is counted");
         assert_eq!(first.usages, 80, "every usage line is counted");
         assert_eq!(first.total_found, 160);
@@ -1592,7 +1600,13 @@ Body to end.
             r.matches.iter().map(|m| (m.path.clone(), m.line)).collect()
         };
         for _ in 0..4 {
-            let again = search("exact_needle", dir.path(), None, None, false).expect("search");
+            let again = search(
+                "exact_needle",
+                Walk::new(dir.path(), WalkConfig::default()),
+                None,
+                false,
+            )
+            .expect("search");
             assert_eq!(again.total_found, first.total_found);
             assert_eq!(shown(&again), shown(&first), "same matches every run");
         }
@@ -1626,7 +1640,16 @@ Body to end.
                 .map(|m| (m.path.clone(), m.line, m.is_definition))
                 .collect()
         };
-        let run = |cap| search_capped("bound_probe", dir.path(), None, None, 10, cap).unwrap();
+        let run = |cap| {
+            search_capped(
+                "bound_probe",
+                Walk::new(dir.path(), WalkConfig::default()),
+                None,
+                10,
+                cap,
+            )
+            .unwrap()
+        };
         let bounded = run(10);
         let unbounded = run(usize::MAX);
         assert_eq!(bounded.total_found, 87);
@@ -1665,9 +1688,20 @@ Body to end.
             std::fs::write(&path, "pub fn WidelyUsedThing() {}\n").expect("write");
         }
 
-        let result_default =
-            search("WidelyUsedThing", scope, None, None, false).expect("search default");
-        let result_full = search("WidelyUsedThing", scope, None, None, true).expect("search full");
+        let result_default = search(
+            "WidelyUsedThing",
+            Walk::new(scope, WalkConfig::default()),
+            None,
+            false,
+        )
+        .expect("search default");
+        let result_full = search(
+            "WidelyUsedThing",
+            Walk::new(scope, WalkConfig::default()),
+            None,
+            true,
+        )
+        .expect("search full");
 
         // Default cap is 10 — should not exceed it.
         assert!(
@@ -1697,7 +1731,13 @@ Body to end.
             tilth_core::lang::go::GO_DECLARATIONS_FIXTURE,
         )
         .expect("write fixture");
-        let result = search(query, dir.path(), None, None, false).expect("search");
+        let result = search(
+            query,
+            Walk::new(dir.path(), WalkConfig::default()),
+            None,
+            false,
+        )
+        .expect("search");
         result
             .matches
             .into_iter()
@@ -1825,7 +1865,13 @@ func run() {
     fn definition_lines(file: &str, fixture: &str, query: &str) -> Vec<u32> {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join(file), fixture).expect("write fixture");
-        let result = search(query, dir.path(), None, None, false).expect("search");
+        let result = search(
+            query,
+            Walk::new(dir.path(), WalkConfig::default()),
+            None,
+            false,
+        )
+        .expect("search");
         let mut lines: Vec<u32> = result
             .matches
             .iter()
@@ -1874,7 +1920,13 @@ func run() {
             tilth_core::lang::c::C_DEFINITIONS_FIXTURE,
         )
         .expect("write fixture");
-        let result = search("add", dir.path(), None, None, false).expect("search");
+        let result = search(
+            "add",
+            Walk::new(dir.path(), WalkConfig::default()),
+            None,
+            false,
+        )
+        .expect("search");
         let def = result
             .matches
             .iter()
@@ -1968,7 +2020,13 @@ func run() {
     fn definition_range(file: &str, fixture: &str, query: &str) -> Option<(u32, u32)> {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join(file), fixture).expect("write fixture");
-        let result = search(query, dir.path(), None, None, false).expect("search");
+        let result = search(
+            query,
+            Walk::new(dir.path(), WalkConfig::default()),
+            None,
+            false,
+        )
+        .expect("search");
         let defs: Vec<&Match> = result.matches.iter().filter(|m| m.is_definition).collect();
         assert_eq!(
             defs.len(),
@@ -2287,7 +2345,13 @@ pub trait Speak {
     fn qualified_search(file: &str, fixture: &str, query: &str) -> (Vec<u32>, SearchResult) {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join(file), fixture).expect("write fixture");
-        let result = search(query, dir.path(), None, None, false).expect("search");
+        let result = search(
+            query,
+            Walk::new(dir.path(), WalkConfig::default()),
+            None,
+            false,
+        )
+        .expect("search");
         let bare = tilth_core::search::scope::split_qualified(query).1;
         let mut lines: Vec<u32> = result
             .matches
@@ -2417,7 +2481,13 @@ pub fn use_them(a: &A, b: &B) -> u8 {
             "@Injectable()\nclass Service {\n  @First()\n  method() {\n    return 1;\n  }\n}\n";
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("service.ts"), ts).expect("write");
-        let result = search("Service", dir.path(), None, None, false).expect("search");
+        let result = search(
+            "Service",
+            Walk::new(dir.path(), WalkConfig::default()),
+            None,
+            false,
+        )
+        .expect("search");
         assert_eq!(result.matches.len(), 1, "{result:?}");
         let m = &result.matches[0];
         assert_eq!(
@@ -2530,7 +2600,13 @@ impl Runner {
             "def slug(s):\n    return s\n",
         )
         .expect("write");
-        let result = search("utils.slug", dir.path(), None, None, false).expect("search");
+        let result = search(
+            "utils.slug",
+            Walk::new(dir.path(), WalkConfig::default()),
+            None,
+            false,
+        )
+        .expect("search");
         assert_eq!(result.definitions, 1, "{result:?}");
     }
 
@@ -2558,7 +2634,13 @@ impl Runner {
             let dir = tempfile::tempdir().expect("tempdir");
             std::fs::write(dir.path().join(free_file), free).expect("write");
             std::fs::write(dir.path().join(owned_file), owned).expect("write");
-            let result = search(query, dir.path(), None, None, false).expect("search");
+            let result = search(
+                query,
+                Walk::new(dir.path(), WalkConfig::default()),
+                None,
+                false,
+            )
+            .expect("search");
             let defs: Vec<&Path> = result
                 .matches
                 .iter()
@@ -2604,7 +2686,13 @@ impl Runner {
         let rb = "class User\n  def save!\n    true\n  end\nend\n\nUser.new.save!\n";
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("u.rb"), rb).expect("write");
-        let result = search("save!", dir.path(), None, None, false).expect("search");
+        let result = search(
+            "save!",
+            Walk::new(dir.path(), WalkConfig::default()),
+            None,
+            false,
+        )
+        .expect("search");
         assert_eq!((result.definitions, result.usages), (1, 1), "{result:?}");
     }
 
@@ -2624,7 +2712,13 @@ impl Runner {
         ] {
             let dir = tempfile::tempdir().expect("tempdir");
             std::fs::write(dir.path().join(file), fixture).expect("write");
-            let result = search(query, dir.path(), None, None, false).expect("search");
+            let result = search(
+                query,
+                Walk::new(dir.path(), WalkConfig::default()),
+                None,
+                false,
+            )
+            .expect("search");
             let def = result
                 .matches
                 .iter()
@@ -2734,5 +2828,64 @@ impl Runner {
                 ("frozen", &[]),
             ],
         );
+    }
+
+    /// The matches of `query` under `dir`, as `(file, line, definition?)`.
+    fn symbol_hits(dir: &Path, query: &str) -> Vec<(String, u32, bool)> {
+        let result = search(query, Walk::new(dir, WalkConfig::default()), None, false).unwrap();
+        let mut hits: Vec<_> = result
+            .matches
+            .iter()
+            .map(|m| {
+                let name = m.path.file_name().unwrap().to_string_lossy().into_owned();
+                (name, m.line, m.is_definition)
+            })
+            .collect();
+        hits.sort();
+        assert_eq!(result.total_found, hits.len());
+        hits
+    }
+
+    /// A byte that is not UTF-8 reads as U+FFFD and costs nothing else: the
+    /// usage scan reads past a matched line that holds one, and the
+    /// definition pass still runs over a file that holds one.
+    #[test]
+    fn a_file_that_is_not_utf8_keeps_its_definitions_and_usages() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(
+            d.path().join("latin1.txt"),
+            b"needle_delta caf\xe9\nneedle_delta two\nneedle_delta three\n",
+        )
+        .unwrap();
+        std::fs::write(
+            d.path().join("latin1.c"),
+            b"/* caf\xe9 */\nint needle_delta(void) { return 0; }\nint y = needle_delta();\nint z = needle_delta();\n",
+        )
+        .unwrap();
+        let hit = |file: &str, line, def| (file.to_string(), line, def);
+        assert_eq!(
+            symbol_hits(d.path(), "needle_delta"),
+            [
+                hit("latin1.c", 2, true),
+                hit("latin1.c", 3, false),
+                hit("latin1.c", 4, false),
+                hit("latin1.txt", 1, false),
+                hit("latin1.txt", 2, false),
+                hit("latin1.txt", 3, false),
+            ]
+        );
+    }
+
+    /// A file is binary when a NUL byte falls in its first 512 bytes, the
+    /// rule a read uses, and a binary file has no definitions and no usages.
+    #[test]
+    fn a_binary_file_has_no_definitions_or_usages() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(
+            d.path().join("blob.c"),
+            b"int needle_delta(void) { return 0; }\n\0\nint y = needle_delta();\n",
+        )
+        .unwrap();
+        assert_eq!(symbol_hits(d.path(), "needle_delta"), []);
     }
 }

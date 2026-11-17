@@ -16,8 +16,10 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
+use crate::format::noun;
 use crate::session::Session;
 use tilth_core::index::bloom::BloomFilterCache;
+use tilth_core::search::walk::WalkConfig;
 
 /// Parse one `files[]` entry into a hash-mode edit task. Parse errors are
 /// deferred onto the task so a malformed entry surfaces as a per-file failure
@@ -25,7 +27,7 @@ use tilth_core::index::bloom::BloomFilterCache;
 pub(in crate::mcp) fn parse_file_edit(
     index: usize,
     val: &Value,
-    root: Option<&Path>,
+    path: PathBuf,
 ) -> crate::edit::FileEditTask {
     use crate::edit::FileEditTask;
 
@@ -62,10 +64,7 @@ pub(in crate::mcp) fn parse_file_edit(
         }
     }
 
-    FileEditTask::Ready {
-        path: resolve_write_path(path_str, root),
-        edits,
-    }
+    FileEditTask::Ready { path, edits }
 }
 
 /// Parse a single `edits[]` entry. Errors carry the edit index so the LLM
@@ -106,17 +105,72 @@ fn parse_overwrite_flag(f: &Value) -> Option<bool> {
     }
 }
 
-fn render_text_diff(before: Option<&str>, after: &str) -> String {
-    let mut out = String::from("── diff ──\n--- before\n+++ after\n");
-    if let Some(before) = before {
-        for line in before.lines() {
-            let _ = writeln!(out, "- {line}");
-        }
+/// The line diff of a direct write, every line removed then every line
+/// added. `None` is a binary side: its header says so, and it shows no lines.
+fn render_text_diff(before: Option<&str>, after: Option<&str>) -> String {
+    let binary = |text: Option<&str>| if text.is_some() { "" } else { " (binary)" };
+    let mut out = format!(
+        "── diff ──\n--- before{}\n+++ after{}\n",
+        binary(before),
+        binary(after)
+    );
+    for line in before.unwrap_or_default().lines() {
+        let _ = writeln!(out, "- {line}");
     }
-    for line in after.lines() {
+    for line in after.unwrap_or_default().lines() {
         let _ = writeln!(out, "+ {line}");
     }
     out
+}
+
+/// What an append of `content` reports, given the file's text `before` it
+/// (`None` for a binary file). A text file echoes the appended region's
+/// hashlines alone, so a log-shaped file does not balloon the response; a
+/// binary file has no lines to number, so it echoes none.
+fn append_echo(before: Option<&str>, content: &str, show_diff: bool) -> String {
+    let bytes = format!("{} {}", content.len(), noun(content.len(), "byte", "bytes"));
+    let Some(before) = before else {
+        let mut echo = format!("append: {bytes} to a binary file, not echoed\n");
+        if show_diff {
+            echo.push_str(&render_text_diff(None, None));
+        }
+        return echo;
+    };
+    let after = format!("{before}{content}");
+    // No trailing newline on the prior content means the first appended line
+    // merges onto the last existing line, so the echoed region starts one
+    // line earlier.
+    let merged = !before.is_empty() && !before.ends_with('\n');
+    let pre_count = before.lines().count();
+    let after_lines: Vec<&str> = after.lines().collect();
+    let total = after_lines.len();
+    let start_idx = if merged {
+        pre_count.saturating_sub(1)
+    } else {
+        pre_count
+    }
+    .min(total);
+    let tail = after_lines[start_idx..].join("\n");
+    let start_line = (start_idx + 1) as u32;
+    let mut echo = format!(
+        "append: {bytes} (echoing last {} of {total} {})\n{}",
+        total - start_idx,
+        noun(total, "line", "lines"),
+        crate::format::hashlines(&tail, start_line),
+    );
+    if show_diff {
+        echo.push_str(&render_text_diff(Some(before), Some(&after)));
+    }
+    echo
+}
+
+/// The text of the file at `path` before a write, by the one rule of
+/// [`tilth_core::source::into_text`], for the echo and the diff alone:
+/// `None` for a binary file. A file that is absent or cannot be read has
+/// no earlier text, so it reads as empty.
+fn earlier_text(path: &Path) -> Option<String> {
+    tilth_core::source::read(path)
+        .map_or_else(|_| Some(String::new()), tilth_core::source::into_text)
 }
 
 /// Returns true if `path` resolves under `scope` (canonical path containment).
@@ -151,17 +205,14 @@ fn path_within_scope(path: &Path, scope: &Path) -> bool {
     full.starts_with(&scope_canon)
 }
 
-/// Resolve a write path: a relative `path_str` is anchored under `root` when one
-/// was supplied; absolute paths are used as-is regardless of `root`.
-fn resolve_write_path(path_str: &str, root: Option<&Path>) -> PathBuf {
+/// Resolve a write path: a relative `path_str` is anchored under `base` (the
+/// call's `root`, else the server's root); absolute paths are used as-is.
+fn resolve_write_path(path_str: &str, base: Option<&Path>) -> Result<PathBuf, String> {
     let p = PathBuf::from(path_str);
     if p.is_absolute() {
-        return p;
+        return Ok(p);
     }
-    match root {
-        Some(r) => r.join(&p),
-        None => p,
-    }
+    Ok(super::require_root(base)?.join(p))
 }
 
 /// Walk up from `path` to the nearest directory containing a `.git` entry
@@ -184,55 +235,24 @@ fn find_git_root(path: &Path) -> Option<PathBuf> {
 
 /// Build a cross-worktree warning string. Called when a relative path write
 /// (no `root` argument) resolves into a different git worktree than the
-/// server's process cwd. Returns `None` when no warning is needed.
-fn cross_worktree_warning(path: &Path, cwd: &Path) -> Option<String> {
+/// server's root. Returns `None` when no warning is needed.
+fn cross_worktree_warning(path: &Path, server_root: &Path) -> Option<String> {
     // Callers pass only paths a write landed at. Only warn for those that
     // resolve into a git repo.
     let resolved = path.canonicalize().ok()?;
     let write_root = find_git_root(&resolved)?;
-    let cwd_root = find_git_root(cwd)?;
-    if write_root == cwd_root {
+    let server_git_root = find_git_root(server_root)?;
+    if write_root == server_git_root {
         return None;
     }
     Some(format!(
         "\n⚠️  cross-worktree write: resolved path is {} (git root: {}), \
-         server cwd git root: {}. Pass `root` or use an absolute path to \
+         server root's git root: {}. Pass `root` or use an absolute path to \
          make the target explicit.",
         resolved.display(),
         write_root.display(),
-        cwd_root.display(),
+        server_git_root.display(),
     ))
-}
-
-/// The cross-worktree check for the relative writes of one batch, against
-/// the server's working directory as read once for that batch.
-struct RelativeWrites<'a> {
-    cwd: &'a std::io::Result<PathBuf>,
-    /// A relative write landed while `cwd` could not be read.
-    unchecked: bool,
-}
-
-impl RelativeWrites<'_> {
-    /// The [`cross_worktree_warning`] for a relative write that landed at
-    /// `path`. An unreadable working directory leaves nothing to compare
-    /// with, so the write is only counted for [`Self::skipped`].
-    fn landed(&mut self, path: &Path) -> Option<String> {
-        if let Ok(cwd) = self.cwd {
-            cross_worktree_warning(path, cwd)
-        } else {
-            self.unchecked = true;
-            None
-        }
-    }
-
-    /// Why the batch's relative writes went unchecked, if any did.
-    fn skipped(&self) -> Option<&std::io::Error> {
-        if self.unchecked {
-            self.cwd.as_ref().err()
-        } else {
-            None
-        }
-    }
 }
 
 /// Returns the resolved absolute path of `path` for success output, falling
@@ -250,6 +270,8 @@ pub(in crate::mcp) fn tool_write(
     args: &Value,
     session: &Session,
     bloom: &Arc<BloomFilterCache>,
+    walk: WalkConfig,
+    server_root: Option<&Path>,
 ) -> Result<String, String> {
     let files_val = args
         .get("files")
@@ -291,7 +313,7 @@ pub(in crate::mcp) fn tool_write(
 
     // Optional per-call anchor root. When provided it must be absolute;
     // relative file paths in this call are anchored to it instead of the
-    // server's process cwd.
+    // server's root.
     let root: Option<PathBuf> = match args.get("root").and_then(|v| v.as_str()) {
         Some(r) => {
             let p = PathBuf::from(r);
@@ -308,43 +330,51 @@ pub(in crate::mcp) fn tool_write(
     // anchors it. When `scope` is absent, default to `root` if one was
     // supplied — `root` names the caller's actual checkout, so it is the
     // correct containment boundary for a root-anchored write; falling back to
-    // the server's process cwd here would refuse a legitimate root-only write
-    // whenever the server was launched from a different directory than
-    // `root` (the headline cross-worktree scenario `root` exists to solve).
-    // Only when BOTH `scope` and `root` are absent does this fall back to the
-    // server cwd, exactly as before. A relative `scope` resolves against the
-    // cwd too. A cwd that cannot be read leaves those without a boundary, so
-    // their writes are refused with that cause.
-    //
-    // The cwd is read once for the batch: it is also what relative writes
-    // are checked against for a cross-worktree landing.
-    let cwd = std::env::current_dir().map_err(|e| {
-        std::io::Error::new(e.kind(), format!("cannot read the current directory: {e}"))
-    });
-    let mut relative_writes = RelativeWrites {
-        cwd: &cwd,
-        unchecked: false,
-    };
+    // the server's root here would refuse a legitimate root-only write
+    // whenever the server was started for a different directory than `root`
+    // (the headline cross-worktree scenario `root` exists to solve). Only
+    // when BOTH `scope` and `root` are absent does this fall back to the
+    // server's root. A relative `scope` resolves against the server's root
+    // too. A server without a root leaves those without a boundary, so their
+    // writes are refused with that cause.
     let scope_arg = args.get("scope").and_then(Value::as_str).map(Path::new);
-    let cwd_error = |e: &std::io::Error| std::io::Error::new(e.kind(), e.to_string());
-    let scope_root: std::io::Result<PathBuf> = match (scope_arg, &root) {
+    let scope_root: Result<PathBuf, String> = match (scope_arg, &root) {
         (Some(scope), _) if scope.is_relative() => {
-            cwd.as_ref().map(|_| scope.to_path_buf()).map_err(cwd_error)
+            super::require_root(server_root).map(|r| r.join(scope))
         }
         (Some(scope), _) => Ok(scope.to_path_buf()),
         (None, Some(root)) => Ok(root.clone()),
-        (None, None) => cwd.as_ref().cloned().map_err(cwd_error),
+        (None, None) => super::require_root(server_root).map(Path::to_path_buf),
     };
     // Canonicalize the scope once for the overwrite/append containment check.
     // Fail closed on canonicalize failure: an unresolvable scope refuses
     // writes rather than silently disabling the guard.
-    let scope_canon: Result<PathBuf, std::io::Error> =
-        scope_root.and_then(|scope| scope.canonicalize());
+    let scope_canon: Result<PathBuf, String> =
+        scope_root.and_then(|scope| scope.canonicalize().map_err(|e| e.to_string()));
+    // A relative path is anchored under `root` when supplied, else under the
+    // server's root.
+    let base = root.as_deref().or(server_root);
+    // The cross-worktree warning for a write that landed at `path`: only a
+    // relative path with no `root` can land somewhere the caller did not
+    // name, so only those are checked, against the server's root.
+    let crossed_worktree = |path_str: &str, path: &Path| -> Option<String> {
+        if root.is_some() || Path::new(path_str).is_absolute() {
+            return None;
+        }
+        cross_worktree_warning(path, server_root?)
+    };
+    // A refusal names the parameter that moves the boundary: an explicit
+    // `scope` sets it, otherwise `root` does.
+    let widen_hint = if scope_arg.is_some() {
+        "pass a scope that contains this path"
+    } else {
+        "pass root: <dir containing this path> to write outside it"
+    };
 
     let mut hash_tasks: Vec<crate::edit::FileEditTask> = Vec::new();
-    // Resolved paths for hash-mode files that were relative with no `root`, so
-    // the cross-worktree warning can fire after apply_batch.
-    let mut hash_relative_paths: Vec<PathBuf> = Vec::new();
+    // The path each hash-mode file was given as, by resolved path, so the
+    // cross-worktree warning can fire after apply_batch.
+    let mut hash_given: Vec<(PathBuf, &str)> = Vec::new();
     let mut direct_results: Vec<String> = Vec::new();
     let mut direct_applied: Vec<PathBuf> = Vec::new();
 
@@ -356,9 +386,15 @@ pub(in crate::mcp) fn tool_write(
         };
         // A relative path is anchored under `root` when supplied; absolute
         // paths are used as-is. With no `root`, a relative path falls back to
-        // the server cwd but a cross-worktree warning fires below if that
-        // resolves into a different git worktree than the server.
-        let path = resolve_write_path(path_str, root.as_deref());
+        // the server's root, and a cross-worktree warning fires below if it
+        // resolves into a different git worktree than the server's root.
+        let path = match resolve_write_path(path_str, base) {
+            Ok(path) => path,
+            Err(e) => {
+                direct_results.push(format!("## {path_str}\nerror: {e}"));
+                continue;
+            }
+        };
 
         // Scope guard for ALL modes. hash mode delegates to apply_batch, which
         // computes a package_root only for blast-radius reporting — it does NOT
@@ -369,7 +405,7 @@ pub(in crate::mcp) fn tool_write(
             Ok(root) => {
                 if !path_within_scope(&path, root) {
                     direct_results.push(format!(
-                        "## {}\nerror: refusing write outside scope ({})",
+                        "## {}\nerror: refusing write outside scope ({}); {widen_hint}",
                         path.display(),
                         root.display()
                     ));
@@ -387,10 +423,8 @@ pub(in crate::mcp) fn tool_write(
 
         match mode {
             "hash" | "h" => {
-                if root.is_none() && !PathBuf::from(path_str).is_absolute() {
-                    hash_relative_paths.push(path.clone());
-                }
-                hash_tasks.push(parse_file_edit(i, f, root.as_deref()));
+                hash_given.push((path.clone(), path_str));
+                hash_tasks.push(parse_file_edit(i, f, path));
             }
             "overwrite" | "w" => {
                 let Some(content) = f.get("content").and_then(|v| v.as_str()) else {
@@ -408,27 +442,29 @@ pub(in crate::mcp) fn tool_write(
                     continue;
                 };
                 let pre_existed = path.try_exists().unwrap_or(false);
-                let before = (show_diff && pre_existed)
-                    .then(|| tilth_core::source::read_to_string(&path).ok())
-                    .flatten();
+                let before = if show_diff && pre_existed {
+                    earlier_text(&path)
+                } else {
+                    Some(String::new())
+                };
                 match crate::mcp::write::write_overwrite(&path, content, overwrite) {
                     Ok(()) => {
                         let line_count = content.lines().count();
                         let verb = if pre_existed { "overwrote" } else { "created" };
                         let mut block = format!(
-                            "## {}\n{verb}: {} bytes, {line_count} lines\n{}",
+                            "## {}\n{verb}: {} {}, {line_count} {}\n{}",
                             resolved_display(&path),
                             content.len(),
+                            noun(content.len(), "byte", "bytes"),
+                            noun(line_count, "line", "lines"),
                             crate::format::hashlines(content, 1),
                         );
                         if show_diff {
-                            block.push_str(&render_text_diff(before.as_deref(), content));
+                            block.push_str(&render_text_diff(before.as_deref(), Some(content)));
                         }
                         // Warn when a relative path (no `root`) crosses a worktree boundary.
-                        if root.is_none() && !PathBuf::from(path_str).is_absolute() {
-                            if let Some(warn) = relative_writes.landed(&path) {
-                                block.push_str(&warn);
-                            }
+                        if let Some(warn) = crossed_worktree(path_str, &path) {
+                            block.push_str(&warn);
                         }
                         direct_results.push(block);
                         direct_applied.push(path);
@@ -456,43 +492,17 @@ pub(in crate::mcp) fn tool_write(
                 // re-read: re-reading would race a concurrent appender, whose
                 // extra lines inflate the count and mis-number the echoed hash
                 // anchors — the agent then hash-edits against wrong line numbers.
-                let before = tilth_core::source::read_to_string(&path).ok();
+                let before = earlier_text(&path);
                 match crate::mcp::write::write_append(&path, content) {
                     Ok(()) => {
-                        let before_str = before.as_deref().unwrap_or("");
-                        let after = format!("{before_str}{content}");
-                        // No trailing newline on the prior content means the first
-                        // appended line merges onto the last existing line, so the
-                        // echoed region starts one line earlier.
-                        let merged = !before_str.is_empty() && !before_str.ends_with('\n');
-                        let pre_count = before_str.lines().count();
-                        let after_lines: Vec<&str> = after.lines().collect();
-                        let total = after_lines.len();
-                        let start_idx = if merged {
-                            pre_count.saturating_sub(1)
-                        } else {
-                            pre_count
-                        }
-                        .min(total);
-                        let tail = after_lines[start_idx..].join("\n");
-                        let start_line = (start_idx + 1) as u32;
-                        // Echo only the appended region's hashlines so log-shaped
-                        // append targets don't balloon the response.
                         let mut block = format!(
-                            "## {}\nappend: {} bytes (echoing last {} of {total} lines)\n{}",
+                            "## {}\n{}",
                             resolved_display(&path),
-                            content.len(),
-                            total - start_idx,
-                            crate::format::hashlines(&tail, start_line),
+                            append_echo(before.as_deref(), content, show_diff)
                         );
-                        if show_diff {
-                            block.push_str(&render_text_diff(before.as_deref(), &after));
-                        }
                         // Warn when a relative path (no `root`) crosses a worktree boundary.
-                        if root.is_none() && !PathBuf::from(path_str).is_absolute() {
-                            if let Some(warn) = relative_writes.landed(&path) {
-                                block.push_str(&warn);
-                            }
+                        if let Some(warn) = crossed_worktree(path_str, &path) {
+                            block.push_str(&warn);
                         }
                         direct_results.push(block);
                         direct_applied.push(path);
@@ -508,7 +518,9 @@ pub(in crate::mcp) fn tool_write(
     }
 
     let mut output = String::new();
-    if !hash_tasks.is_empty() {
+    // A hash task exists only once its path passed the containment check
+    // against `scope_canon`, so there are none unless that resolved.
+    if let (false, Ok(scope)) = (hash_tasks.is_empty(), &scope_canon) {
         // Record reads up front: record_read counts attempts, not just
         // committed edits.
         for task in &hash_tasks {
@@ -516,16 +528,15 @@ pub(in crate::mcp) fn tool_write(
                 session.record_read(path);
             }
         }
-        match crate::edit::apply_batch(hash_tasks, bloom, show_diff) {
+        match crate::edit::apply_batch(hash_tasks, bloom, walk, show_diff, scope) {
             Ok(batch) => {
                 output.push_str(&batch.output);
                 // Cross-worktree warning for the hash-mode relative paths whose
                 // edits applied.
                 for path in &batch.applied {
-                    if hash_relative_paths.contains(path) {
-                        if let Some(warn) = relative_writes.landed(path) {
-                            output.push_str(&warn);
-                        }
+                    let given = hash_given.iter().find(|(p, _)| p == path);
+                    if let Some(warn) = given.and_then(|(_, s)| crossed_worktree(s, path)) {
+                        output.push_str(&warn);
                     }
                 }
             }
@@ -549,11 +560,6 @@ pub(in crate::mcp) fn tool_write(
             session.record_read(p);
         }
     }
-    if let Some(e) = relative_writes.skipped() {
-        crate::diag::emit(format_args!(
-            "tilth: warning: no cross-worktree check for this batch's relative paths: {e}"
-        ));
-    }
     Ok(output)
 }
 
@@ -572,7 +578,7 @@ mod tests {
     #[test]
     fn parse_file_edit_rejects_empty_edits_array() {
         let val = serde_json::json!({ "path": "noop.txt", "edits": [] });
-        match parse_file_edit(0, &val, None) {
+        match parse_file_edit(0, &val, PathBuf::from("noop.txt")) {
             crate::edit::FileEditTask::ParseError { label, msg } => {
                 assert_eq!(label, "noop.txt");
                 assert!(msg.contains("empty"), "unexpected msg: {msg}");
@@ -605,7 +611,14 @@ mod tests {
             "scope": dir.path().to_str().unwrap(),
             "files": [{"path": p.to_str().unwrap(), "mode": "overwrite", "content": "fn main(){}\n"}],
         });
-        let out = tool_write(&args, &Session::new(), &fresh_bloom()).unwrap();
+        let out = tool_write(
+            &args,
+            &Session::new(),
+            &fresh_bloom(),
+            WalkConfig::default(),
+            None,
+        )
+        .unwrap();
         assert!(out.contains("created"), "expected 'created' verb: {out}");
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "fn main(){}\n");
     }
@@ -619,7 +632,14 @@ mod tests {
             "scope": dir.path().to_str().unwrap(),
             "files": [{"path": p.to_str().unwrap(), "mode": "overwrite", "content": "new"}],
         });
-        let out = tool_write(&args, &Session::new(), &fresh_bloom()).unwrap();
+        let out = tool_write(
+            &args,
+            &Session::new(),
+            &fresh_bloom(),
+            WalkConfig::default(),
+            None,
+        )
+        .unwrap();
         assert!(
             out.contains("already exists") && out.contains("overwrite: true"),
             "expected create-only guard message: {out}"
@@ -640,7 +660,14 @@ mod tests {
             "scope": dir.path().to_str().unwrap(),
             "files": [{"path": p.to_str().unwrap(), "mode": "overwrite", "content": "replaced", "overwrite": true}],
         });
-        let out = tool_write(&args, &Session::new(), &fresh_bloom()).unwrap();
+        let out = tool_write(
+            &args,
+            &Session::new(),
+            &fresh_bloom(),
+            WalkConfig::default(),
+            None,
+        )
+        .unwrap();
         assert!(
             out.contains("overwrote"),
             "expected 'overwrote' verb: {out}"
@@ -656,7 +683,14 @@ mod tests {
             "scope": dir.path().to_str().unwrap(),
             "files": [{"path": p.to_str().unwrap(), "mode": "append", "content": "line1\n"}],
         });
-        let out = tool_write(&args, &Session::new(), &fresh_bloom()).unwrap();
+        let out = tool_write(
+            &args,
+            &Session::new(),
+            &fresh_bloom(),
+            WalkConfig::default(),
+            None,
+        )
+        .unwrap();
         assert!(out.contains("append"), "expected 'append' summary: {out}");
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "line1\n");
     }
@@ -673,8 +707,14 @@ mod tests {
                 {"path": ps, "mode": "overwrite", "content": "b"},
             ],
         });
-        let err = tool_write(&args, &Session::new(), &fresh_bloom())
-            .expect_err("duplicate paths must be rejected");
+        let err = tool_write(
+            &args,
+            &Session::new(),
+            &fresh_bloom(),
+            WalkConfig::default(),
+            None,
+        )
+        .expect_err("duplicate paths must be rejected");
         assert!(err.contains("duplicate file path"), "unexpected err: {err}");
         // Nothing written: the batch is refused before any file op.
         assert!(!p.exists(), "no file should be created on a rejected batch");
@@ -688,7 +728,14 @@ mod tests {
             "scope": dir.path().to_str().unwrap(),
             "files": [{"path": p.to_str().unwrap(), "mode": "bogus", "content": "x"}],
         });
-        let out = tool_write(&args, &Session::new(), &fresh_bloom()).unwrap();
+        let out = tool_write(
+            &args,
+            &Session::new(),
+            &fresh_bloom(),
+            WalkConfig::default(),
+            None,
+        )
+        .unwrap();
         assert!(
             out.contains("unknown mode"),
             "expected unknown-mode error: {out}"
@@ -710,7 +757,14 @@ mod tests {
         });
         // hash task fails (file absent) but the overwrite succeeds, so the
         // call returns Ok with both sections rather than hard-failing.
-        let out = tool_write(&args, &Session::new(), &fresh_bloom()).unwrap();
+        let out = tool_write(
+            &args,
+            &Session::new(),
+            &fresh_bloom(),
+            WalkConfig::default(),
+            None,
+        )
+        .unwrap();
         assert!(
             out.contains("created"),
             "direct write should report success: {out}"
@@ -731,7 +785,14 @@ mod tests {
             "scope": dir.path().to_str().unwrap(),
             "files": [{"path": p.to_str().unwrap(), "mode": "overwrite", "content": "x"}],
         });
-        let out = tool_write(&args, &Session::new(), &fresh_bloom()).unwrap();
+        let out = tool_write(
+            &args,
+            &Session::new(),
+            &fresh_bloom(),
+            WalkConfig::default(),
+            None,
+        )
+        .unwrap();
         assert!(
             out.contains("outside scope"),
             "expected scope refusal: {out}"
@@ -753,7 +814,14 @@ mod tests {
             "files": [{"path": p.to_str().unwrap(), "mode": "hash",
                        "edits": [{"start": "1:000", "content": "hacked"}]}],
         });
-        let out = tool_write(&args, &Session::new(), &fresh_bloom()).unwrap();
+        let out = tool_write(
+            &args,
+            &Session::new(),
+            &fresh_bloom(),
+            WalkConfig::default(),
+            None,
+        )
+        .unwrap();
         assert!(
             out.contains("outside scope"),
             "hash mode must honor the scope guard: {out}"
@@ -766,6 +834,73 @@ mod tests {
     }
 
     #[test]
+    fn refusal_outside_launch_folder_names_root() {
+        // #319: with neither `scope` nor `root`, the boundary is the server's
+        // root. An absolute path outside it is refused, and the refusal must
+        // name the parameter that moves the boundary.
+        let server_root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let p = outside.path().join("probe.txt");
+        let args = serde_json::json!({
+            "files": [{"path": p.to_str().unwrap(), "mode": "overwrite", "content": "probe\n"}],
+        });
+        let out = tool_write(
+            &args,
+            &Session::new(),
+            &fresh_bloom(),
+            WalkConfig::default(),
+            Some(server_root.path()),
+        )
+        .unwrap();
+        assert!(
+            out.contains("refusing write outside scope")
+                && out.contains("pass root: <dir containing this path>"),
+            "refusal must say to pass root: {out}"
+        );
+        assert!(!p.exists(), "out-of-scope path must not be written");
+
+        // Following the advice writes the file.
+        let args = serde_json::json!({
+            "root": outside.path().to_str().unwrap(),
+            "files": [{"path": p.to_str().unwrap(), "mode": "overwrite", "content": "probe\n"}],
+        });
+        tool_write(
+            &args,
+            &Session::new(),
+            &fresh_bloom(),
+            WalkConfig::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "probe\n");
+    }
+
+    #[test]
+    fn refusal_outside_explicit_scope_names_scope() {
+        // An explicit `scope` wins over `root` as the boundary, so the advice
+        // for it is a wider scope, not a root.
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let p = outside.path().join("escape.rs");
+        let args = serde_json::json!({
+            "scope": dir.path().to_str().unwrap(),
+            "files": [{"path": p.to_str().unwrap(), "mode": "overwrite", "content": "x"}],
+        });
+        let out = tool_write(
+            &args,
+            &Session::new(),
+            &fresh_bloom(),
+            WalkConfig::default(),
+            None,
+        )
+        .unwrap();
+        assert!(
+            out.contains("pass a scope that contains this path"),
+            "refusal under an explicit scope must say to widen it: {out}"
+        );
+    }
+
+    #[test]
     fn append_echoes_appended_region_with_correct_line_numbers() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("multi.log");
@@ -774,7 +909,14 @@ mod tests {
             "scope": dir.path().to_str().unwrap(),
             "files": [{"path": p.to_str().unwrap(), "mode": "append", "content": "d\n"}],
         });
-        let out = tool_write(&args, &Session::new(), &fresh_bloom()).unwrap();
+        let out = tool_write(
+            &args,
+            &Session::new(),
+            &fresh_bloom(),
+            WalkConfig::default(),
+            None,
+        )
+        .unwrap();
         // 3 pre-existing lines → the appended line is numbered 4, and only it is
         // echoed. Anchors come from before+content, not a post-write re-read.
         assert!(
@@ -788,11 +930,117 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "a\nb\nc\nd\n");
     }
 
+    /// One `tilth_write` call with `diff: true` on the files in `dir`.
+    fn write_with_diff(dir: &Path, files: &Value) -> String {
+        let args = serde_json::json!({
+            "scope": dir.to_str().unwrap(),
+            "diff": true,
+            "files": files,
+        });
+        tool_write(
+            &args,
+            &Session::new(),
+            &fresh_bloom(),
+            WalkConfig::default(),
+            None,
+        )
+        .unwrap()
+    }
+
+    /// A file that is not UTF-8 is text by the one rule, so an append
+    /// numbers its lines from the file's real line count and the diff shows
+    /// its earlier lines, each Latin-1 byte as U+FFFD. The file keeps its
+    /// bytes.
+    #[test]
+    fn append_to_latin1_file_numbers_from_its_line_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("notes.txt");
+        std::fs::write(&p, b"one\ncaf\xe9\nthree\n").unwrap();
+        let out = write_with_diff(
+            dir.path(),
+            &serde_json::json!([{"path": p.to_str().unwrap(), "mode": "append", "content": "four\n"}]),
+        );
+        assert!(out.contains("echoing last 1 of 4 lines"), "{out}");
+        assert!(out.contains("\n4:"), "the appended line is line 4: {out}");
+        assert!(
+            out.contains("- one\n- caf\u{fffd}\n- three\n+ one\n+ caf\u{fffd}\n"),
+            "{out}"
+        );
+        assert_eq!(std::fs::read(&p).unwrap(), b"one\ncaf\xe9\nthree\nfour\n");
+    }
+
+    /// An append onto a Latin-1 line with no newline echoes the merged line
+    /// as text, and writes only the appended bytes after the file's own.
+    #[test]
+    fn append_merging_onto_latin1_line_keeps_its_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("notes.txt");
+        std::fs::write(&p, b"one\ncaf\xe9").unwrap();
+        let out = write_with_diff(
+            dir.path(),
+            &serde_json::json!([{"path": p.to_str().unwrap(), "mode": "append", "content": "s\n"}]),
+        );
+        assert!(out.contains("echoing last 1 of 2 lines"), "{out}");
+        assert!(out.contains("|caf\u{fffd}s\n"), "{out}");
+        assert_eq!(std::fs::read(&p).unwrap(), b"one\ncaf\xe9s\n");
+    }
+
+    /// An overwrite's diff shows a Latin-1 file's earlier lines, and the file
+    /// then holds exactly the new content.
+    #[test]
+    fn overwrite_diff_of_latin1_file_shows_its_old_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("notes.txt");
+        std::fs::write(&p, b"old caf\xe9\nold two\n").unwrap();
+        let out = write_with_diff(
+            dir.path(),
+            &serde_json::json!([{
+                "path": p.to_str().unwrap(), "mode": "overwrite", "overwrite": true, "content": "new\n",
+            }]),
+        );
+        assert!(
+            out.contains("--- before\n+++ after\n- old caf\u{fffd}\n- old two\n+ new\n"),
+            "{out}"
+        );
+        assert_eq!(std::fs::read(&p).unwrap(), b"new\n");
+    }
+
+    /// A binary file has no text by the one rule: an append to one echoes
+    /// no lines, and a diff names the binary side instead of showing it as
+    /// empty. The file keeps its bytes.
+    #[test]
+    fn writes_to_binary_file_show_no_text_for_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = dir.path().join("blob.bin");
+        let ovr = dir.path().join("old.bin");
+        std::fs::write(&app, b"\x89PNG\0\xff\n").unwrap();
+        std::fs::write(&ovr, b"\x89PNG\0\xff\n").unwrap();
+        let out = write_with_diff(
+            dir.path(),
+            &serde_json::json!([
+                {"path": app.to_str().unwrap(), "mode": "append", "content": "tail\n"},
+                {"path": ovr.to_str().unwrap(), "mode": "overwrite", "overwrite": true, "content": "text\n"},
+            ]),
+        );
+        assert!(
+            out.contains(
+                "append: 5 bytes to a binary file, not echoed\n── diff ──\n--- before (binary)\n+++ after (binary)\n"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains("--- before (binary)\n+++ after\n+ text\n"),
+            "{out}"
+        );
+        assert_eq!(std::fs::read(&app).unwrap(), b"\x89PNG\0\xff\ntail\n");
+        assert_eq!(std::fs::read(&ovr).unwrap(), b"text\n");
+    }
+
     // -- root parameter tests (issue #73) --
 
     #[test]
-    fn root_param_anchors_relative_path_to_root_not_cwd() {
-        // A relative path + explicit `root` must land under `root`, not cwd.
+    fn root_param_anchors_relative_path_to_root_not_server_root() {
+        // A relative path + explicit `root` must land under `root`, not the server root.
         let root_dir = tempfile::tempdir().unwrap();
         let root_path = root_dir.path();
         let args = serde_json::json!({
@@ -804,7 +1052,14 @@ mod tests {
             }],
             "scope": root_path.to_str().unwrap(),
         });
-        let out = tool_write(&args, &Session::new(), &fresh_bloom()).expect("create succeeds");
+        let out = tool_write(
+            &args,
+            &Session::new(),
+            &fresh_bloom(),
+            WalkConfig::default(),
+            None,
+        )
+        .expect("create succeeds");
         let expected = root_path.join("relative/file.txt");
         assert!(
             expected.exists(),
@@ -835,7 +1090,14 @@ mod tests {
             }],
             "scope": target_dir.path().to_str().unwrap(),
         });
-        let out = tool_write(&args, &Session::new(), &fresh_bloom()).expect("create succeeds");
+        let out = tool_write(
+            &args,
+            &Session::new(),
+            &fresh_bloom(),
+            WalkConfig::default(),
+            None,
+        )
+        .expect("create succeeds");
         assert!(
             target.exists(),
             "absolute path file must exist at its own location: {}",
@@ -868,7 +1130,14 @@ mod tests {
             }],
             "scope": dir.path().to_str().unwrap(),
         });
-        let out = tool_write(&args, &Session::new(), &fresh_bloom()).expect("create succeeds");
+        let out = tool_write(
+            &args,
+            &Session::new(),
+            &fresh_bloom(),
+            WalkConfig::default(),
+            None,
+        )
+        .expect("create succeeds");
         let abs_path = p.canonicalize().unwrap();
         assert!(
             out.contains(abs_path.to_str().unwrap()),
@@ -887,8 +1156,14 @@ mod tests {
                 "content": "x",
             }],
         });
-        let err = tool_write(&args, &Session::new(), &fresh_bloom())
-            .expect_err("relative root must be rejected");
+        let err = tool_write(
+            &args,
+            &Session::new(),
+            &fresh_bloom(),
+            WalkConfig::default(),
+            None,
+        )
+        .expect_err("relative root must be rejected");
         assert!(
             err.contains("must be an absolute path"),
             "error must mention absolute path requirement; got: {err}"
@@ -899,29 +1174,16 @@ mod tests {
     fn root_only_no_scope_write_succeeds_into_root() {
         // KNOWN HIGH (review on #158): `root` reaches path resolution
         // (resolve_write_path) but NOT the containment guard — `scope_root`
-        // fell back to `current_dir()` whenever `scope` was omitted, ignoring
-        // `root` entirely. Headline scenario: server process cwd is one
-        // directory (call it dirA — here, whatever `current_dir()` naturally
-        // is under `cargo test`), the caller passes `root` = a DIFFERENT
+        // fell back to the server's directory whenever `scope` was omitted,
+        // ignoring `root` entirely. Headline scenario: the server's root is
+        // one directory (dirA), the caller passes `root` = a DIFFERENT
         // directory (dirB) plus a relative path under dirB, and supplies NO
         // `scope`. Before the fix, `scope_root` defaulted to dirA, the write
         // resolved into dirB (correctly, via resolve_write_path), and
         // `path_within_scope(dirB_path, dirA)` refused it — a false-positive
         // containment failure for a legitimate root-anchored write.
-        //
-        // No `set_current_dir` here — the codebase's own tests document that
-        // mutating process cwd inside a test races other parallel tests (see
-        // edit.rs's `normalize_path_key_is_cwd_independent` comment). Using
-        // the ambient `current_dir()` as the implicit "dirA" and a fresh
-        // tempdir as "dirB" reproduces the divergence without mutating global
-        // state.
-        let dir_a = std::env::current_dir().expect("ambient cwd (\"dirA\") must be readable");
+        let dir_a = tempfile::tempdir().expect("dirA tempdir");
         let dir_b = tempfile::tempdir().expect("dirB tempdir");
-        assert_ne!(
-            dir_a.canonicalize().unwrap(),
-            dir_b.path().canonicalize().unwrap(),
-            "test setup requires dirA (ambient cwd) and dirB (tempdir) to differ"
-        );
 
         let args = serde_json::json!({
             "root": dir_b.path().to_str().unwrap(),
@@ -931,8 +1193,14 @@ mod tests {
                 "content": "root-only write\n",
             }],
         });
-        let out = tool_write(&args, &Session::new(), &fresh_bloom())
-            .expect("root-only write (no scope) must succeed into root, not refuse");
+        let out = tool_write(
+            &args,
+            &Session::new(),
+            &fresh_bloom(),
+            WalkConfig::default(),
+            Some(dir_a.path()),
+        )
+        .expect("root-only write (no scope) must succeed into root, not refuse");
         assert!(
             !out.contains("error: refusing write outside scope"),
             "root-only write must not be refused by the containment guard: {out}"
@@ -945,7 +1213,7 @@ mod tests {
         let expected = dir_b.path().join("nested/file.txt");
         assert!(
             expected.exists(),
-            "file must land under root (dirB), not under the server's cwd (dirA): {}",
+            "file must land under root (dirB), not under the server's root (dirA): {}",
             expected.display()
         );
         assert_eq!(
@@ -954,10 +1222,52 @@ mod tests {
         );
     }
 
+    /// A relative path with no `root` lands under the server's root, never
+    /// under the process's working directory.
+    #[test]
+    fn relative_path_without_root_lands_under_the_server_root() {
+        let server_root = tempfile::tempdir().unwrap();
+        let args = serde_json::json!({
+            "files": [{ "path": "nested/new.txt", "mode": "overwrite", "content": "x\n" }],
+        });
+        let out = tool_write(
+            &args,
+            &Session::new(),
+            &fresh_bloom(),
+            WalkConfig::default(),
+            Some(server_root.path()),
+        )
+        .unwrap();
+        assert!(out.contains("created"), "{out}");
+        assert!(server_root.path().join("nested/new.txt").exists());
+    }
+
+    /// With no root anywhere, a relative path has nowhere to land, and the
+    /// result says why instead of writing under the process's directory.
+    #[test]
+    fn relative_path_without_any_root_is_refused() {
+        let args = serde_json::json!({
+            "files": [{ "path": "tilth-no-root-probe.txt", "mode": "overwrite", "content": "x\n" }],
+        });
+        let out = tool_write(
+            &args,
+            &Session::new(),
+            &fresh_bloom(),
+            WalkConfig::default(),
+            None,
+        )
+        .unwrap();
+        assert!(
+            out.contains("## tilth-no-root-probe.txt") && out.contains(super::super::NO_ROOT),
+            "{out}"
+        );
+        assert!(!Path::new("tilth-no-root-probe.txt").exists());
+    }
+
     #[test]
     fn cross_worktree_warning_fires_for_different_git_roots() {
         // Two fake worktrees (each with a .git dir): write path git root differs
-        // from the cwd-analog git root.
+        // from the server root's git root.
         let server_wt = tempfile::tempdir().unwrap();
         let write_wt = tempfile::tempdir().unwrap();
         std::fs::create_dir(server_wt.path().join(".git")).unwrap();
@@ -973,7 +1283,7 @@ mod tests {
         let warn = cross_worktree_warning(&target, server_wt.path());
         assert!(
             warn.is_some(),
-            "cross-worktree warning must fire when write and cwd are in different git roots"
+            "cross-worktree warning must fire when write and server root are in different git roots"
         );
         assert!(
             warn.unwrap().contains("cross-worktree"),
@@ -1054,7 +1364,14 @@ mod tests {
                 }]
             }]
         });
-        let out = tool_write(&args, &Session::new(), &fresh_bloom()).expect("hash edit succeeds");
+        let out = tool_write(
+            &args,
+            &Session::new(),
+            &fresh_bloom(),
+            WalkConfig::default(),
+            None,
+        )
+        .expect("hash edit succeeds");
 
         assert!(
             target.exists(),
@@ -1105,7 +1422,7 @@ mod tests {
 
     #[test]
     fn hash_mode_no_warning_for_in_tree_write() {
-        // hash-mode write within the same git root as cwd → no warning.
+        // hash-mode write within the same git root as the server root → no warning.
         let wt = tempfile::tempdir().unwrap();
         std::fs::create_dir(wt.path().join(".git")).unwrap();
         let target = wt.path().join("inplace.rs");

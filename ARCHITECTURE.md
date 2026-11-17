@@ -50,17 +50,18 @@ crates/tilth-core/src/
 ├── imports.rs       Imports as data (one per module named), import lines, related-file resolution
 ├── test_structure.rs describe/it/test calls as TestEntry data
 ├── source.rs        OpenFile, the one way tilth opens a file to read
-│                    it; read_source: reads a file for parsing or search
-│                    without its byte-order mark; MAX_FILE_SIZE, the
-│                    one size limit every parse and search walk shares
+│                    it; into_text, the one rule for text and binary;
+│                    read_source: reads a file's text for parsing or
+│                    search without its byte-order mark; MAX_FILE_SIZE,
+│                    the one size limit every parse and search walk shares
 │
 ├── search/          Cross-file queries
-│   ├── walk.rs          Walker and ignore policy (SKIP_DIRS, .tilthignore,
-│   │                    gitignore switch, glob overrides)
+│   ├── walk.rs          Walker and ignore policy (WalkConfig, SKIP_DIRS,
+│   │                    .tilthignore, gitignore switch, glob overrides)
 │   ├── callers.rs       find_callers_batch: call sites of N symbols in one walk
 │   ├── callees.rs       Resolve function calls inside a definition
-│   ├── callee_query.rs  Cached tree-sitter `Query` objects for callee
-│   │                    extraction across languages
+│   ├── callee_query.rs  Per-language tree-sitter call-expression queries,
+│   │                    shared by callers and callees
 │   ├── deps.rs          analyze_deps → DepsResult
 │   ├── bloom_walk.rs    Shared walker preamble (size gating, mtime,
 │   │                    bloom filter) factored out of callers/callees
@@ -73,7 +74,8 @@ crates/tilth-core/src/
 │   ├── mod.rs           detect_file_type, package_root, FileType ↔ Lang
 │   ├── spec.rs          Per-language spec table, one `<lang>.rs` per language
 │   ├── detection.rs     Binary / generated / minified detection
-│   ├── treesitter.rs    DEFINITION_KINDS, extract_definition_name
+│   ├── treesitter.rs    DEFINITION_KINDS, extract_definition_name,
+│   │                    compiled_query (the compiled-`Query` cache)
 │   └── outline.rs       outline_language(Lang) → tree_sitter::Language;
 │                        node_to_entry walker (the bulk of this file);
 │                        parse_markdown / heading_level / heading_text
@@ -88,12 +90,16 @@ src/
 ├── lib.rs           Public API + dispatch (run / run_full / run_expanded /
 │                    run_callers / run_deps)
 ├── main.rs          CLI binary (clap parser → lib calls or mcp::run)
+├── config.rs        Config: built once from the environment and the
+│                    flags, then passed down; env_var, the one read of
+│                    the environment
 ├── mcp.rs           MCP server: JSON-RPC stdio loop, tool dispatch,
 │                    per-request timeout / abandoned-thread tracking
 ├── classify.rs      Query string → QueryType (8-rule precedence ladder)
 ├── types.rs         Binary types: QueryType, ViewMode, Match,
 │                    SearchResult, FacetTotals
 ├── format.rs        Output headers, line numbering, hashlines
+├── git.rs           The one git runner: Git, GitError
 ├── budget.rs        Token cap (truncate output to a token budget)
 ├── session.rs       Per-MCP-process counters: reads, searches, top
 │                    queries, hot dirs, expanded-set dedup
@@ -153,6 +159,37 @@ Both surfaces produce the same string outputs from the same internals.
 The CLI is a thin shell around `lib.rs`; the MCP server is a thicker
 shell with its own concurrency model.
 
+### Configuration (`src/config.rs`)
+
+`main` builds one `Config` before it dispatches, from the environment
+(`Config::from_env`) and the flags that override it
+(`--respect-gitignore`, `--no-overview`). It passes the `Config`, or the
+one field a function needs, down as a parameter; the MCP server keeps it
+in `Services`, and each tool call works on its own copy, which the call's
+`gitignore` argument may change. The field docs on `Config` list each
+`TILTH_*` variable and what it does. A value that does not parse falls
+back to its default.
+
+`config::env_var` is the only read of the process environment, and
+nothing writes it. `clippy.toml` forbids `std::env::var`, `var_os`,
+`vars`, `vars_os`, `set_var` and `remove_var` everywhere else. Besides
+the `Config`, `env_var` reads the CLI's `PAGER` and `LINES` and the
+installer's `APPDATA` on Windows. Those locate things on the host, as
+`HOME` does, so they stay at their one use.
+
+The walk settings are `tilth_core::WalkConfig` (threads, gitignore). A
+walk takes them in a `tilth_core::Walk`, with the directory it starts from
+and an optional glob, so library users set them the same way.
+
+`config::launch_dir` is the only read of the working directory, and
+nothing changes it: `clippy.toml` forbids `std::env::current_dir`,
+`set_current_dir` and `std::path::absolute`. `main` calls it once. The
+CLI uses that directory as its root (the overview, the `--deps`
+fallback, the diff's checkout), and the relative paths it hands the OS
+resolve against the same directory. The MCP server derives its root from
+it, keeps the root in `Services`, and passes it to every tool. A missing
+root fails a call with one message, `tools::NO_ROOT`.
+
 ### CLI (`src/main.rs`)
 
 A clap `derive`-style parser (`Cli` struct) accepts a free-form `query`
@@ -186,12 +223,16 @@ over stdio. The body is a hand-rolled loop, not a framework.
 
 Startup (`mcp::run`) resolves a project root in priority order:
 explicit `--scope` argument > MCP `roots/list` response > nearest
-`package_root(cwd)` > `cwd`. The chosen root becomes the process's
-working directory, so every later tool call resolves relative paths
-against it. This was added specifically to handle MCP hosts (Codex was
-the documented case) that launch tilth with `cwd=/`. A `--scope` that
-is not a directory stops the launch with a usage error naming the
-close directories (`missing_scope_hint`).
+`package_root(cwd)` > `cwd`. The root is a value in `Services`: a call
+with no `root` argument resolves its relative paths against it, and one
+with no `scope` searches it. The process's working directory never
+changes. This was added specifically to handle MCP hosts (Codex was the
+documented case) that launch tilth with `cwd=/`. A `--scope` that is
+not a directory stops the launch with a usage error naming the close
+directories (`missing_scope_hint`). When the launch directory cannot be
+read and no other root arrives, the server warns on stderr once it knows
+none is coming, and each call that needs the root fails with
+`tools::NO_ROOT` in its result.
 
 Per call, a `scope` that does not exist falls back to the caller's
 `root` with a warning that carries the same hint, so a typo still
@@ -214,8 +255,9 @@ methods worth describing in detail:
   `include_str!("../../prompts/mcp-base.md")` and rewritten on `fd3de77`
   as a pre-flight gate naming the exact Bash commands and host tools to
   avoid, with concrete `<bad>→<good>` rewrites. When
-  `TILTH_NO_OVERVIEW` is unset, `overview::fingerprint(cwd)` is
-  prepended — a project summary built in <250ms (a stderr warning fires
+  `Config::overview` is on (no `TILTH_NO_OVERVIEW`, no `--no-overview`),
+  `overview::fingerprint(root)` is prepended, for the server's root at
+  that moment — a project summary built in <250ms (a stderr warning fires
   if it overruns).
 - `tools/list` — returns the tool schemas. `tools/call` is the workhorse
   and goes through `handle_tool_call`.
@@ -230,7 +272,7 @@ showed that agents overused structural maps.
 
 Concurrency: each `tools/call` spawns a worker thread, communicates via
 `mpsc::channel`, and waits with `recv_timeout`. The default per-tool
-timeout is 90s (`TILTH_TIMEOUT` env override). On timeout, the response
+timeout is `Config::request_timeout`, 90s unless `TILTH_TIMEOUT` sets it. On timeout, the response
 goes back immediately with an `isError: true` payload; the worker thread
 is **abandoned** (not joined, not killed) — this is the safest option in
 Rust since cancelling a thread mid-tree-sitter-parse is unsound. A
@@ -374,36 +416,46 @@ binary's `src/search/`. The cross-file queries that return data live in
 `tilth-core`'s `search/`: the walker, call sites, callees, enclosing
 scopes and dependency analysis. The walker preamble (size gating +
 mtime + bloom filter) is factored into `bloom_walk.rs` so all
-relational paths share it; AST-scope walking is in `scope.rs`; cached
-tree-sitter `Query` objects live in `callee_query.rs`.
+relational paths share it; AST-scope walking is in `scope.rs`; the
+call-expression queries live in `callee_query.rs`.
+
+Every tree-sitter `Query` tilth matches with (call sites, callees,
+siblings, the Go receiver, import statements) comes from
+`lang::treesitter::compiled_query`. It compiles each query on first use
+and leaks it, so it hands out a `&'static Query` and the lock covers only
+the lookup. Threads in a parallel walk then match side by side. The leak
+is one query per grammar and query text, a fixed set.
 
 ### Walker and ignore policy (`tilth-core` `search/walk.rs`)
 
-`walker(scope, glob)` builds an `ignore::WalkParallel` with tilth's
-opinionated defaults:
+`walker(walk)` builds an `ignore::WalkParallel` with tilth's opinionated
+defaults from a `Walk`: the scope, an optional glob, and the run's
+`WalkConfig`. `base_walk_builder(scope, config)` builds the same walker,
+without the glob, for the sequential map and list walks. `walk_builder(walk)`
+is the glob-narrowed builder `walker` runs; a search's basename "File
+overview" fallback walks it in order, six levels deep. `clippy.toml` forbids
+`ignore::WalkBuilder::new` and `ignore::Walk::new` outside `walk.rs`, so
+every walk visits files by the same policy:
 
 - **Always-skipped directories** (`SKIP_DIRS`): build artifacts,
   dependency caches, VCS internals — `.git`, `node_modules`, `target`,
   `dist`, `build`, `__pycache__`, `vendor`, `.next`, `.venv`,
   `.mypy_cache`, etc. ~30 entries.
-- **`.gitignore`, global gitignore, `.git/info/exclude`, and custom
-  `.ignore` files are all deliberately never consulted**
-  (`git_ignore(false)`, `git_global(false)`, `git_exclude(false)`,
-  `ignore(false)`). This is not an oversight: grep-style queries need
-  to see gitignored-but-locally-relevant files (docs/, configs,
-  generated code, per-engineer agent state) that a `.gitignore` would
-  hide from a normal directory listing. A per-project `.tilthignore`
-  override was proposed and **rejected 2026-07-03** — it would
-  special-case one tool's walker instead of fixing the underlying
-  need (which is `SKIP_DIRS`-style unconditional exclusion, already
-  covered above).
+- **`.tilthignore`** files are always honored, at the scope and above it.
+- **`.gitignore`, global gitignore, `.git/info/exclude` and `.ignore`
+  files are off by default**, because grep-style queries need to see
+  gitignored but locally relevant files (docs, configs, generated code,
+  per-engineer agent state). `WalkConfig::respect_gitignore` turns them
+  on (`TILTH_RESPECT_GITIGNORE` or `--respect-gitignore`), and an MCP
+  call's `gitignore` argument overrides it for that call.
 - **Symlinks are followed** (`follow_links(true)`). This is the
   upstream `feat: follow symlinks in all file walkers (#46)` change
   and creates a known duplicate-match problem when a path is reachable
   via multiple symlink chains — see [Open
   threads](#open-architectural-threads).
-- **Threads**: `TILTH_THREADS` env or `available_parallelism / 2`
-  clamped to `[2, 6]`.
+- **Threads**: `WalkConfig::threads`, from `TILTH_THREADS`, or by
+  default `available_parallelism / 2` clamped to `[2, 6]`. `0` lets the
+  walker choose. The rayon pool gets the same count.
 
 The glob filter, when present, is applied via `OverrideBuilder` —
 gitignore-style with whitelist, negation (`!`), and brace expansion.
@@ -576,14 +628,10 @@ machinery:
   framework registration).
 - **Callees** (`callees.rs`) — resolve outgoing calls inside a
   definition body. Drives the `── calls ──` footer under each
-  expanded match. Cached `Query` compilation lives in
-  `callee_query.rs`.
+  expanded match.
 - **Siblings** (`siblings.rs`) — extract the surrounding outline
   context (the entries immediately before and after the matched
-  definition). Compiles tree-sitter `Query` objects lazily and caches
-  them in a process-wide `LazyLock<Mutex<HashMap>>`. The cache key
-  uses the query string's pointer address (`&'static str`) so distinct
-  queries against the same language stay separated.
+  definition).
 - **Deps** (`deps.rs`, both crates) — `analyze_deps` (`tilth-core`)
   is what `tilth_deps` runs. Returns a `DepsResult` with `Uses` (local
   + external) and every dependent in `Used by`. A dependent calls one
@@ -662,7 +710,8 @@ gateway. The decision tree, in order:
    file whose outline OGATE rejects goes on to step 7 too, which reads
    it whole.
 7. **Full mode + oversized.** This guards `--full` on huge files. Caps
-   at `TILTH_FULL_SIZE_CAP` (default in `full_read_size_cap()`); above
+   at `Config::full_size_cap` (`TILTH_FULL_SIZE_CAP`, 2 MB by default),
+   which reaches `read_file` as its `full_cap` argument; above
    the cap, returns the outline with a banner explaining how to
    override. From this step on the file is read whole, up to the length
    its open handle reported.
@@ -679,16 +728,30 @@ gateway. The decision tree, in order:
 
 Every read opens the file through `tilth_core::source::OpenFile`, as
 do `read_source`, `source::read` and `source::read_to_string`, which
-every parse, search and edit read goes through. On Unix it opens with
+every parse, search and edit read goes through. Bytes become text by
+one rule, `source::into_text`: a NUL byte in the first 512 bytes makes a
+file binary, and any other file is text, each sequence that is not
+UTF-8 read as U+FFFD. Search, the symbol definition and usage passes,
+callers, deps, outlines and reads all follow it, so a Latin-1 file is
+searched, parsed and shown, and a binary one is skipped by all of them.
+A section read shows any file's lines as asked. The hash-anchored edit
+reads strictly (`source::read_to_string`), because it writes the file
+back: it refuses a file that is not UTF-8 rather than turn its bytes
+into U+FFFD. The structural diff (until #312) reads strictly too. The
+overwrite and append modes show a file's earlier content by the one
+rule in their echo and diff, and never write that text back: an append
+adds the call's bytes after the file's own, and an overwrite writes the
+call's bytes alone. `clippy.toml` forbids the strict decoders
+(`str::from_utf8`, `String::from_utf8`, `Read::read_to_string`) and
+`source::read_to_string` elsewhere. On Unix it opens with
 `O_NONBLOCK`, checks the handle's own metadata and clears the flag on a
 regular file, so a pipe swapped in after the path was checked is still
 never read. A pipe, socket or device reads as empty everywhere. The one
 read that waits on a pipe is `tilth diff --patch`, which may be handed
 one.
 
-The signature and stripped views reshape only code. Any other file gets
-its default view, after a streamed check that it is UTF-8, so it fails
-as those views always made it fail.
+The signature and stripped views reshape only code. Any other file,
+and a binary one, gets its default view.
 
 The `outline/` submodule dispatches on `FileType` through
 `outline::View`, the one mapping from file type to view:
@@ -715,8 +778,9 @@ Two helpers feed the MCP layer:
   is going to see an outline.
 - `tilth_core::imports::resolve_related_files` does the related-file
   resolution for the same hint. It returns every local import; the
-  hint names the first `RELATED_HINT_LIMIT` (8). Deps and callee
-  resolution use the full list.
+  hint names the first `RELATED_HINT_LIMIT` (8) and counts the rest
+  (`and 4 more`). `read::related_hint` writes the line for the CLI and
+  MCP reads alike. Deps and callee resolution use the full list.
 
 ## Language layer (`crates/tilth-core/src/lang/`)
 
@@ -763,7 +827,7 @@ the overview's language counts stay path-only.
 (`Cargo.toml`, `package.json`, `pyproject.toml`, `go.mod`, etc.) and is
 used by both ranking (`scope_proximity`) and faceting
 (`is_same_package`). It's also what the MCP server uses at startup to
-resolve a project root from cwd.
+resolve a project root from its launch directory.
 
 ## Caches and indexes
 
@@ -773,20 +837,27 @@ deliberately scoped — only `OutlineCache`, `Session`, and
 
 ### `OutlineCache` (`tilth-core` `cache.rs`)
 
-Two `DashMap` tables, both keyed by `(PathBuf, SystemTime)`:
+Two `DashMap` tables, both keyed by path, each value carrying the
+file's `mtime`:
 
 - `entries`: rendered outline strings (`Arc<str>`).
 - `parsed`: parsed tree-sitter trees (`Arc<ParsedFile>`,
   carrying `Arc<String>` content, `tree_sitter::Tree`, and `Lang`).
 
 Entries are computed lazily via `get_or_compute` and `get_or_parse`.
-Both use the entry-API to avoid TOCTOU races. There is no eviction —
-`mtime` change on the keyed file means the old entry is never hit
-again, and idle entries simply sit there. For long-running MCP
-processes this is an O(touched files) cache; the trade-off is that a
-file repeatedly modified will accumulate stale entries until the
-process exits. In practice the working set of active files is small
-enough that this hasn't been a concern.
+Both use the entry-API to avoid TOCTOU races. A changed `mtime`
+replaces the file's entry in place.
+
+Reads fill the cache with the files they outline, and `tilth_search`
+with every file whose matches it shows (the enclosing scope and the
+outline context of each match). Callers, grok, deps and diff do not
+use it. A parsed tree takes about 30 times its source in memory, so a
+235 KB Rust file holds 7 MB. The entries stay within a memory budget,
+`CACHE_BUDGET_BYTES` (128 MiB), counted from each outline's length and
+each tree's node count. When an entry takes the cache over it, the
+cache drops every entry and starts again, the way `BloomFilterCache`
+does; a dropped file is parsed again on its next use. The doc comments
+on the two constants give the measurements behind them.
 
 The ceiling on `get_or_parse` (`tilth_core::source::MAX_FILE_SIZE`,
 500 KB) keeps tree-sitter parses from blowing up memory on generated
@@ -836,6 +907,13 @@ This is actively used in the relational-query paths (it's why
 `tilth_search kind:callers` doesn't take O(N files) tree-sitter parses
 on every query).
 
+The filters stay within a memory budget, `CACHE_BUDGET_BYTES`, sized
+to hold a callers walk over the cargo registry source (its doc gives the
+numbers). When a new filter would take the cache over its budget, it
+drops every filter and starts again; a dropped file is checked again
+from its content. One lock holds the filters and their byte count
+together, so the count is exact.
+
 ## Diff and edit subsystems
 
 These two are separate from the search/read pipeline but share the same
@@ -854,36 +932,50 @@ single tool each.
    (read a `.patch` file), `Log(range)` (per-commit summaries). For a git
    source, every git command and working-tree read then runs at the
    repository top (`git rev-parse --show-toplevel`), because git prints
-   paths from there.
-2. **`run_git_diff`** shells out to `git diff` with the right args
-   (or reads the patch file). Before the first commit, `HEAD` is the
-   empty tree.
+   paths from there. `checkout` picks the repository: the one the base
+   (the call's `root`, the server's root, or the CLI's working directory)
+   is in, unless the scope lies outside it. Then the scope names
+   its own, so a scope in another worktree diffs that worktree.
+2. **`run_git_diff`** runs `git diff` with the right args through the
+   git runner (or reads the patch file). Before the first commit, `HEAD`
+   is the empty tree. A file pair's sides are opened first, and one that
+   cannot be read fails as a read of it fails: `git diff --no-index`
+   exits 1 for it, the code it gives for files that differ.
 3. **`resolve_sides`** decides where each side reads file content from
-   (`Side`: a revision, the index, the working tree, a file). It is the
-   one place that knows what a range means: `a..b` compares `a` with `b`,
-   `a...b` compares their merge base with `b`, a bare revision compares
-   it with the working tree.
+   (`Side`: a revision, the index, the working tree, or a file pair's
+   file or directory). It is the one place that knows what a range
+   means: `a..b` compares `a` with `b`, `a...b` compares their merge base
+   with `b`, a bare revision compares it with the working tree.
 4. **`parse::parse_unified_diff`** turns the raw text into
    `Vec<FileDiff>` — header, hunks, and lines numbered in the old file
-   (removed lines) or the new file (the rest).
+   (removed lines) or the new file (the rest). A file starts at a
+   `diff --git` line, or, in a patch from `diff -u`, at a `--- `/`+++ `
+   pair that a hunk follows. A patch file with text but no file is an
+   error, never "No changes."
 5. **`overlay::compute_overlay`** reads both sides of each `FileDiff`,
    outlines them and matches their symbols (`matching::match_symbols`:
    identity, then structural hash, then fuzzy similarity). Members are
    qualified by their type (`A::run`), so same-named methods stay apart.
    A function's signature is its whole header from the syntax tree,
    compared by tokens, so a re-wrapped header is not a signature change
-   and a change on its third line is one. Each patch line goes to the
-   innermost changed symbol that holds it; lines outside every changed
-   symbol, and all lines of a non-code file, stay in `other_lines`. The
-   overlay's `+N/−M` counts come from the patch itself.
+   and a change on its third line is one. Each changed line goes to the
+   innermost changed symbol that holds it, and each context line to the
+   innermost symbol of any kind, so an unchanged symbol keeps its own
+   context out of sight. Lines no symbol takes, and all lines of a
+   non-code file, stay in `other_lines`. The overlay's `+N/−M` counts
+   come from the patch itself. Each side reads the file by the path the
+   patch names on that side; in a file pair that path starts at the
+   side's own root. When a side cannot be read, the file keeps its lines
+   and has no symbols, and the formatters say why (`read_error`).
 6. **`overlay::cross_file_matching`** detects symbols moved between
    files.
-7. **Scope** (`ScopeSpec`) — a `--scope` resolves against `root` (or the
-   cwd) to a path from the repository top. A changed file at that path
-   (or at its path before a rename) gives the file detail; a directory
-   gives the overview of the changed files under it; a trailing part of
-   a path (`main.rs`) must name one changed file. An existing path with
-   no changes says so; anything else is an error.
+7. **Scope** (`ScopeSpec`) — a `--scope` resolves against the base to a
+   path from the repository top. A changed file at that path (or at its
+   old side's path, as after a rename) gives the file detail; a
+   directory gives the overview of the changed files under it; a
+   trailing part of a path (`main.rs`) must name one changed file. An existing path with
+   no changes says so; anything else is an error. A patch or a file pair
+   has no repository top, so an absolute scope there is refused.
 8. **`overlay::signature_warnings`** flags a signature changed in several
    files.
 9. **Search filter** (`keep_search_matches`) — narrows to symbols/files
@@ -895,6 +987,9 @@ single tool each.
     `format::format_function_detail` (`file:fn`, where `fn` may be
     qualified as `Type::fn`). Marker line prefixes are
     `[+]`/`[-]`/`[~]`/`[~:sig]`; output is budgeted via `budget::apply`.
+    `--expand N` adds, below the overview's warnings, the file-detail
+    section of the first N changed symbols that hold patch lines of their
+    own, so a budget cut takes those sections before any file.
 12. **Conflict detection** — only on `DiffSource::GitUncommitted`,
     `overlay::detect_conflicts` scans each affected file for git
     merge-conflict markers and `format::format_conflicts` appends the
@@ -929,7 +1024,9 @@ also in `edit.rs`) produces the diff string itself.
 
 The callee-callers warning lives one layer up. `mcp::tool_edit`, on a
 successful `Applied` result, calls `search::blast::blast_radius` with
-the same `Edit` list and appends its output. The check is
+the same `Edit` list and appends its output. It searches the file's
+package, or, for a file outside any package, the call's write boundary
+(its `scope`, else its `root`, else the server's root). The check is
 unconditional in MCP (every successful edit gets the warning); the
 `diff: true` argument controls whether the per-edit `-`/`+` block is
 shown alongside the hashlined context, *not* whether the blast
@@ -945,9 +1042,13 @@ beyond the surface API are worth understanding:
 
 **Roots discovery.** After answering `initialize`, if the client
 declared `roots` capability and `--scope` wasn't explicit, the server
-sends a `roots/list` request to the client. The client's response (if
-any) becomes the new working directory. This is what makes tilth work
-correctly with hosts that launch it from a non-project directory.
+sends a `roots/list` request to the client. The first root in the
+response that names a directory becomes the server's root, whenever it
+arrives. Each tool call runs on its own copy of `Services`, so a call in
+flight keeps the root it started with and the next call sees the new
+one; nothing is shared that could change under it. This is what makes
+tilth work correctly with hosts that launch it from a non-project
+directory.
 
 **Per-request thread model.** Every `tools/call` is run on a fresh
 `std::thread::spawn`-ed worker. The main loop waits with
@@ -972,8 +1073,8 @@ strategic guidance every host gets at `initialize`. It lives in
 agents kept reaching for those despite earlier "DO NOT use
 Grep/Read/Glob" rules. Edit mode appends an `EDIT_MODE_EXTRA` block
 from `prompts/mcp-edit.md` with the `tilth_write` instructions.
-`overview::fingerprint(cwd)` is prepended unless `TILTH_NO_OVERVIEW`
-is set — a brief summary of language counts, manifests, hot files,
+`overview::fingerprint(root)` is prepended unless `Config::overview` is
+off — a brief summary of language counts, manifests, hot files,
 and git context.
 
 `AGENTS.md` at the repo root is the user-facing copy of these
@@ -991,9 +1092,25 @@ A handful of small files cut across every subsystem.
 - **`format.rs`** — `file_header` / `binary_header` / `search_header`
   produce the `# path (N lines, ~Mk tokens) [outline]`-style banners.
   `number_lines(content, start)` and `hashlines(content, start)` are
-  the line-numbering / hash-anchored variants.
+  the line-numbering / hash-anchored variants. `noun(n, one, many)`
+  picks the noun after every count in tilth's output, so a count of
+  one reads `1 line`. `and_more(total, limit)` ends a list cut to its
+  first `limit` with `and N more`, and `capped_list` sets a comma list
+  that way, as in `a, b, and 3 more`.
 - **`budget.rs`** — `apply(output, budget)` truncates a finished
   output string to a token budget. Used by every entry point and tool.
+- **`git.rs`** — the one way tilth runs git, used by the diff and the
+  overview. `Git::new(dir, command)` builds a command: options are
+  `&'static str`, so only text tilth wrote can be one, and a caller's
+  revision or path goes after `--end-of-options` or `--` (#277). Every
+  command pins `core.quotePath` and `diff.suppressBlankEmpty` and reads
+  no stdin. `deadline` stops a command still running at a given
+  instant, and reads its output while it runs, so output larger than a
+  pipe cannot hold git up (#356). A failure
+  is a `GitError` (`Io`, `NotARepository`, `Failed`, `TimedOut`) whose
+  text is git's own words after the command that failed; nothing parses
+  git's stderr, because git translates it. `tests/git_runner.rs` fails
+  on a `Command::new("git")` anywhere else outside test code.
 - **`error.rs`** (`tilth-core`) — `TilthError` enum (`NotFound`, `PermissionDenied`,
   `InvalidQuery`, `IoError`, `ParseError`) with `Display` impls that
   format human-readable messages and include suggestions where
@@ -1011,7 +1128,9 @@ user-facing.
 - **`overview.rs`** — `fingerprint(root)` walks files (depth 2),
   detects primary language, parses the project manifest (`Cargo.toml`,
   `package.json`, `go.mod`, `pyproject.toml`), reads `git` context
-  (`branch`, `uncommitted`, `recent commits`), and emits a few
+  (branch and uncommitted file count from one `git status`, with one
+  200 ms deadline for the whole line, which is left out when git does
+  not answer by then), and emits a few
   hot-file lines. Wrapped in `catch_unwind` and a 250ms wall-clock
   budget; warn-on-overrun via stderr. Output is the project summary
   that the MCP `initialize` response prepends to `SERVER_INSTRUCTIONS`.
@@ -1090,11 +1209,3 @@ tracking.
   loop would fix this but is an invasive rewrite. Bounding the
   walker (max files visited per call) is the lower-cost option and
   would also prevent the underlying problem.
-
-- **No `OutlineCache` eviction.** Long-running MCP processes
-  accumulate cache entries indefinitely (one per `(path, mtime)`
-  pair touched). For practical workloads the working set stays
-  small enough that this hasn't surfaced, but a session that visits
-  thousands of distinct files would grow the cache without bound.
-  An LRU layer or an mtime-staleness sweeper at request boundaries
-  would be a small, targeted fix.

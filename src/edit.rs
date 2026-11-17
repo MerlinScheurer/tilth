@@ -1,5 +1,6 @@
 use std::fmt::Write as _;
 use std::fs;
+use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 
@@ -10,6 +11,7 @@ use crate::format;
 use crate::util::WriteOutcome;
 use tilth_core::error::TilthError;
 use tilth_core::index::bloom::BloomFilterCache;
+use tilth_core::search::walk::WalkConfig;
 
 /// One write guard per file, keyed by [`normalize_path_key`].
 ///
@@ -33,6 +35,10 @@ static IN_FLIGHT: LazyLock<DashMap<String, Arc<Mutex<()>>>> = LazyLock::new(Dash
 fn file_guard(path: &Path) -> Arc<Mutex<()>> {
     Arc::clone(&IN_FLIGHT.entry(normalize_path_key(path)).or_default())
 }
+
+/// Why a hash edit refuses a file that is not UTF-8.
+const NOT_UTF8: &str =
+    "holds bytes that are not UTF-8, which a hash edit would rewrite as U+FFFD; nothing was written";
 
 /// A single edit operation targeting a line range by hash anchors.
 #[derive(Debug, Clone)]
@@ -108,11 +114,23 @@ fn apply_edits(path: &Path, edits: &[Edit]) -> Result<EditResult, TilthError> {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     // Read file
-    let content = tilth_core::source::read_to_string(path)
-        .map_err(|e| TilthError::from_io(path, e, || None))?;
+    // Strict: the file is written back line by line, and the lossy text
+    // would turn every byte that is not UTF-8 into U+FFFD.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "by design: a hash edit writes the file back and must keep every byte"
+    )]
+    let content = tilth_core::source::read_to_string(path).map_err(|e| match e.kind() {
+        io::ErrorKind::InvalidData => TilthError::IoError {
+            path: path.to_path_buf(),
+            source: io::Error::new(io::ErrorKind::InvalidData, NOT_UTF8),
+        },
+        _ => TilthError::from_io(path, e, || None),
+    })?;
 
     let lines: Vec<&str> = content.lines().collect();
     let total = lines.len();
+    let lines_noun = format::noun(total, "line", "lines");
 
     // Phase 1: Verify all hashes
     let mut mismatches: Vec<String> = Vec::new();
@@ -121,15 +139,15 @@ fn apply_edits(path: &Path, edits: &[Edit]) -> Result<EditResult, TilthError> {
         // Bounds check
         if edit.start_line < 1 || edit.start_line > total {
             mismatches.push(format!(
-                "Line {} out of bounds (file has {} lines)",
-                edit.start_line, total
+                "Line {} out of bounds (file has {total} {lines_noun})",
+                edit.start_line
             ));
             continue;
         }
         if edit.end_line < 1 || edit.end_line > total {
             mismatches.push(format!(
-                "Line {} out of bounds (file has {} lines)",
-                edit.end_line, total
+                "Line {} out of bounds (file has {total} {lines_noun})",
+                edit.end_line
             ));
             continue;
         }
@@ -366,13 +384,11 @@ fn format_diffs(diffs: &[EditDiff]) -> String {
 /// collisions on case-sensitive APFS configs are preferred over
 /// false-negatives that race two writers against the same inode.
 ///
-/// **No `current_dir()` calls.** `std::path::absolute(p)` was previously
-/// used here, but it reads `current_dir()` which is process-global mutable
-/// state. Two parallel tests (one of which calls `set_current_dir`) could
-/// race against each other and produce different keys for the same path
-/// — surfacing as a flaky `dedup_catches_nonexistent_alias_spellings`
-/// failure under CI's parallel test runner. Pure-lexical normalization
-/// removes the race.
+/// **No working-directory reads.** `std::path::absolute(p)` was previously
+/// used here, but it reads the process's working directory, which a test
+/// used to change while others ran, so the same path could get two keys
+/// (a flaky `dedup_catches_nonexistent_alias_spellings`). Pure-lexical
+/// normalization keeps the key a function of the path alone.
 pub(crate) fn normalize_path_key(path: &Path) -> String {
     let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| lexical_normalize(path));
     let key = resolved.to_string_lossy().into_owned();
@@ -385,7 +401,7 @@ pub(crate) fn normalize_path_key(path: &Path) -> String {
 
 /// Lexical-only path normalization: skip `CurDir`, walk `ParentDir`
 /// against the component stack, leave the rest in order. Does not touch
-/// the filesystem or `current_dir()`, so it's deterministic under
+/// the filesystem or the working directory, so it's deterministic under
 /// parallel tests.
 ///
 /// `ParentDir` handling depends on what's already on the stack:
@@ -476,10 +492,16 @@ pub struct BatchApplied {
 ///
 /// Rejects the whole batch up front when two `Ready` tasks resolve to the
 /// same canonical path so workers cannot race writes against the same file.
+///
+/// The blast radius of an edit lists the callers in the file's package.
+/// For a file outside any package they are searched under `scope`, the
+/// call's scope or root.
 pub fn apply_batch(
     tasks: Vec<FileEditTask>,
     bloom: &Arc<BloomFilterCache>,
+    walk: WalkConfig,
     show_diff: bool,
+    scope: &Path,
 ) -> Result<BatchApplied, String> {
     if let Some(msg) = detect_duplicate_paths(&tasks) {
         return Err(msg);
@@ -488,7 +510,7 @@ pub fn apply_batch(
     let bloom: &BloomFilterCache = bloom;
     let outcomes: Vec<(String, Option<PathBuf>)> = tasks
         .into_par_iter()
-        .map(|task| apply_one(task, bloom, show_diff))
+        .map(|task| apply_one(task, bloom, walk, show_diff, scope))
         .collect();
 
     let (sections, applied): (Vec<String>, Vec<Option<PathBuf>>) = outcomes.into_iter().unzip();
@@ -508,7 +530,9 @@ pub fn apply_batch(
 fn apply_one(
     task: FileEditTask,
     bloom: &BloomFilterCache,
+    walk: WalkConfig,
     show_diff: bool,
+    scope: &Path,
 ) -> (String, Option<PathBuf>) {
     let (path, edits) = match task {
         FileEditTask::ParseError { label, msg } => {
@@ -516,7 +540,7 @@ fn apply_one(
         }
         FileEditTask::Ready { path, edits } => (path, edits),
     };
-    match render_applied(&path, &edits, bloom, show_diff) {
+    match render_applied(&path, &edits, bloom, walk, show_diff, scope) {
         // Echo the resolved absolute path in the success header so a write that
         // landed in a different worktree than the agent intended is visible.
         Ok(body) => {
@@ -537,7 +561,9 @@ fn render_applied(
     path: &Path,
     edits: &[Edit],
     bloom: &BloomFilterCache,
+    walk: WalkConfig,
     show_diff: bool,
+    scope: &Path,
 ) -> Result<String, String> {
     match apply_edits(path, edits).map_err(|e| e.to_string())? {
         EditResult::Applied {
@@ -562,23 +588,12 @@ fn render_applied(
                 output.push_str(&parse);
             }
             let abs_path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-            // Callers are searched in the file's package, or in the working
-            // directory for a file outside any package.
-            let scope = tilth_core::lang::package_root(&abs_path)
-                .map_or_else(std::env::current_dir, |root| Ok(root.to_path_buf()));
-            match scope {
-                Ok(scope) => {
-                    if let Some(blast) =
-                        crate::search::blast::blast_radius(path, edits, &scope, bloom)
-                    {
-                        output.push_str(&blast);
-                    }
-                }
-                Err(e) => crate::diag::emit(format_args!(
-                    "tilth: warning: no blast radius for {}: \
-                     cannot read the current directory: {e}",
-                    path.display()
-                )),
+            // Callers are searched in the file's package, or in the call's
+            // scope for a file outside any package.
+            let scope = tilth_core::lang::package_root(&abs_path).unwrap_or(scope);
+            if let Some(blast) = crate::search::blast::blast_radius(path, edits, scope, bloom, walk)
+            {
+                output.push_str(&blast);
             }
             Ok(output)
         }
@@ -1001,9 +1016,15 @@ mod tests {
             ),
         ];
 
-        let out = apply_batch(tasks, &fresh_bloom(), false)
-            .expect("batch should succeed")
-            .output;
+        let out = apply_batch(
+            tasks,
+            &fresh_bloom(),
+            WalkConfig::default(),
+            false,
+            dir.path(),
+        )
+        .expect("batch should succeed")
+        .output;
         // The success header echoes the resolved absolute (canonicalized) path.
         let a_abs = a.canonicalize().unwrap();
         let b_abs = b.canonicalize().unwrap();
@@ -1046,7 +1067,14 @@ mod tests {
             ),
         ];
 
-        let batch = apply_batch(tasks, &fresh_bloom(), false).expect("good half succeeded");
+        let batch = apply_batch(
+            tasks,
+            &fresh_bloom(),
+            WalkConfig::default(),
+            false,
+            dir.path(),
+        )
+        .expect("good half succeeded");
         assert_eq!(
             batch.applied,
             std::slice::from_ref(&good),
@@ -1078,8 +1106,14 @@ mod tests {
             }],
         )];
 
-        let err = apply_batch(tasks, &fresh_bloom(), false)
-            .expect_err("batch with no successes returns Err");
+        let err = apply_batch(
+            tasks,
+            &fresh_bloom(),
+            WalkConfig::default(),
+            false,
+            dir.path(),
+        )
+        .expect_err("batch with no successes returns Err");
         assert!(err.contains("hash mismatch"));
     }
 
@@ -1107,9 +1141,15 @@ mod tests {
             },
         ];
 
-        let out = apply_batch(tasks, &fresh_bloom(), false)
-            .expect("good half kept the batch alive")
-            .output;
+        let out = apply_batch(
+            tasks,
+            &fresh_bloom(),
+            WalkConfig::default(),
+            false,
+            dir.path(),
+        )
+        .expect("good half kept the batch alive")
+        .output;
         assert!(out.contains("## files[1]"));
         assert!(out.contains("error: missing 'edits' array"));
         assert_eq!(std::fs::read_to_string(&good).unwrap(), "K\n");
@@ -1143,17 +1183,13 @@ mod tests {
         assert!(detect_duplicate_paths(&tasks).is_none());
     }
 
-    /// Pin the race fix: `normalize_path_key` MUST NOT depend on
-    /// `current_dir()`. If it did, this test could flake under parallel
-    /// test execution (another test calling `set_current_dir` could
-    /// change the result of the second key computation). The dedup
-    /// must hold even when cwd changes between the two computations,
-    /// which we simulate here by toggling cwd in between.
+    /// Pin the race fix: `normalize_path_key` MUST NOT depend on the
+    /// working directory, so two spellings of a not-yet-created path get
+    /// one key lexically.
     ///
-    /// Regression: pre-fix this used `std::path::absolute()` whose
-    /// behavior depends on `current_dir()`; the test was flaky on
-    /// Linux CI because `mcp::tests::scope_handoff_when_cwd_is_root`
-    /// runs in parallel and calls `set_current_dir("/")`.
+    /// Regression: pre-fix this used `std::path::absolute()`, which reads
+    /// the working directory; the test was flaky on Linux CI while a
+    /// parallel test changed it.
     #[test]
     fn normalize_path_key_is_cwd_independent() {
         let key_a = normalize_path_key(Path::new("foo.rs"));
@@ -1272,8 +1308,14 @@ mod tests {
             ready_task(a.clone(), vec![make_edit()]),
         ];
 
-        let err = apply_batch(tasks, &fresh_bloom(), false)
-            .expect_err("duplicate paths must reject the batch");
+        let err = apply_batch(
+            tasks,
+            &fresh_bloom(),
+            WalkConfig::default(),
+            false,
+            dir.path(),
+        )
+        .expect_err("duplicate paths must reject the batch");
         assert!(err.contains("duplicate file path"), "unexpected: {err}");
         // File must be untouched — no worker ran.
         assert_eq!(std::fs::read_to_string(&a).unwrap(), "x\n");
@@ -1321,12 +1363,12 @@ mod tests {
                 let a = s.spawn(|| {
                     let task = ready_task(path.clone(), one_edit(1, h1, "AAA"));
                     barrier.wait();
-                    apply_batch(vec![task], &bloom, false)
+                    apply_batch(vec![task], &bloom, WalkConfig::default(), false, dir.path())
                 });
                 let b = s.spawn(|| {
                     let task = ready_task(path.clone(), one_edit(5, h5, "EEE"));
                     barrier.wait();
-                    apply_batch(vec![task], &bloom, false)
+                    apply_batch(vec![task], &bloom, WalkConfig::default(), false, dir.path())
                 });
                 (a.join().unwrap(), b.join().unwrap())
             });
@@ -1378,12 +1420,58 @@ mod tests {
             }],
         )];
 
-        let out = apply_batch(tasks, &fresh_bloom(), false)
-            .expect("edit applies")
-            .output;
+        let out = apply_batch(
+            tasks,
+            &fresh_bloom(),
+            WalkConfig::default(),
+            false,
+            dir.path(),
+        )
+        .expect("edit applies")
+        .output;
         assert!(
             out.contains("\u{2500}\u{2500} parse \u{2500}\u{2500}"),
             "introduced error should surface a parse block: {out}"
+        );
+    }
+
+    /// #307: a file outside any package had its callers searched in the
+    /// process's working directory, whatever the call's scope. They are
+    /// searched in the scope the call passes.
+    #[test]
+    fn blast_radius_outside_any_package_searches_the_calls_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("lib.rs");
+        let content = "fn target_zq() {}\n";
+        std::fs::write(&lib, content).unwrap();
+        std::fs::write(
+            dir.path().join("user.rs"),
+            "fn user_zq() {\n    target_zq();\n}\n",
+        )
+        .unwrap();
+        let h = hash_at(content, 1);
+        let tasks = vec![ready_task(
+            lib,
+            vec![Edit {
+                start_line: 1,
+                start_hash: h,
+                end_line: 1,
+                end_hash: h,
+                content: "fn target_zq(n: u8) {}".into(),
+            }],
+        )];
+        let out = apply_batch(
+            tasks,
+            &fresh_bloom(),
+            WalkConfig::default(),
+            false,
+            dir.path(),
+        )
+        .expect("the edit applies")
+        .output;
+        assert!(
+            out.contains("user.rs") && out.contains("user_zq"),
+            "the caller in the call's scope must be listed: {out}"
         );
     }
 
@@ -1407,12 +1495,53 @@ mod tests {
             }],
         )];
 
-        let out = apply_batch(tasks, &fresh_bloom(), false)
-            .expect("edit applies")
-            .output;
+        let out = apply_batch(
+            tasks,
+            &fresh_bloom(),
+            WalkConfig::default(),
+            false,
+            dir.path(),
+        )
+        .expect("edit applies")
+        .output;
         assert!(
             !out.contains("\u{2500}\u{2500} parse \u{2500}\u{2500}"),
             "clean edit must not surface a parse block: {out}"
         );
+    }
+
+    /// A hash edit on a file that is not UTF-8 refuses and leaves every
+    /// byte as it was, with an anchor taken from the file's own read.
+    /// Written back from its lossy text, each byte that is not UTF-8
+    /// outside the edited lines would become U+FFFD.
+    #[test]
+    fn a_hash_edit_refuses_a_file_that_is_not_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("latin1.c");
+        let bytes = b"/* caf\xe9 */\nint a;\nint b;\n";
+        std::fs::write(&path, bytes).unwrap();
+        let cache = tilth_core::cache::OutlineCache::new();
+        let view = crate::read::read_file(&path, None, None, &cache, true, None).unwrap();
+        let anchor = view
+            .lines()
+            .find_map(|line| line.strip_suffix("|int a;"))
+            .unwrap();
+        let (line, hash) = format::parse_anchor(anchor).unwrap();
+        let edits = [Edit {
+            start_line: line,
+            start_hash: hash,
+            end_line: line,
+            end_hash: hash,
+            content: "int c;".into(),
+        }];
+        let err = apply_edits(&path, &edits).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "{}: holds bytes that are not UTF-8, which a hash edit would rewrite as U+FFFD; nothing was written",
+                path.display()
+            )
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
     }
 }

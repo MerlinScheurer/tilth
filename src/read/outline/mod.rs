@@ -9,6 +9,7 @@ use std::path::Path;
 
 use tilth_core::types::{FileType, Lang};
 
+use crate::format::noun;
 use crate::read::ends::{Ends, Shape};
 
 const OUTLINE_CAP: usize = 100; // max outline lines for huge files
@@ -22,13 +23,7 @@ fn max_lines(capped: bool) -> usize {
 }
 
 /// Generate a smart view based on file type.
-pub fn generate(
-    path: &Path,
-    file_type: FileType,
-    content: &str,
-    buf: &[u8],
-    capped: bool,
-) -> String {
+pub fn generate(path: &Path, file_type: FileType, content: &str, capped: bool) -> String {
     let max_lines = max_lines(capped);
 
     // Test files get special treatment regardless of language
@@ -42,7 +37,7 @@ pub fn generate(
 
     let outline = match View::of(file_type) {
         View::Code(lang) => code::outline(content, lang, max_lines),
-        View::Markdown => markdown::outline(buf, max_lines),
+        View::Markdown => markdown::outline(content, max_lines),
         View::Structured => structured::outline(path, content, max_lines),
         View::Ends(view) => view.outline_of_text(content),
     };
@@ -149,9 +144,11 @@ pub fn fit(outline: &str, names: Option<String>, room: u64) -> String {
             parts.push("signatures and docs left out".to_string());
         }
         if entries < total_entries {
-            parts.push(format!("{entries} of {total_entries} entries shown"));
+            let unit = noun(total_entries, "entry", "entries");
+            parts.push(format!("{entries} of {total_entries} {unit} shown"));
         } else if kept < lines.len() {
-            parts.push(format!("{kept} of {} lines shown", lines.len()));
+            let unit = noun(lines.len(), "line", "lines");
+            parts.push(format!("{kept} of {} {unit} shown", lines.len()));
         }
         if parts.is_empty() {
             return String::new();
@@ -289,7 +286,7 @@ mod tests {
         });
         let path = std::path::Path::new("fake.rs");
         let file_type = tilth_core::types::FileType::Code(tilth_core::types::Lang::Rust);
-        let result = super::generate(path, file_type, &src, src.as_bytes(), true);
+        let result = super::generate(path, file_type, &src, true);
         assert!(
             result.contains("outline truncated"),
             "expected truncation note for 150 funcs over OUTLINE_CAP=100, got:\n{result}"
@@ -307,7 +304,7 @@ mod tests {
         });
         let path = std::path::Path::new("fake.rs");
         let file_type = tilth_core::types::FileType::Code(tilth_core::types::Lang::Rust);
-        let result = super::generate(path, file_type, &src, src.as_bytes(), true);
+        let result = super::generate(path, file_type, &src, true);
         assert!(
             !result.contains("outline truncated"),
             "spurious truncation note for 5 funcs (under OUTLINE_CAP=100):\n{result}"

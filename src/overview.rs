@@ -5,14 +5,22 @@ use std::collections::HashMap;
 use std::fmt::Write;
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
+use crate::format::{self, noun};
+use crate::git::Git;
 use tilth_core::lang::detect_file_type;
 use tilth_core::search::walk::SKIP_DIRS;
 use tilth_core::types::{FileType, Lang};
+
+/// How many directories the `dirs:` line lists before it counts the rest.
+const DIRS_SHOWN: usize = 10;
+/// How many dependencies the `deps:` line lists before it counts the rest.
+const DEPS_SHOWN: usize = 10;
+/// How many hot files the `hot` line lists before it counts the rest.
+const HOT_SHOWN: usize = 5;
 
 /// Compute a project fingerprint for MCP initialization.
 /// Must be fast (<250ms) — runs synchronously in the initialize handler.
@@ -38,11 +46,16 @@ fn fingerprint_inner(root: &Path) -> String {
     // Walk files (depth 2) — collect language counts, modules, entry points
     let walk = walk_files(root);
 
-    // Determine primary language
+    // Primary language: the most files, and on a tie the name first in
+    // alphabetical order, since the map iterates in a random order.
     let primary_lang = walk
         .lang_counts
         .iter()
-        .max_by_key(|(_, count)| *count)
+        .max_by(|(a, a_count), (b, b_count)| {
+            a_count
+                .cmp(b_count)
+                .then_with(|| lang_display_name(**b).cmp(lang_display_name(**a)))
+        })
         .map(|(lang, _)| *lang);
 
     let lang_name = primary_lang.map_or("Unknown", lang_display_name);
@@ -54,7 +67,7 @@ fn fingerprint_inner(root: &Path) -> String {
     // Modules: dirs with >=2 files of the primary language, with common prefix stripped.
     // Keys in module_lang_counts may be "dir" or "dir/subdir" (for deeply nested projects).
     let modules: Vec<String> = {
-        // Collect dirs with >=2 primary-language files, sorted by file count descending
+        // Collect dirs with >=2 primary-language files
         let mut mods: Vec<(String, usize)> = walk
             .module_lang_counts
             .iter()
@@ -70,7 +83,6 @@ fn fingerprint_inner(root: &Path) -> String {
                 }
             })
             .collect();
-        mods.sort_by_key(|b| std::cmp::Reverse(b.1)); // most files first
 
         // If all modules (or at least most) share a common top-level prefix
         // (e.g., all are "src/..."), strip it so we display short names
@@ -136,24 +148,29 @@ fn fingerprint_inner(root: &Path) -> String {
             // Check if ANY path component is a non-source dir
             !lower.split('/').any(|part| non_source.contains(&part))
         });
-        // Sort by file count descending, truncate to 10, extract names
-        mods.sort_by_key(|b| std::cmp::Reverse(b.1));
-        mods.truncate(10);
+        // Most files first, ties by name. The names come out of a hash map
+        // in a random order, so the name decides every tie.
+        mods.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         mods.into_iter().map(|(name, _)| name).collect()
     };
 
     // Header line
     let dir_count = modules.len();
     lines.push(format!(
-        "[tilth] {lang_name} project — {total_files} source files, {dir_count} directories"
+        "[tilth] {lang_name} project — {total_files} source {}, {dir_count} {}",
+        noun(total_files, "file", "files"),
+        noun(dir_count, "directory", "directories")
     ));
 
-    // Directories (cap at 10, sorted by file count descending)
+    // Directories, most files first
     if !modules.is_empty() {
-        let mut dirs = modules;
-        dirs.truncate(10);
-        let display: Vec<String> = dirs.iter().map(|m| format!("{m}/")).collect();
-        lines.push(format!("  dirs: {}", display.join(" ")));
+        let mut dirs: Vec<String> = modules
+            .iter()
+            .take(DIRS_SHOWN)
+            .map(|m| format!("{m}/"))
+            .collect();
+        dirs.extend(format::and_more(modules.len(), DIRS_SHOWN));
+        lines.push(format!("  dirs: {}", dirs.join(" ")));
     }
 
     // Manifest — name, version, deps
@@ -161,19 +178,17 @@ fn fingerprint_inner(root: &Path) -> String {
         if let Some(info) = parse_manifest(root, &manifest) {
             // Deps line
             if !info.deps.is_empty() {
-                let dep_str = info.deps.join(", ");
+                let dep_str = format::capped_list(info.deps.iter(), DEPS_SHOWN);
                 lines.push(format!("  deps: {dep_str}"));
             }
 
             // Hot files (only for projects with local imports)
-            if let Some(hot) =
-                hot_files(root, &walk, primary_lang, Instant::now() + HOT_FILES_BUDGET)
-            {
+            if let Some(hot) = hot_files(root, &walk, primary_lang) {
                 lines.push(format!("  hot (× = importers): {hot}"));
             }
 
             // Git context
-            if let Some(git) = git_context(root) {
+            if let Some(git) = git_context(root, Instant::now() + GIT_LIMIT) {
                 lines.push(format!("  git: {git}"));
             }
 
@@ -195,10 +210,10 @@ fn fingerprint_inner(root: &Path) -> String {
         }
     } else {
         // No manifest — still show hot, git, tests
-        if let Some(hot) = hot_files(root, &walk, primary_lang, Instant::now() + HOT_FILES_BUDGET) {
+        if let Some(hot) = hot_files(root, &walk, primary_lang) {
             lines.push(format!("  hot (× = importers): {hot}"));
         }
-        if let Some(git) = git_context(root) {
+        if let Some(git) = git_context(root, Instant::now() + GIT_LIMIT) {
             lines.push(format!("  git: {git}"));
         }
         if let Some(tests) = test_style(root, &walk, primary_lang) {
@@ -445,7 +460,9 @@ fn parse_cargo_toml(root: &Path) -> Option<ManifestInfo> {
         version: Option<String>,
     }
 
-    let content = tilth_core::source::read_source(&root.join("Cargo.toml")).ok()?;
+    let content = tilth_core::source::read_source(&root.join("Cargo.toml"))
+        .ok()
+        .flatten()?;
     let parsed: CargoToml = toml::from_str(&content).ok()?;
     let (name, version) = parsed.package.map_or((None, None), |p| (p.name, p.version));
     let mut deps: Vec<String> = parsed
@@ -453,7 +470,6 @@ fn parse_cargo_toml(root: &Path) -> Option<ManifestInfo> {
         .map(|d| d.into_iter().map(|(k, _)| k).collect())
         .unwrap_or_default();
     deps.sort();
-    deps.truncate(10);
     Some(ManifestInfo {
         name,
         version,
@@ -469,14 +485,15 @@ fn parse_package_json(root: &Path) -> Option<ManifestInfo> {
         dependencies: Option<serde_json::Map<String, serde_json::Value>>,
     }
 
-    let content = tilth_core::source::read_source(&root.join("package.json")).ok()?;
+    let content = tilth_core::source::read_source(&root.join("package.json"))
+        .ok()
+        .flatten()?;
     let parsed: PackageJson = serde_json::from_str(&content).ok()?;
     let mut deps: Vec<String> = parsed
         .dependencies
         .map(|d| d.into_iter().map(|(k, _)| k).collect())
         .unwrap_or_default();
     deps.sort();
-    deps.truncate(10);
     Some(ManifestInfo {
         name: parsed.name,
         version: parsed.version,
@@ -485,7 +502,9 @@ fn parse_package_json(root: &Path) -> Option<ManifestInfo> {
 }
 
 fn parse_go_mod(root: &Path) -> Option<ManifestInfo> {
-    let content = tilth_core::source::read_source(&root.join("go.mod")).ok()?;
+    let content = tilth_core::source::read_source(&root.join("go.mod"))
+        .ok()
+        .flatten()?;
     let mut name = None;
     let mut deps: Vec<String> = Vec::new();
     let mut in_require = false;
@@ -516,7 +535,6 @@ fn parse_go_mod(root: &Path) -> Option<ManifestInfo> {
     }
 
     deps.sort();
-    deps.truncate(10);
 
     Some(ManifestInfo {
         name,
@@ -537,7 +555,9 @@ fn parse_pyproject_toml(root: &Path) -> Option<ManifestInfo> {
         dependencies: Option<Vec<String>>,
     }
 
-    let content = tilth_core::source::read_source(&root.join("pyproject.toml")).ok()?;
+    let content = tilth_core::source::read_source(&root.join("pyproject.toml"))
+        .ok()
+        .flatten()?;
     let parsed: PyProject = toml::from_str(&content).ok()?;
     let project = parsed.project.unwrap_or_default();
     let mut deps: Vec<String> = project
@@ -553,7 +573,6 @@ fn parse_pyproject_toml(root: &Path) -> Option<ManifestInfo> {
         })
         .collect();
     deps.sort();
-    deps.truncate(10);
     Some(ManifestInfo {
         name: project.name,
         version: project.version,
@@ -565,61 +584,51 @@ fn parse_pyproject_toml(root: &Path) -> Option<ManifestInfo> {
 // Git context
 // ---------------------------------------------------------------------------
 
-/// Run a git command with a 200ms timeout. Returns None if it fails or times out.
-/// Best-effort: every git failure (spawn error, non-zero exit, timeout, I/O error)
-/// is intentionally swallowed into None — git context is a cosmetic fingerprint
-/// and must never break the primary read/search path.
-fn git_output(root: &Path, args: &[&str]) -> Option<String> {
-    let mut child = Command::new("git")
-        .args(args)
-        .current_dir(root)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
+/// How long the `git:` line may take, all its git commands together.
+const GIT_LIMIT: Duration = Duration::from_millis(200);
+
+/// The `git:` line: the branch, or the short commit id on a detached HEAD,
+/// and how many files have uncommitted changes.
+///
+/// `None` unless git answered in full by `deadline`. A count git could not
+/// finish is left out with the rest of the line rather than shown as
+/// `clean` (#356). Every failure is swallowed: git context is a cosmetic
+/// fingerprint and must never break the primary read/search path.
+fn git_context(root: &Path, deadline: Instant) -> Option<String> {
+    // One command gives both the branch and the changes. Every header line
+    // starts with `# `, and every other line is one changed file.
+    let status = Git::new(root, "status")
+        .args(&["--porcelain=v2", "--branch"])
+        .deadline(deadline)
+        .run()
         .ok()?;
+    let head = status
+        .lines()
+        .find_map(|line| line.strip_prefix("# branch.head "))?;
+    let changes = status
+        .lines()
+        .filter(|line| !line.starts_with("# "))
+        .count();
 
-    let deadline = Instant::now() + Duration::from_millis(200);
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                if !status.success() {
-                    return None;
-                }
-                let out = child.stdout.take()?;
-                let s = std::io::read_to_string(out).ok()?;
-                let trimmed = s.trim().to_string();
-                return if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(trimmed)
-                };
-            }
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    // Best effort, like the rest of this function: kill fails
-                    // only if git exited in the meantime, and the wait then
-                    // just reaps it.
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return None;
-                }
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            Err(_) => return None,
-        }
-    }
-}
+    let branch = if head == "(detached)" {
+        Git::new(root, "rev-parse")
+            .args(&["--short", "HEAD"])
+            .deadline(deadline)
+            .run()
+            .ok()?
+            .trim()
+            .to_string()
+    } else {
+        head.to_string()
+    };
 
-fn git_context(root: &Path) -> Option<String> {
-    let branch = git_output(root, &["branch", "--show-current"])
-        .or_else(|| git_output(root, &["rev-parse", "--short", "HEAD"]))?;
-
-    let dirty_count = git_output(root, &["status", "--porcelain"]).map_or(0, |s| s.lines().count());
-
-    let dirty_str = if dirty_count == 0 {
+    let dirty_str = if changes == 0 {
         "clean".to_string()
     } else {
-        format!("{dirty_count} uncommitted files")
+        format!(
+            "{changes} uncommitted {}",
+            crate::format::noun(changes, "file", "files")
+        )
     };
 
     Some(format!("branch {branch}, {dirty_str}"))
@@ -683,8 +692,8 @@ fn test_style(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Opt
             .take(5)
             .any(|(path, _)| {
                 let full = root.join(path);
-                tilth_core::source::read_to_string(&full)
-                    .is_ok_and(|content| content.contains("#[cfg(test)]"))
+                tilth_core::source::read_source(&full)
+                    .is_ok_and(|content| content.is_some_and(|c| c.contains("#[cfg(test)]")))
             });
         if has_cfg_test {
             styles.push("in-source #[cfg(test)]".to_string());
@@ -702,18 +711,10 @@ fn test_style(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Opt
 // Hot files — most imported local files
 // ---------------------------------------------------------------------------
 
-/// How long the hot-files pass may read imports: a share of the
-/// fingerprint's 250 ms budget.
-const HOT_FILES_BUDGET: Duration = Duration::from_millis(100);
-
-/// The most imported local files, from the imports of the smallest code
-/// files read before `deadline`.
-fn hot_files(
-    root: &Path,
-    walk: &WalkResult,
-    primary_lang: Option<Lang>,
-    deadline: Instant,
-) -> Option<String> {
+/// The most imported local files, from the imports of the 100 smallest code
+/// files. The limit is a file count, never a clock, so a loaded machine
+/// reads the same files as an idle one (#281).
+fn hot_files(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Option<String> {
     primary_lang?; // require a detected language
 
     // Sort by size (smallest first) and take first 100
@@ -728,11 +729,8 @@ fn hot_files(
     let mut all_import_sources: Vec<String> = Vec::new();
 
     for (rel_path, _) in &files {
-        if Instant::now() >= deadline {
-            break;
-        }
         let full = root.join(rel_path);
-        let Ok(content) = tilth_core::source::read_source(&full) else {
+        let Ok(Some(content)) = tilth_core::source::read_source(&full) else {
             continue;
         };
 
@@ -757,78 +755,65 @@ fn hot_files(
         }
     }
 
-    if path_counts.is_empty() {
-        return None;
-    }
-
-    // Sort by import count descending, take top 5
-    let mut sorted: Vec<(std::path::PathBuf, usize)> = path_counts.into_iter().collect();
-    sorted.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-    sorted.truncate(5);
-
-    if sorted[0].1 < 2 {
-        return None;
-    }
-
-    // For each hot file, find the most commonly imported symbol by scanning
-    // import sources that reference this file's module name.
-    let parts: Vec<String> = sorted
-        .iter()
+    // A file is hot when two or more files import it. Most importers first,
+    // ties by path.
+    let mut sorted: Vec<(std::path::PathBuf, usize)> = path_counts
+        .into_iter()
         .filter(|(_, count)| *count >= 2)
-        .map(|(path, count)| {
-            let rel = path.strip_prefix(root).unwrap_or(path);
-            let rel_str = rel.display().to_string();
+        .collect();
+    if sorted.is_empty() {
+        return None;
+    }
+    sorted.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
 
-            // Derive the module name from the file path
-            // src/types.rs → "types", src/lang/mod.rs → "lang", src/error.rs → "error"
-            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-            let module_name = if stem == "mod" || stem == "index" || stem == "__init__" {
-                path.parent()
-                    .and_then(|p| p.file_name())
-                    .and_then(|n| n.to_str())
-                    .unwrap_or(stem)
-            } else {
-                stem
-            };
+    // For each hot file shown, find the most commonly imported symbol by
+    // scanning import sources that reference this file's module name.
+    let parts = sorted.iter().map(|(path, count)| {
+        let rel = path.strip_prefix(root).unwrap_or(path);
+        let rel_str = rel.display().to_string();
 
-            // Count symbols imported from this module across all import sources
-            let mut symbol_counts: HashMap<String, usize> = HashMap::new();
-            for source in &all_import_sources {
-                // Match imports that reference this module
-                // e.g., for module "types": "tilth_core::types::OutlineEntry" matches
-                let segments: Vec<&str> = source.split("::").collect();
-                if let Some(mod_pos) = segments.iter().position(|s| *s == module_name) {
-                    // Everything after the module name is a symbol path
-                    for &sym in segments.iter().skip(mod_pos + 1) {
-                        if !sym.is_empty()
-                            && !sym.contains('*')
-                            && !sym.contains('{')
-                            && sym != "self"
-                        {
-                            *symbol_counts.entry(sym.to_string()).or_insert(0) += 1;
-                        }
+        // Derive the module name from the file path
+        // src/types.rs → "types", src/lang/mod.rs → "lang", src/error.rs → "error"
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        let module_name = if stem == "mod" || stem == "index" || stem == "__init__" {
+            path.parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .unwrap_or(stem)
+        } else {
+            stem
+        };
+
+        // Count symbols imported from this module across all import sources
+        let mut symbol_counts: HashMap<String, usize> = HashMap::new();
+        for source in &all_import_sources {
+            // Match imports that reference this module
+            // e.g., for module "types": "tilth_core::types::OutlineEntry" matches
+            let segments: Vec<&str> = source.split("::").collect();
+            if let Some(mod_pos) = segments.iter().position(|s| *s == module_name) {
+                // Everything after the module name is a symbol path
+                for &sym in segments.iter().skip(mod_pos + 1) {
+                    if !sym.is_empty() && !sym.contains('*') && !sym.contains('{') && sym != "self"
+                    {
+                        *symbol_counts.entry(sym.to_string()).or_insert(0) += 1;
                     }
                 }
             }
+        }
 
-            // Pick the most frequently imported symbol (break ties alphabetically for determinism)
-            let top_sym = symbol_counts
-                .into_iter()
-                .max_by(|(a_sym, a_c), (b_sym, b_c)| a_c.cmp(b_c).then(b_sym.cmp(a_sym)))
-                .map(|(sym, _)| sym);
+        // Pick the most frequently imported symbol (break ties alphabetically for determinism)
+        let top_sym = symbol_counts
+            .into_iter()
+            .max_by(|(a_sym, a_c), (b_sym, b_c)| a_c.cmp(b_c).then(b_sym.cmp(a_sym)))
+            .map(|(sym, _)| sym);
 
-            top_sym.map_or_else(
-                || format!("{rel_str} ×{count}"),
-                |sym| format!("{rel_str}({sym}) ×{count}"),
-            )
-        })
-        .collect();
+        top_sym.map_or_else(
+            || format!("{rel_str} ×{count}"),
+            |sym| format!("{rel_str}({sym}) ×{count}"),
+        )
+    });
 
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts.join(", "))
-    }
+    Some(format::capped_list(parts, HOT_SHOWN))
 }
 
 // ---------------------------------------------------------------------------
@@ -838,6 +823,7 @@ fn hot_files(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::git::tests::git;
 
     #[test]
     fn test_fingerprint_on_tilth() {
@@ -878,27 +864,132 @@ mod tests {
             .unwrap();
         }
         let walk = walk_files(tmp.path());
-        let later = Instant::now() + Duration::from_secs(3600);
-        let hot = hot_files(tmp.path(), &walk, Some(Lang::Rust), later);
+        let hot = hot_files(tmp.path(), &walk, Some(Lang::Rust));
         assert_eq!(
             hot.as_deref(),
             Some("src/other.rs ×2, src/types.rs(Outline) ×2")
         );
     }
 
-    /// The deadline is the caller's, so a test sets one a loaded machine
-    /// cannot miss. One already past reads no file.
+    /// Counts that tie are ordered by name, so the same tree gives the same
+    /// overview on every build. The counts came out of hash maps, and each
+    /// map iterates in its own random order, so ties used to land anywhere
+    /// (#281). Here eight directories tie on file count and two languages
+    /// tie as the primary one.
     #[test]
-    fn hot_files_stop_at_the_deadline() {
+    fn tied_counts_give_the_same_overview_every_time() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = [
+            "golf", "alpha", "hotel", "delta", "bravo", "foxtrot", "charlie", "echo",
+        ];
+        for dir in dirs {
+            let path = tmp.path().join(dir);
+            fs::create_dir_all(&path).unwrap();
+            for file in ["a.py", "b.py", "a.rs", "b.rs"] {
+                fs::write(path.join(file), "x = 1\n").unwrap();
+            }
+        }
+        let expected = "[tilth] Python project — 16 source files, 8 directories\n  \
+             dirs: alpha/ bravo/ charlie/ delta/ echo/ foxtrot/ golf/ hotel/";
+        for _ in 0..10 {
+            assert_eq!(fingerprint(tmp.path()), expected);
+        }
+    }
+
+    /// A tree of `n` directories that each hold two Python files.
+    fn tree_of_dirs(n: usize) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        for i in 0..n {
+            let dir = tmp.path().join(format!("d{i:02}"));
+            fs::create_dir_all(&dir).unwrap();
+            for file in ["a.py", "b.py"] {
+                fs::write(dir.join(file), "x = 1\n").unwrap();
+            }
+        }
+        tmp
+    }
+
+    /// The summary listed ten directories and counted only those ten in its
+    /// header, so a tree with more read as if it had ten (#343).
+    #[test]
+    fn the_startup_summary_counts_the_dirs_it_leaves_out() {
+        let tmp = tree_of_dirs(DIRS_SHOWN + 1);
+        let expected = "[tilth] Python project — 22 source files, 11 directories\n  \
+             dirs: d00/ d01/ d02/ d03/ d04/ d05/ d06/ d07/ d08/ d09/ and 1 more";
+        assert_eq!(fingerprint(tmp.path()), expected);
+
+        let tmp = tree_of_dirs(DIRS_SHOWN);
+        let expected = "[tilth] Python project — 20 source files, 10 directories\n  \
+             dirs: d00/ d01/ d02/ d03/ d04/ d05/ d06/ d07/ d08/ d09/";
+        assert_eq!(fingerprint(tmp.path()), expected);
+    }
+
+    /// The `deps:` line of a manifest with `n` dependencies.
+    fn deps_line(n: usize) -> String {
+        let tmp = tempfile::tempdir().unwrap();
+        let deps: Vec<String> = (0..n).map(|i| format!("\"dep{i:02}\": \"1\"")).collect();
+        fs::write(
+            tmp.path().join("package.json"),
+            format!("{{\"dependencies\": {{{}}}}}", deps.join(", ")),
+        )
+        .unwrap();
+        let summary = fingerprint(tmp.path());
+        summary
+            .lines()
+            .find(|line| line.starts_with("  deps: "))
+            .unwrap_or_else(|| panic!("no deps line: {summary}"))
+            .to_string()
+    }
+
+    /// The summary listed ten dependencies and said nothing of the rest
+    /// (#343).
+    #[test]
+    fn the_startup_summary_counts_the_deps_it_leaves_out() {
+        assert_eq!(
+            deps_line(DEPS_SHOWN + 1),
+            "  deps: dep00, dep01, dep02, dep03, dep04, dep05, dep06, dep07, dep08, dep09, \
+             and 1 more"
+        );
+        assert_eq!(
+            deps_line(DEPS_SHOWN),
+            "  deps: dep00, dep01, dep02, dep03, dep04, dep05, dep06, dep07, dep08, dep09"
+        );
+    }
+
+    /// The hot files of a Rust tree where two files import each of `n`
+    /// modules.
+    fn hot_of(n: usize) -> Option<String> {
         let tmp = tempfile::tempdir().unwrap();
         let src = tmp.path().join("src");
         fs::create_dir_all(&src).unwrap();
-        fs::write(src.join("types.rs"), "pub struct Outline;\n").unwrap();
-        fs::write(src.join("a.rs"), "use crate::types::Outline;\n").unwrap();
+        let modules: Vec<String> = (0..n).map(|i| format!("h{i}")).collect();
+        for module in &modules {
+            fs::write(src.join(format!("{module}.rs")), "").unwrap();
+        }
+        for user in ["a.rs", "b.rs"] {
+            fs::write(
+                src.join(user),
+                format!("use crate::{{{}}};\n", modules.join(", ")),
+            )
+            .unwrap();
+        }
         let walk = walk_files(tmp.path());
+        hot_files(tmp.path(), &walk, Some(Lang::Rust))
+    }
+
+    /// The summary listed five hot files and said nothing of the rest
+    /// (#343).
+    #[test]
+    fn the_startup_summary_counts_the_hot_files_it_leaves_out() {
         assert_eq!(
-            hot_files(tmp.path(), &walk, Some(Lang::Rust), Instant::now()),
-            None
+            hot_of(HOT_SHOWN + 1).as_deref(),
+            Some(
+                "src/h0.rs ×2, src/h1.rs ×2, src/h2.rs ×2, src/h3.rs ×2, src/h4.rs ×2, and 1 more"
+            )
+        );
+        assert_eq!(
+            hot_of(HOT_SHOWN).as_deref(),
+            Some("src/h0.rs ×2, src/h1.rs ×2, src/h2.rs ×2, src/h3.rs ×2, src/h4.rs ×2")
         );
     }
 
@@ -914,6 +1005,77 @@ mod tests {
         .unwrap();
         let manifest = parse_package_json(tmp.path()).expect("manifest parsed");
         assert_eq!(manifest.name.as_deref(), Some("bom-app"));
+    }
+
+    /// Git's output was read only once git exited, and a pipe holds 64 KiB,
+    /// so a `git status` that printed more waited for the time limit, and the
+    /// line then said `clean` (#356).
+    #[test]
+    fn a_status_longer_than_a_pipe_is_counted() {
+        let repo = crate::git::tests::repo();
+        for i in 0..2500 {
+            fs::write(
+                repo.path()
+                    .join(format!("untracked-file-with-a-long-name-{i}.txt")),
+                "",
+            )
+            .unwrap();
+        }
+        let line = git_context(repo.path(), far_off()).expect("a git line");
+        assert!(line.ends_with(", 2500 uncommitted files"), "{line}");
+    }
+
+    /// A deadline only a hung git would miss.
+    fn far_off() -> Instant {
+        Instant::now() + Duration::from_secs(60)
+    }
+
+    /// The branch is named, and on a detached HEAD the short commit id,
+    /// each as git itself names it.
+    #[test]
+    fn the_git_line_names_the_branch_or_the_detached_commit() {
+        let repo = crate::git::tests::repo();
+        let dir = repo.path();
+        git(
+            dir,
+            &[
+                "-c",
+                "user.name=tilth",
+                "-c",
+                "user.email=tilth@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "--no-verify",
+                "--allow-empty",
+                "-m",
+                "first",
+            ],
+        );
+        let branch = git(dir, &["branch", "--show-current"]);
+        assert_eq!(
+            git_context(dir, far_off()),
+            Some(format!("branch {branch}, clean"))
+        );
+
+        git(dir, &["checkout", "-q", "--detach"]);
+        let commit = git(dir, &["rev-parse", "--short", "HEAD"]);
+        assert_eq!(
+            git_context(dir, far_off()),
+            Some(format!("branch {commit}, clean"))
+        );
+    }
+
+    /// A `git:` line git could not finish in time is left out, so it never
+    /// calls a dirty checkout `clean` (#356).
+    #[test]
+    fn a_git_line_out_of_time_is_left_out() {
+        let repo = crate::git::tests::repo();
+        fs::write(repo.path().join("new.txt"), "").unwrap();
+        let line = git_context(repo.path(), far_off()).expect("a git line");
+        assert!(line.ends_with(", 1 uncommitted file"), "{line}");
+        assert_eq!(git_context(repo.path(), Instant::now()), None);
     }
 
     #[test]

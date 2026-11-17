@@ -23,11 +23,21 @@ use crate::session::Session;
 use crate::types::{estimate_tokens, Match, SearchResult};
 use tilth_core::cache::OutlineCache;
 use tilth_core::error::TilthError;
+use tilth_core::search::walk::{Walk, WalkConfig};
 use tilth_core::types::FileType;
 
 use crate::format::rel;
 
 const EXPAND_FULL_FILE_THRESHOLD: u64 = 800;
+/// How many callees the `-- calls --` footer under an expanded definition
+/// lists before it counts the rest.
+const CALLS_SHOWN: usize = 8;
+/// How many second-hop `->` callees the `-- calls --` footer lists across
+/// all its callees before each one counts the rest.
+const CHILDREN_SHOWN: usize = 15;
+/// How many sibling members the `-- siblings --` footer lists before it
+/// counts the rest.
+const SIBLINGS_SHOWN: usize = 6;
 
 #[derive(Debug)]
 struct Expansion {
@@ -37,11 +47,15 @@ struct Expansion {
     end: usize,
 }
 
-/// Preserve dedup within the response without updating the shared session
-/// until the final budget is known.
+type ExpansionKey = (PathBuf, u32, SystemTime);
+
+/// Dedup while rendering without updating the shared session until the final
+/// budget is known. Within a section, staged entries avoid duplicate bodies;
+/// only fitted entries from that section can dedup later sections.
 struct RenderSession<'a> {
     previous: Option<&'a Session>,
-    staged: HashSet<(PathBuf, u32, SystemTime)>,
+    staged: HashSet<ExpansionKey>,
+    fitted: HashSet<ExpansionKey>,
 }
 
 impl<'a> RenderSession<'a> {
@@ -49,13 +63,19 @@ impl<'a> RenderSession<'a> {
         Self {
             previous,
             staged: HashSet::new(),
+            fitted: HashSet::new(),
         }
     }
 
     fn is_expanded(&self, path: &Path, line: u32, mtime: SystemTime) -> bool {
-        self.previous
+        if self
+            .previous
             .is_some_and(|session| session.is_expanded(path, line, mtime))
-            || self.staged.contains(&(path.to_path_buf(), line, mtime))
+        {
+            return true;
+        }
+        let key = (path.to_path_buf(), line, mtime);
+        self.staged.contains(&key) || self.fitted.contains(&key)
     }
 }
 
@@ -87,7 +107,7 @@ fn expansion_line(m: &Match, start: u32) -> u32 {
         return start;
     }
     let decorated = || {
-        let content = tilth_core::source::read_source(&m.path).ok()?;
+        let content = tilth_core::source::read_source(&m.path).ok().flatten()?;
         let FileType::Code(lang) =
             tilth_core::lang::detect_file_type_with_content(&m.path, &content)
         else {
@@ -206,21 +226,14 @@ pub(crate) fn owner_candidates(
     } else {
         "."
     };
-    let mut listed: Vec<String> = others
-        .iter()
-        .take(SHOWN)
-        .map(|o| {
-            let place = format!("{}:{}", rel(&o.path, scope), o.line);
-            o.owner.as_ref().map_or_else(
-                || format!("{name} ({place})"),
-                |owner| format!("{owner}{sep}{name} ({place})"),
-            )
-        })
-        .collect();
-    if others.len() > SHOWN {
-        listed.push(format!("and {} more", others.len() - SHOWN));
-    }
-    listed.join(", ")
+    let listed = others.iter().map(|o| {
+        let place = format!("{}:{}", rel(&o.path, scope), o.line);
+        o.owner.as_ref().map_or_else(
+            || format!("{name} ({place})"),
+            |owner| format!("{owner}{sep}{name} ({place})"),
+        )
+    });
+    format::capped_list(listed, SHOWN)
 }
 
 /// The sentence that names the files a walk skipped for size although they
@@ -232,18 +245,14 @@ pub(crate) fn skipped_files_note(skipped: &[PathBuf], held: &str, scope: &Path) 
     if skipped.is_empty() {
         return None;
     }
-    let mut files: Vec<String> = skipped.iter().take(SHOWN).map(|p| rel(p, scope)).collect();
-    if skipped.len() > SHOWN {
-        files.push(format!("and {} more", skipped.len() - SHOWN));
-    }
+    let files = format::capped_list(skipped.iter().map(|p| rel(p, scope)), SHOWN);
     let (count, contains, was) = match skipped.len() {
         1 => ("1 file".to_string(), "contains", "was"),
         n => (format!("{n} files"), "contain", "were"),
     };
     Some(format!(
-        "{count} over {} {contains} {held} and {was} not searched: {}",
+        "{count} over {} {contains} {held} and {was} not searched: {files}",
         tilth_core::source::max_file_size_label(),
-        files.join(", ")
     ))
 }
 
@@ -281,49 +290,46 @@ pub(crate) fn file_metadata(path: &Path) -> (u32, SystemTime) {
 /// The totals are exact either way.
 pub fn search_symbol(
     query: &str,
-    scope: &Path,
+    walk: Walk<'_>,
     cache: &OutlineCache,
-    glob: Option<&str>,
     full: bool,
 ) -> Result<String, TilthError> {
-    let result = symbol::search(query, scope, None, glob, full)?;
+    let result = symbol::search(query, walk, None, full)?;
     let bloom = tilth_core::index::bloom::BloomFilterCache::new();
-    format_search_result(&result, cache, None, &bloom, 0, None)
+    format_search_result(&result, walk, cache, None, &bloom, 0, None)
 }
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "per-call options become one Request in #307"
+    reason = "per-call options become one Request in #350"
 )]
 pub fn search_symbol_expanded(
     query: &str,
-    scope: &Path,
+    walk: Walk<'_>,
     cache: &OutlineCache,
     session: &Session,
     bloom: &tilth_core::index::bloom::BloomFilterCache,
     expand: usize,
     context: Option<&Path>,
-    glob: Option<&str>,
     full: bool,
     budget: Option<u64>,
 ) -> Result<String, TilthError> {
-    let result = symbol::search(query, scope, context, glob, full)?;
-    format_search_result(&result, cache, Some(session), bloom, expand, budget)
+    let result = symbol::search(query, walk, context, full)?;
+    format_search_result(&result, walk, cache, Some(session), bloom, expand, budget)
 }
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "per-call options become one Request in #307"
+    reason = "per-call options become one Request in #350"
 )]
 pub fn search_multi_symbol_expanded(
     queries: &[&str],
-    scope: &Path,
+    walk: Walk<'_>,
     cache: &OutlineCache,
     session: &Session,
     bloom: &tilth_core::index::bloom::BloomFilterCache,
     expand: usize,
     context: Option<&Path>,
-    glob: Option<&str>,
     full: bool,
     budget: Option<u64>,
 ) -> Result<String, TilthError> {
@@ -340,7 +346,7 @@ pub fn search_multi_symbol_expanded(
     let mut expansions = Vec::new();
 
     for query in queries {
-        let result = symbol::search(query, scope, context, glob, full)?;
+        let result = symbol::search(query, walk, context, full)?;
         let mut out = format::search_header(
             &result.query,
             &result.scope,
@@ -363,9 +369,10 @@ pub fn search_multi_symbol_expanded(
         );
         if result.total_found > result.matches.len() {
             let omitted = result.total_found - result.matches.len();
+            let matches = format::noun(omitted, "match", "matches");
             let _ = write!(
                 out,
-                "\n\n... and {omitted} more matches. Narrow with scope."
+                "\n\n... and {omitted} more {matches}. Narrow with scope."
             );
         }
         out.push_str(&skipped_large_note(&result));
@@ -377,8 +384,14 @@ pub fn search_multi_symbol_expanded(
             combined.push_str("\n\n---\n");
         }
         let offset = combined.len();
+        render_session.staged.clear();
         expansions.extend(segments.into_iter().filter_map(|block| {
             let mut expansion = block.expansion?;
+            // A later section may say "shown earlier" only if this body
+            // survived the per-section fit. The final cut keeps a prefix.
+            render_session
+                .fitted
+                .insert((expansion.path.clone(), expansion.line, expansion.mtime));
             expansion.end += offset;
             Some(expansion)
         }));
@@ -391,113 +404,108 @@ pub fn search_multi_symbol_expanded(
 
 pub fn search_content(
     query: &str,
-    scope: &Path,
+    walk: Walk<'_>,
     cache: &OutlineCache,
-    glob: Option<&str>,
     full: bool,
 ) -> Result<String, TilthError> {
     let (pattern, is_regex) = parse_pattern(query);
-    let result = content::search(pattern, scope, is_regex, None, glob, full)?;
+    let result = content::search(pattern, walk, is_regex, None, full)?;
     let bloom = tilth_core::index::bloom::BloomFilterCache::new();
-    format_search_result(&result, cache, None, &bloom, 0, None)
+    format_search_result(&result, walk, cache, None, &bloom, 0, None)
 }
 
 pub fn search_regex(
     pattern: &str,
-    scope: &Path,
+    walk: Walk<'_>,
     cache: &OutlineCache,
-    glob: Option<&str>,
     full: bool,
 ) -> Result<String, TilthError> {
-    let result = content::search(pattern, scope, true, None, glob, full)?;
+    let result = content::search(pattern, walk, true, None, full)?;
     let bloom = tilth_core::index::bloom::BloomFilterCache::new();
-    format_search_result(&result, cache, None, &bloom, 0, None)
+    format_search_result(&result, walk, cache, None, &bloom, 0, None)
 }
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "per-call options become one Request in #307"
+    reason = "per-call options become one Request in #350"
 )]
 pub fn search_content_expanded(
     query: &str,
-    scope: &Path,
+    walk: Walk<'_>,
     cache: &OutlineCache,
     session: &Session,
     expand: usize,
     context: Option<&Path>,
-    glob: Option<&str>,
     full: bool,
     budget: Option<u64>,
 ) -> Result<String, TilthError> {
     let (pattern, is_regex) = parse_pattern(query);
-    let result = content::search(pattern, scope, is_regex, context, glob, full)?;
+    let result = content::search(pattern, walk, is_regex, context, full)?;
     let bloom = tilth_core::index::bloom::BloomFilterCache::new();
-    format_search_result(&result, cache, Some(session), &bloom, expand, budget)
+    format_search_result(&result, walk, cache, Some(session), &bloom, expand, budget)
 }
 
 /// Expanded regex search — takes raw pattern, no slash wrapping needed.
 #[expect(
     clippy::too_many_arguments,
-    reason = "per-call options become one Request in #307"
+    reason = "per-call options become one Request in #350"
 )]
 pub fn search_regex_expanded(
     pattern: &str,
-    scope: &Path,
+    walk: Walk<'_>,
     cache: &OutlineCache,
     session: &Session,
     expand: usize,
     context: Option<&Path>,
-    glob: Option<&str>,
     full: bool,
     budget: Option<u64>,
 ) -> Result<String, TilthError> {
-    let result = content::search(pattern, scope, true, context, glob, full)?;
+    let result = content::search(pattern, walk, true, context, full)?;
     let bloom = tilth_core::index::bloom::BloomFilterCache::new();
-    format_search_result(&result, cache, Some(session), &bloom, expand, budget)
+    format_search_result(&result, walk, cache, Some(session), &bloom, expand, budget)
 }
 
 /// Raw symbol search — returns structured result for programmatic inspection.
 pub fn search_symbol_raw(
     query: &str,
-    scope: &Path,
-    glob: Option<&str>,
+    walk: Walk<'_>,
     full: bool,
 ) -> Result<SearchResult, TilthError> {
-    symbol::search(query, scope, None, glob, full)
+    symbol::search(query, walk, None, full)
 }
 
 /// Raw content search — returns structured result for programmatic inspection.
 pub fn search_content_raw(
     query: &str,
-    scope: &Path,
-    glob: Option<&str>,
+    walk: Walk<'_>,
     full: bool,
 ) -> Result<SearchResult, TilthError> {
     let (pattern, is_regex) = parse_pattern(query);
-    content::search(pattern, scope, is_regex, None, glob, full)
+    content::search(pattern, walk, is_regex, None, full)
 }
 
 /// Raw regex search — returns structured result for programmatic inspection.
 pub fn search_regex_raw(
     pattern: &str,
-    scope: &Path,
-    glob: Option<&str>,
+    walk: Walk<'_>,
     full: bool,
 ) -> Result<SearchResult, TilthError> {
-    content::search(pattern, scope, true, None, glob, full)
+    content::search(pattern, walk, true, None, full)
 }
 
 /// Format a raw search result (symbol or content — both use the same pipeline).
+/// `walk` is the walk that found it.
 pub fn format_raw_result(
     result: &SearchResult,
+    walk: Walk<'_>,
     cache: &OutlineCache,
 ) -> Result<String, TilthError> {
     let bloom = tilth_core::index::bloom::BloomFilterCache::new();
-    format_search_result(result, cache, None, &bloom, 0, None)
+    format_search_result(result, walk, cache, None, &bloom, 0, None)
 }
 
-pub fn search_glob(pattern: &str, scope: &Path) -> Result<String, TilthError> {
-    let result = glob::search(pattern, scope)?;
+pub fn search_glob(pattern: &str, scope: &Path, walk: WalkConfig) -> Result<String, TilthError> {
+    let result = glob::search(pattern, scope, walk)?;
     format_glob_result(&result, scope)
 }
 
@@ -516,9 +524,10 @@ fn count_label(shown: usize, total: usize) -> String {
 /// Emit a per-facet hidden-count tail line after a truncated facet's entries.
 /// Wording mirrors the linear-path global tail so a reader sees a single
 /// consistent shape — only the noun changes per facet kind.
-fn write_hidden_tail(out: &mut String, shown: usize, total: usize, kind: &str) {
+fn write_hidden_tail(out: &mut String, shown: usize, total: usize, (one, many): (&str, &str)) {
     if shown < total {
         let hidden = total - shown;
+        let kind = format::noun(hidden, one, many);
         let _ = write!(out, "\n\n... and {hidden} more {kind}. Narrow with scope.");
     }
 }
@@ -786,7 +795,7 @@ fn format_single_match(
     // the existing outline / single-line preview branches.
     if m.is_definition && m.def_weight == 30 {
         if let Some((heading_line_1, section_end_1)) = m.def_range {
-            if let Ok(content) = tilth_core::source::read_source(&m.path) {
+            if let Ok(Some(content)) = tilth_core::source::read_source(&m.path) {
                 let lines: Vec<&str> = content.lines().collect();
                 // def_range is `(heading_line, section_end)` in 1-indexed
                 // inclusive form (see `find_defs_markdown_buf`). The body
@@ -806,7 +815,8 @@ fn format_single_match(
                         let truncated = total_body_lines - take_n;
                         let _ = write!(
                             out,
-                            "… ({truncated} more lines — pass --expand to see the full section)"
+                            "… ({truncated} more {} — pass --expand to see the full section)",
+                            format::noun(truncated, "line", "lines")
                         );
                     }
                     return (out.len(), None);
@@ -916,23 +926,30 @@ fn format_single_match(
                                 m.def_range,
                             );
                             if !callee_names.is_empty() {
-                                let mut nodes =
-                                    tilth_core::search::callees::resolve_callees_transitive(
-                                        &callee_names,
-                                        &m.path,
-                                        &content,
-                                        bloom,
-                                        2,
-                                        15,
-                                    );
-
-                                if let Some(ref name) = m.def_name {
-                                    nodes.retain(|n| n.callee.name != *name);
+                                let first_hop = tilth_core::search::callees::resolve_callees(
+                                    &callee_names,
+                                    &m.path,
+                                    &content,
+                                    bloom,
+                                );
+                                let mut shown: Vec<_> = first_hop
+                                    .iter()
+                                    .filter(|c| m.def_name.as_ref() != Some(&c.name))
+                                    .cloned()
+                                    .collect();
+                                let total = shown.len();
+                                if total > CALLS_SHOWN {
+                                    shown.sort_by_key(|c| i32::from(c.file == m.path));
+                                    shown.truncate(CALLS_SHOWN);
                                 }
-                                if nodes.len() > 8 {
-                                    nodes.sort_by_key(|n| i32::from(n.callee.file == m.path));
-                                    nodes.truncate(8);
-                                }
+                                // The second hop only under the callees shown,
+                                // so a hidden one spends none of the budget.
+                                let nodes = tilth_core::search::callees::resolve_second_hops(
+                                    shown,
+                                    &first_hop,
+                                    bloom,
+                                    CHILDREN_SHOWN,
+                                );
 
                                 if !nodes.is_empty() {
                                     out.push_str("\n\n-- calls --");
@@ -962,6 +979,14 @@ fn format_single_match(
                                                 let _ = write!(out, "  {sig}");
                                             }
                                         }
+                                        if let Some(more) =
+                                            format::and_more(n.children_found, n.children.len())
+                                        {
+                                            let _ = write!(out, "\n    ... {more}");
+                                        }
+                                    }
+                                    if let Some(more) = format::and_more(total, CALLS_SHOWN) {
+                                        let _ = write!(out, "\n  ... {more}");
                                     }
                                 }
                             }
@@ -986,7 +1011,7 @@ fn format_single_match(
                                             siblings::resolve_siblings(&filtered, &parent.children);
                                         if !resolved.is_empty() {
                                             out.push_str("\n\n-- siblings --");
-                                            for s in &resolved {
+                                            for s in resolved.iter().take(SIBLINGS_SHOWN) {
                                                 let _ = write!(
                                                     out,
                                                     "\n  {}  {}:{}-{}  {}",
@@ -996,6 +1021,11 @@ fn format_single_match(
                                                     s.end_line,
                                                     s.signature,
                                                 );
+                                            }
+                                            if let Some(more) =
+                                                format::and_more(resolved.len(), SIBLINGS_SHOWN)
+                                            {
+                                                let _ = write!(out, "\n  ... {more}");
                                             }
                                         }
                                     }
@@ -1087,16 +1117,15 @@ pub(crate) fn format_token_count(tokens: u64) -> String {
 }
 
 /// Fallback: lightweight directory walk to find a basename-matching file
-/// when it didn't survive ranking/truncation in the match set.
-fn find_basename_fallback(scope: &Path, query_lower: &str) -> Option<PathBuf> {
+/// when it didn't survive ranking/truncation in the match set. It visits the
+/// files the search's own walk visits, down to six levels below the scope.
+fn find_basename_fallback(walk: Walk<'_>, query_lower: &str) -> Option<PathBuf> {
     let mut candidate: Option<PathBuf> = None;
     let mut best_priority: u8 = 0;
 
-    let walker = ignore::WalkBuilder::new(scope)
-        .follow_links(true)
-        .same_file_system(true) // Stop at mount boundaries (NFS, external volumes).
-        .hidden(true)
-        .git_ignore(true)
+    // The search already ran this walk, so its glob is valid.
+    let walker = tilth_core::search::walk::walk_builder(walk)
+        .ok()?
         .max_depth(Some(6))
         .build();
 
@@ -1130,7 +1159,7 @@ fn find_basename_fallback(scope: &Path, query_lower: &str) -> Option<PathBuf> {
 fn basename_file_outline(
     query: &str,
     matches: &[Match],
-    scope: &Path,
+    walk: Walk<'_>,
     cache: &OutlineCache,
 ) -> Option<String> {
     let query_lower = query.to_ascii_lowercase();
@@ -1142,33 +1171,30 @@ fn basename_file_outline(
 
     // Find the best candidate among existing matches whose basename matches the query
     let matched_path = find_basename_candidate(matches, &query_lower)
-        .or_else(|| find_basename_fallback(scope, &query_lower))?;
+        .or_else(|| find_basename_fallback(walk, &query_lower))?;
 
     // Read file and generate outline
-    let content = tilth_core::source::read_source(&matched_path).ok()?;
+    let content = tilth_core::source::read_source(&matched_path)
+        .ok()
+        .flatten()?;
     let file_type = tilth_core::lang::detect_file_type_with_content(&matched_path, &content);
     let mtime = std::fs::metadata(&matched_path)
         .and_then(|m| m.modified())
         .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
 
     let outline = cache.get_or_compute(&matched_path, mtime, || {
-        crate::read::outline::generate(
-            &matched_path,
-            file_type,
-            &content,
-            content.as_bytes(),
-            false,
-        )
+        crate::read::outline::generate(&matched_path, file_type, &content, false)
     });
 
     if outline.trim().is_empty() {
         return None;
     }
 
-    let rel_path = rel(&matched_path, scope);
+    let rel_path = rel(&matched_path, walk.scope);
     let line_count = content.lines().count();
     Some(format!(
-        "## File overview: {rel_path} ({line_count} lines)\n{outline}"
+        "## File overview: {rel_path} ({line_count} {})\n{outline}",
+        format::noun(line_count, "line", "lines")
     ))
 }
 
@@ -1179,6 +1205,7 @@ fn basename_file_outline(
 )]
 fn format_search_result(
     result: &SearchResult,
+    walk: Walk<'_>,
     cache: &OutlineCache,
     session: Option<&Session>,
     bloom: &tilth_core::index::bloom::BloomFilterCache,
@@ -1201,9 +1228,7 @@ fn format_search_result(
 
     // File-level retrieval: when a file basename matches the query exactly,
     // prepend a compact outline so the agent gets file-level context first.
-    if let Some(file_outline) =
-        basename_file_outline(&result.query, &result.matches, &result.scope, cache)
-    {
+    if let Some(file_outline) = basename_file_outline(&result.query, &result.matches, walk, cache) {
         let _ = write!(out, "\n\n{file_outline}");
     }
 
@@ -1239,7 +1264,7 @@ fn format_search_result(
                 &mut out,
                 faceted.definitions.len(),
                 totals.definitions,
-                "definitions",
+                ("definition", "definitions"),
             );
         }
 
@@ -1264,7 +1289,7 @@ fn format_search_result(
                 &mut out,
                 faceted.implementations.len(),
                 totals.implementations,
-                "implementations",
+                ("implementation", "implementations"),
             );
         }
 
@@ -1284,7 +1309,12 @@ fn format_search_result(
                     m.text.trim()
                 );
             }
-            write_hidden_tail(&mut out, faceted.tests.len(), totals.tests, "tests");
+            write_hidden_tail(
+                &mut out,
+                faceted.tests.len(),
+                totals.tests,
+                ("test", "tests"),
+            );
         }
 
         if !faceted.usages_local.is_empty() {
@@ -1308,7 +1338,7 @@ fn format_search_result(
                 &mut out,
                 faceted.usages_local.len(),
                 totals.usages_local,
-                "usages",
+                ("usage", "usages"),
             );
         }
 
@@ -1333,7 +1363,7 @@ fn format_search_result(
                 &mut out,
                 faceted.usages_cross.len(),
                 totals.usages_cross,
-                "usages",
+                ("usage", "usages"),
             );
         }
 
@@ -1348,9 +1378,10 @@ fn format_search_result(
             > 0;
         if !facet_totals_present && result.total_found > result.matches.len() {
             let omitted = result.total_found - result.matches.len();
+            let matches = format::noun(omitted, "match", "matches");
             let _ = write!(
                 out,
-                "\n\n... and {omitted} more matches. Narrow with scope."
+                "\n\n... and {omitted} more {matches}. Narrow with scope."
             );
         }
     } else {
@@ -1372,9 +1403,10 @@ fn format_search_result(
         // matches.
         if result.total_found > result.matches.len() {
             let omitted = result.total_found - result.matches.len();
+            let matches = format::noun(omitted, "match", "matches");
             let _ = write!(
                 out,
-                "\n\n... and {omitted} more matches. Narrow with scope."
+                "\n\n... and {omitted} more {matches}. Narrow with scope."
             );
         }
     }
@@ -1407,7 +1439,7 @@ fn format_search_result(
 /// For definitions: use tree-sitter node range (`def_range`).
 /// For usages: ±10 lines around the match.
 fn expand_match(m: &Match, scope: &Path) -> Option<(String, String)> {
-    let content = tilth_core::source::read_source(&m.path).ok()?;
+    let content = tilth_core::source::read_source(&m.path).ok().flatten()?;
     let lines: Vec<&str> = content.lines().collect();
     let total = lines.len() as u32;
 
@@ -1532,9 +1564,12 @@ fn get_outline_str(path: &std::path::Path, cache: &OutlineCache) -> Option<std::
     Some(cache.get_or_compute(path, mtime, || {
         // An unreadable file gets an empty outline, so its matches show no
         // outline context; the matches themselves are reported either way.
-        let content = tilth_core::source::read_source(path).unwrap_or_default();
+        let content = tilth_core::source::read_source(path)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
         let file_type = tilth_core::lang::detect_file_type_with_content(path, &content);
-        read::outline::generate(path, file_type, &content, content.as_bytes(), false)
+        read::outline::generate(path, file_type, &content, false)
     }))
 }
 
@@ -1608,7 +1643,7 @@ fn markdown_enclosing_scope(path: &std::path::Path, match_line: u32) -> Option<S
     if match_line == 0 {
         return None;
     }
-    let content = tilth_core::source::read_source(path).ok()?;
+    let content = tilth_core::source::read_source(path).ok().flatten()?;
     let tree = tilth_core::lang::outline::parse_markdown(&content)?;
     let lines: Vec<&str> = content.lines().collect();
     let mut best: Option<(tree_sitter::Node, u32)> = None;
@@ -1695,10 +1730,11 @@ fn extract_line_range(line: &str) -> Option<(u32, u32)> {
 )]
 fn format_glob_result(result: &glob::GlobResult, scope: &Path) -> Result<String, TilthError> {
     let header = format!(
-        "# Glob: \"{}\" in {} — {} files",
+        "# Glob: \"{}\" in {} — {} {}",
         result.pattern,
         scope.display(),
-        result.files.len()
+        result.files.len(),
+        format::noun(result.files.len(), "file", "files")
     );
 
     let mut out = header;
@@ -1711,14 +1747,19 @@ fn format_glob_result(result: &glob::GlobResult, scope: &Path) -> Result<String,
 
     if result.total_found > result.files.len() {
         let omitted = result.total_found - result.files.len();
-        let _ = write!(out, "\n\n... and {omitted} more files. Narrow with scope.");
+        let files = format::noun(omitted, "file", "files");
+        let _ = write!(
+            out,
+            "\n\n... and {omitted} more {files}. Narrow with scope."
+        );
     }
 
     if result.files.is_empty() && !result.available_extensions.is_empty() {
+        const SHOWN: usize = 10;
         let _ = write!(
             out,
             "\n\nNo matches. Available extensions in scope: {}",
-            result.available_extensions.join(", ")
+            format::capped_list(result.available_extensions.iter(), SHOWN)
         );
     }
 
@@ -1739,12 +1780,38 @@ mod tests {
     #[test]
     fn content_search_glob_restricts_results() {
         let scope = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let all =
-            content::search("TilthError", &scope, false, None, None, false).expect("search failed");
-        let rs_only = content::search("TilthError", &scope, false, None, Some("*.rs"), false)
-            .expect("search with glob failed");
-        let toml_only = content::search("TilthError", &scope, false, None, Some("*.toml"), false)
-            .expect("search with toml glob failed");
+        let all = content::search(
+            "TilthError",
+            Walk::new(&scope, WalkConfig::default()),
+            false,
+            None,
+            false,
+        )
+        .expect("search failed");
+        let rs_only = content::search(
+            "TilthError",
+            Walk {
+                scope: &scope,
+                glob: Some("*.rs"),
+                config: WalkConfig::default(),
+            },
+            false,
+            None,
+            false,
+        )
+        .expect("search with glob failed");
+        let toml_only = content::search(
+            "TilthError",
+            Walk {
+                scope: &scope,
+                glob: Some("*.toml"),
+                config: WalkConfig::default(),
+            },
+            false,
+            None,
+            false,
+        )
+        .expect("search with toml glob failed");
 
         assert!(all.total_found > 0, "unfiltered should find TilthError");
         assert!(rs_only.total_found > 0, "*.rs should find TilthError");
@@ -1765,10 +1832,28 @@ mod tests {
     #[test]
     fn symbol_search_glob_restricts_results() {
         let scope = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let rs_result = symbol::search("walker", &scope, None, Some("*.rs"), false)
-            .expect("symbol search failed");
-        let toml_result = symbol::search("walker", &scope, None, Some("*.toml"), false)
-            .expect("symbol search with toml failed");
+        let rs_result = symbol::search(
+            "walker",
+            Walk {
+                scope: &scope,
+                glob: Some("*.rs"),
+                config: WalkConfig::default(),
+            },
+            None,
+            false,
+        )
+        .expect("symbol search failed");
+        let toml_result = symbol::search(
+            "walker",
+            Walk {
+                scope: &scope,
+                glob: Some("*.toml"),
+                config: WalkConfig::default(),
+            },
+            None,
+            false,
+        )
+        .expect("symbol search with toml failed");
 
         assert!(rs_result.total_found > 0, "*.rs should find 'walker'");
         assert_eq!(
@@ -1791,16 +1876,26 @@ mod tests {
         let bloom = tilth_core::index::bloom::BloomFilterCache::new();
         let single: std::collections::HashSet<String> =
             std::iter::once("walker".to_string()).collect();
-        let rs_callers =
-            tilth_core::find_callers_batch(&single, &scope, &bloom, Some("*.rs"), None, |sites| {
-                sites
-            })
-            .expect("callers failed");
+        let rs_callers = tilth_core::find_callers_batch(
+            &single,
+            Walk {
+                scope: &scope,
+                glob: Some("*.rs"),
+                config: WalkConfig::default(),
+            },
+            &bloom,
+            None,
+            |sites| sites,
+        )
+        .expect("callers failed");
         let toml_callers = tilth_core::find_callers_batch(
             &single,
-            &scope,
+            Walk {
+                scope: &scope,
+                glob: Some("*.toml"),
+                config: WalkConfig::default(),
+            },
             &bloom,
-            Some("*.toml"),
             None,
             |sites| sites,
         )
@@ -1845,9 +1940,8 @@ mod tests {
 
         let result = content::search(
             "unique_symlink_test_symbol",
-            tmp.path(),
+            Walk::new(tmp.path(), WalkConfig::default()),
             false,
-            None,
             None,
             false,
         )
@@ -2111,15 +2205,20 @@ mod tests {
     #[test]
     fn write_hidden_tail_emits_only_when_truncated() {
         let mut out = String::new();
-        write_hidden_tail(&mut out, 3, 3, "definitions");
+        let definitions = ("definition", "definitions");
+        write_hidden_tail(&mut out, 3, 3, definitions);
         assert!(out.is_empty(), "no truncation → no tail line, got {out:?}");
 
         let mut out = String::new();
-        write_hidden_tail(&mut out, 10, 14, "definitions");
+        write_hidden_tail(&mut out, 10, 14, definitions);
         assert_eq!(out, "\n\n... and 4 more definitions. Narrow with scope.");
 
         let mut out = String::new();
-        write_hidden_tail(&mut out, 3, 27, "usages");
+        write_hidden_tail(&mut out, 3, 4, definitions);
+        assert_eq!(out, "\n\n... and 1 more definition. Narrow with scope.");
+
+        let mut out = String::new();
+        write_hidden_tail(&mut out, 3, 27, ("usage", "usages"));
         assert_eq!(out, "\n\n... and 24 more usages. Narrow with scope.");
     }
 
@@ -2499,12 +2598,11 @@ mod tests {
 
         let out = search_symbol_expanded(
             "budget_probe_target",
-            tmp.path(),
+            Walk::new(tmp.path(), WalkConfig::default()),
             &cache,
             &session,
             &bloom,
             2,
-            None,
             None,
             false,
             Some(400),
@@ -2549,12 +2647,11 @@ mod tests {
         let bloom = tilth_core::index::bloom::BloomFilterCache::new();
         let out = search_symbol_expanded(
             "big_target",
-            tmp.path(),
+            Walk::new(tmp.path(), WalkConfig::default()),
             &cache,
             &session,
             &bloom,
             1,
-            None,
             None,
             false,
             Some(300),
@@ -2592,12 +2689,11 @@ mod tests {
 
         let with_none = search_symbol_expanded(
             "budget_probe_target",
-            tmp.path(),
+            Walk::new(tmp.path(), WalkConfig::default()),
             &cache,
             &session,
             &bloom,
             2,
-            None,
             None,
             false,
             None,
@@ -2607,12 +2703,11 @@ mod tests {
         let session2 = Session::new();
         let with_explicit_default = search_symbol_expanded(
             "budget_probe_target",
-            tmp.path(),
+            Walk::new(tmp.path(), WalkConfig::default()),
             &cache,
             &session2,
             &bloom,
             2,
-            None,
             None,
             false,
             Some(crate::budget::DEFAULT_BUDGET),
@@ -2643,11 +2738,10 @@ mod tests {
 
         let out = search_content_expanded(
             "needle_alpha",
-            tmp.path(),
+            Walk::new(tmp.path(), WalkConfig::default()),
             &OutlineCache::new(),
             &Session::new(),
             0,
-            None,
             None,
             false,
             None,
@@ -2685,12 +2779,11 @@ mod tests {
         let bloom = tilth_core::index::bloom::BloomFilterCache::new();
         let single = search_symbol_expanded(
             "alpha_target",
-            tmp.path(),
+            Walk::new(tmp.path(), WalkConfig::default()),
             &cache,
             &session,
             &bloom,
             0,
-            None,
             None,
             false,
             None,
@@ -2713,12 +2806,11 @@ mod tests {
         let session = Session::new();
         let multi = search_multi_symbol_expanded(
             &["alpha_target"],
-            tmp.path(),
+            Walk::new(tmp.path(), WalkConfig::default()),
             &cache,
             &session,
             &bloom,
             0,
-            None,
             None,
             false,
             None,
@@ -2743,9 +2835,27 @@ mod tests {
         .unwrap();
         let cache = OutlineCache::new();
         for out in [
-            search_symbol("bom_func", tmp.path(), &cache, None, false).unwrap(),
-            search_content("bom_func", tmp.path(), &cache, None, false).unwrap(),
-            search_regex("bom_f.nc", tmp.path(), &cache, None, false).unwrap(),
+            search_symbol(
+                "bom_func",
+                Walk::new(tmp.path(), WalkConfig::default()),
+                &cache,
+                false,
+            )
+            .unwrap(),
+            search_content(
+                "bom_func",
+                Walk::new(tmp.path(), WalkConfig::default()),
+                &cache,
+                false,
+            )
+            .unwrap(),
+            search_regex(
+                "bom_f.nc",
+                Walk::new(tmp.path(), WalkConfig::default()),
+                &cache,
+                false,
+            )
+            .unwrap(),
         ] {
             assert!(out.contains("bom_func"), "{out}");
             assert!(!out.contains('\u{feff}'), "stray BOM in: {out}");
@@ -2772,15 +2882,33 @@ mod tests {
         for (query, out) in [
             (
                 "needle_target_fn",
-                search_symbol("needle_target_fn", tmp.path(), &cache, None, false).unwrap(),
+                search_symbol(
+                    "needle_target_fn",
+                    Walk::new(tmp.path(), WalkConfig::default()),
+                    &cache,
+                    false,
+                )
+                .unwrap(),
             ),
             (
                 "needle_target_fn",
-                search_content("needle_target_fn", tmp.path(), &cache, None, false).unwrap(),
+                search_content(
+                    "needle_target_fn",
+                    Walk::new(tmp.path(), WalkConfig::default()),
+                    &cache,
+                    false,
+                )
+                .unwrap(),
             ),
             (
                 "needle_t.rget_fn",
-                search_regex("needle_t.rget_fn", tmp.path(), &cache, None, false).unwrap(),
+                search_regex(
+                    "needle_t.rget_fn",
+                    Walk::new(tmp.path(), WalkConfig::default()),
+                    &cache,
+                    false,
+                )
+                .unwrap(),
             ),
         ] {
             let note =
@@ -2788,7 +2916,13 @@ mod tests {
             assert!(out.contains(&note), "the skipped file must be named: {out}");
             assert!(!out.contains("other_big.rs"), "{out}");
         }
-        let quiet = search_symbol("unrelated", tmp.path(), &cache, None, false).unwrap();
+        let quiet = search_symbol(
+            "unrelated",
+            Walk::new(tmp.path(), WalkConfig::default()),
+            &cache,
+            false,
+        )
+        .unwrap();
         assert!(!quiet.contains("not searched"), "{quiet}");
     }
 
@@ -2806,8 +2940,20 @@ mod tests {
         std::fs::write(tmp.path().join("data.db"), bytes).unwrap();
         let cache = OutlineCache::new();
         for out in [
-            search_symbol("needle_target_fn", tmp.path(), &cache, None, false).unwrap(),
-            search_content("needle_target_fn", tmp.path(), &cache, None, false).unwrap(),
+            search_symbol(
+                "needle_target_fn",
+                Walk::new(tmp.path(), WalkConfig::default()),
+                &cache,
+                false,
+            )
+            .unwrap(),
+            search_content(
+                "needle_target_fn",
+                Walk::new(tmp.path(), WalkConfig::default()),
+                &cache,
+                false,
+            )
+            .unwrap(),
         ] {
             assert!(!out.contains("not searched"), "{out}");
         }
@@ -2824,9 +2970,27 @@ mod tests {
         std::fs::write(tmp.path().join("bundle.js"), bytes).unwrap();
         let cache = OutlineCache::new();
         for out in [
-            search_symbol("needle_target_fn", tmp.path(), &cache, None, false).unwrap(),
-            search_content("needle_target_fn", tmp.path(), &cache, None, false).unwrap(),
-            search_regex("needle_t.rget_fn", tmp.path(), &cache, None, false).unwrap(),
+            search_symbol(
+                "needle_target_fn",
+                Walk::new(tmp.path(), WalkConfig::default()),
+                &cache,
+                false,
+            )
+            .unwrap(),
+            search_content(
+                "needle_target_fn",
+                Walk::new(tmp.path(), WalkConfig::default()),
+                &cache,
+                false,
+            )
+            .unwrap(),
+            search_regex(
+                "needle_t.rget_fn",
+                Walk::new(tmp.path(), WalkConfig::default()),
+                &cache,
+                false,
+            )
+            .unwrap(),
         ] {
             assert!(out.contains("not searched: bundle.js"), "{out}");
         }
@@ -2848,8 +3012,20 @@ mod tests {
         .unwrap();
         let cache = OutlineCache::new();
         for out in [
-            search_symbol("needle_target_fn", tmp.path(), &cache, None, false).unwrap(),
-            search_content("needle_target_fn", tmp.path(), &cache, None, false).unwrap(),
+            search_symbol(
+                "needle_target_fn",
+                Walk::new(tmp.path(), WalkConfig::default()),
+                &cache,
+                false,
+            )
+            .unwrap(),
+            search_content(
+                "needle_target_fn",
+                Walk::new(tmp.path(), WalkConfig::default()),
+                &cache,
+                false,
+            )
+            .unwrap(),
         ] {
             assert!(out.contains("not searched: app.log"), "{out}");
         }
@@ -2878,26 +3054,37 @@ mod tests {
 
         let callers = callers::search_callers_expanded(
             "big_callee",
-            tmp.path(),
+            Walk::new(tmp.path(), WalkConfig::default()),
             &bloom,
             0,
-            None,
             None,
             false,
         )
         .unwrap();
         let multi = callers::search_callers_multi_expanded(
             &["big_callee", "small_caller"],
-            tmp.path(),
+            Walk::new(tmp.path(), WalkConfig::default()),
             &bloom,
             0,
-            None,
             None,
             false,
         )
         .unwrap();
-        let grok = crate::run_grok("big_callee", tmp.path(), false).unwrap();
-        let deps = crate::run_deps(&tmp.path().join("lib.rs"), tmp.path(), None, false).unwrap();
+        let grok = crate::run_grok(
+            "big_callee",
+            tmp.path(),
+            false,
+            &crate::config::Config::default(),
+        )
+        .unwrap();
+        let deps = crate::run_deps(
+            &tmp.path().join("lib.rs"),
+            tmp.path(),
+            None,
+            false,
+            WalkConfig::default(),
+        )
+        .unwrap();
         for (held, out) in [
             ("`big_callee`", callers),
             ("`big_callee` or `small_caller`", multi),
@@ -2945,8 +3132,7 @@ mod tests {
         let content = std::fs::read_to_string(&path).unwrap();
         let file_type = tilth_core::lang::detect_file_type_with_content(&path, &content);
         assert_eq!(file_type, FileType::Code(tilth_core::types::Lang::Cpp));
-        let expected =
-            read::outline::generate(&path, file_type, &content, content.as_bytes(), false);
+        let expected = read::outline::generate(&path, file_type, &content, false);
         let cache = OutlineCache::new();
         assert_eq!(
             get_outline_str(&path, &cache).as_deref(),
@@ -2978,12 +3164,24 @@ mod tests {
         .unwrap();
         let cache = OutlineCache::new();
 
-        let out = search_symbol("B::run", tmp.path(), &cache, None, false).unwrap();
+        let out = search_symbol(
+            "B::run",
+            Walk::new(tmp.path(), WalkConfig::default()),
+            &cache,
+            false,
+        )
+        .unwrap();
         assert!(out.contains("not searched: big.rs"), "{out}");
         assert!(out.contains("contains `run` and was"), "{out}");
         assert!(out.contains("No `run` is defined in `B`"), "{out}");
 
-        let out = search_symbol("res.send", tmp.path(), &cache, None, false).unwrap();
+        let out = search_symbol(
+            "res.send",
+            Walk::new(tmp.path(), WalkConfig::default()),
+            &cache,
+            false,
+        )
+        .unwrap();
         assert!(out.contains("response.js:3"), "{out}");
         assert!(!out.contains("is defined in"), "{out}");
 
@@ -2991,15 +3189,275 @@ mod tests {
         let bloom = tilth_core::index::bloom::BloomFilterCache::new();
         let out = callers::search_callers_multi_expanded(
             &["A.run", "start", "B::run"],
-            tmp.path(),
+            Walk::new(tmp.path(), WalkConfig::default()),
             &bloom,
             0,
-            None,
             None,
             false,
         )
         .unwrap();
         assert!(out.contains("not searched: big.rs"), "{out}");
         assert!(out.contains("contains `run` or `start` and was"), "{out}");
+    }
+
+    /// The footer block under `heading` in `out`, up to the next blank line.
+    fn footer_block<'a>(out: &'a str, heading: &str) -> &'a str {
+        let start = out
+            .find(heading)
+            .unwrap_or_else(|| panic!("no {heading} block: {out}"));
+        let block = &out[start..];
+        block.find("\n\n").map_or(block, |end| &block[..end])
+    }
+
+    /// An expanded `target` whose body calls `free` free functions and
+    /// `methods` methods of its own type through `self`.
+    fn expand_target(free: usize, methods: usize) -> String {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut src = String::new();
+        for i in 0..free {
+            let _ = writeln!(src, "fn f{i}() {{}}");
+        }
+        src.push_str("struct S;\nimpl S {\n");
+        for i in 0..methods {
+            let _ = writeln!(src, "    fn m{i}(&self) {{}}");
+        }
+        src.push_str("    fn target(&self) {\n");
+        for i in 0..free {
+            let _ = writeln!(src, "        f{i}();");
+        }
+        for i in 0..methods {
+            let _ = writeln!(src, "        self.m{i}();");
+        }
+        src.push_str("    }\n}\n");
+        std::fs::write(tmp.path().join("lib.rs"), src).unwrap();
+        let bloom = tilth_core::index::bloom::BloomFilterCache::new();
+        search_symbol_expanded(
+            "target",
+            Walk::new(tmp.path(), WalkConfig::default()),
+            &OutlineCache::new(),
+            &Session::new(),
+            &bloom,
+            1,
+            None,
+            false,
+            None,
+        )
+        .unwrap()
+    }
+
+    /// The `-- calls --` footer stopped at eight callees and said nothing
+    /// of the rest (#330).
+    #[test]
+    fn the_calls_footer_counts_the_callees_it_leaves_out() {
+        let out = expand_target(CALLS_SHOWN + 1, 0);
+        let calls = footer_block(&out, "-- calls --");
+        assert_eq!(calls.lines().count(), 1 + CALLS_SHOWN + 1, "{calls}");
+        assert!(calls.ends_with("\n  ... and 1 more"), "{calls}");
+
+        let out = expand_target(CALLS_SHOWN, 0);
+        let calls = footer_block(&out, "-- calls --");
+        assert_eq!(calls.lines().count(), 1 + CALLS_SHOWN, "{calls}");
+        assert!(!calls.contains("more"), "{calls}");
+    }
+
+    /// An expanded `target` that calls one function per entry of `hubs`,
+    /// each of which calls as many leaf functions as its entry says.
+    fn expand_hubs(hubs: &[usize]) -> String {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut src = String::new();
+        for (h, &leaves) in hubs.iter().enumerate() {
+            let _ = writeln!(src, "fn hub{h}() {{");
+            for l in 0..leaves {
+                let _ = writeln!(src, "    leaf{h}_{l}();");
+            }
+            src.push_str("}\n");
+            for l in 0..leaves {
+                let _ = writeln!(src, "fn leaf{h}_{l}() {{}}");
+            }
+        }
+        src.push_str("fn target() {\n");
+        for h in 0..hubs.len() {
+            let _ = writeln!(src, "    hub{h}();");
+        }
+        src.push_str("}\n");
+        std::fs::write(tmp.path().join("lib.rs"), src).unwrap();
+        let bloom = tilth_core::index::bloom::BloomFilterCache::new();
+        search_symbol_expanded(
+            "target",
+            Walk::new(tmp.path(), WalkConfig::default()),
+            &OutlineCache::new(),
+            &Session::new(),
+            &bloom,
+            1,
+            None,
+            false,
+            None,
+        )
+        .unwrap()
+    }
+
+    /// The second-hop `->` lines share one budget, and a callee it cut
+    /// lost its calls without a word (#343).
+    #[test]
+    fn the_calls_footer_counts_the_second_hop_calls_it_leaves_out() {
+        let out = expand_hubs(&[CHILDREN_SHOWN + 1]);
+        let calls = footer_block(&out, "-- calls --");
+        assert_eq!(calls.lines().count(), 2 + CHILDREN_SHOWN + 1, "{calls}");
+        assert!(calls.ends_with("\n    ... and 1 more"), "{calls}");
+
+        let out = expand_hubs(&[CHILDREN_SHOWN]);
+        let calls = footer_block(&out, "-- calls --");
+        assert_eq!(calls.lines().count(), 2 + CHILDREN_SHOWN, "{calls}");
+        assert!(!calls.contains("more"), "{calls}");
+
+        // The budget runs out at the first hub, and the second still counts
+        // the calls it no longer shows.
+        let out = expand_hubs(&[CHILDREN_SHOWN, 2]);
+        let calls = footer_block(&out, "-- calls --");
+        assert!(
+            calls.ends_with("\n  hub1  lib.rs:33-36  fn hub1()\n    ... and 2 more"),
+            "{calls}"
+        );
+    }
+
+    /// A callee the footer hides spent the second-hop budget, so the
+    /// callees it shows had none left (#343). Here `target` calls a local
+    /// `hub` with a full budget's worth of calls and `CALLS_SHOWN` imported
+    /// functions, which the footer lists first and so leaves `hub` out.
+    #[test]
+    fn the_second_hop_budget_goes_to_the_callees_the_footer_shows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut b = String::new();
+        for i in 0..CALLS_SHOWN {
+            let _ = writeln!(b, "def f{i}():\n    g{i}()\n\ndef g{i}():\n    pass\n");
+        }
+        std::fs::write(tmp.path().join("b.py"), b).unwrap();
+        let imported: Vec<String> = (0..CALLS_SHOWN).map(|i| format!("f{i}")).collect();
+        let mut a = format!("from b import {}\n\ndef hub():\n", imported.join(", "));
+        for l in 0..CHILDREN_SHOWN {
+            let _ = writeln!(a, "    leaf{l}()");
+        }
+        for l in 0..CHILDREN_SHOWN {
+            let _ = writeln!(a, "\ndef leaf{l}():\n    pass");
+        }
+        a.push_str("\ndef target():\n    hub()\n");
+        for f in &imported {
+            let _ = writeln!(a, "    {f}()");
+        }
+        std::fs::write(tmp.path().join("a.py"), a).unwrap();
+        let bloom = tilth_core::index::bloom::BloomFilterCache::new();
+        let out = search_symbol_expanded(
+            "target",
+            Walk::new(tmp.path(), WalkConfig::default()),
+            &OutlineCache::new(),
+            &Session::new(),
+            &bloom,
+            1,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        let calls = footer_block(&out, "-- calls --");
+        for i in 0..CALLS_SHOWN {
+            assert!(calls.contains(&format!("\n    -> g{i}  b.py:")), "{calls}");
+        }
+        assert!(calls.ends_with("\n  ... and 1 more"), "{calls}");
+    }
+
+    /// The `-- siblings --` footer stopped at six and said nothing of the
+    /// rest (#330).
+    #[test]
+    fn the_siblings_footer_counts_the_siblings_it_leaves_out() {
+        let out = expand_target(0, SIBLINGS_SHOWN + 1);
+        let siblings = footer_block(&out, "-- siblings --");
+        assert_eq!(
+            siblings.lines().count(),
+            1 + SIBLINGS_SHOWN + 1,
+            "{siblings}"
+        );
+        assert!(siblings.ends_with("\n  ... and 1 more"), "{siblings}");
+
+        let out = expand_target(0, SIBLINGS_SHOWN);
+        let siblings = footer_block(&out, "-- siblings --");
+        assert_eq!(siblings.lines().count(), 1 + SIBLINGS_SHOWN, "{siblings}");
+        assert!(!siblings.contains("more"), "{siblings}");
+    }
+
+    /// A glob that matched nothing named the first ten extensions in scope
+    /// and said nothing of the rest (#330).
+    #[test]
+    fn a_glob_with_no_match_counts_the_extensions_it_leaves_out() {
+        let names = |n: usize| (0..n).map(|i| format!("e{i:02}")).collect::<Vec<_>>();
+        for (count, tail) in [(11, ", and 1 more"), (10, "")] {
+            let tmp = tempfile::tempdir().unwrap();
+            for ext in names(count) {
+                std::fs::write(tmp.path().join(format!("a.{ext}")), "x\n").unwrap();
+            }
+            let out = search_glob("*.nomatch", tmp.path(), WalkConfig::default()).unwrap();
+            let shown = names(10).join(", ");
+            assert!(
+                out.ends_with(&format!("Available extensions in scope: {shown}{tail}")),
+                "{out}"
+            );
+        }
+    }
+
+    /// The "File overview" a search adds for a file named after the query
+    /// came from a walk of its own, which saw files the search walk hides:
+    /// `SKIP_DIRS`, `.tilthignore`, and gitignore whichever way the call set
+    /// it (#347). It must visit what the search walk visits.
+    #[test]
+    fn basename_overview_visits_only_what_the_search_walk_visits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir(root.join(".git")).unwrap();
+        for dir in ["node_modules/pkg", "tilthignored", "gitignored", "src"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        std::fs::write(root.join(".tilthignore"), "tilthignored/\n").unwrap();
+        std::fs::write(root.join(".gitignore"), "gitignored/\n").unwrap();
+        // Each file is named after its query and holds no match for it, so
+        // only the fallback walk can find it.
+        for file in [
+            "node_modules/pkg/skipped.rs",
+            "tilthignored/tilthhidden.rs",
+            "gitignored/githidden.rs",
+            "src/visible.rs",
+        ] {
+            std::fs::write(root.join(file), "fn other() {}\n").unwrap();
+        }
+
+        let gitignore = |respect_gitignore| WalkConfig {
+            respect_gitignore,
+            ..WalkConfig::default()
+        };
+        let cases = [
+            ("visible", None, gitignore(false), Some("src/visible.rs")),
+            ("skipped", None, gitignore(false), None),
+            ("tilthhidden", None, gitignore(false), None),
+            ("githidden", None, gitignore(true), None),
+            (
+                "githidden",
+                None,
+                gitignore(false),
+                Some("gitignored/githidden.rs"),
+            ),
+            ("visible", Some("*.py"), gitignore(false), None),
+        ];
+        let cache = OutlineCache::new();
+        for (query, glob, config, want) in cases {
+            let walk = Walk {
+                scope: root,
+                glob,
+                config,
+            };
+            let out = search_symbol(query, walk, &cache, false).unwrap();
+            let shown = out
+                .lines()
+                .find_map(|line| line.strip_prefix("## File overview: "))
+                .and_then(|rest| rest.split(" (").next());
+            assert_eq!(shown, want, "{query:?} with {walk:?}: {out}");
+        }
     }
 }

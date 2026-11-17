@@ -4,19 +4,22 @@
 //! pairs, and renders them as a single tree rooted at scope.
 
 use std::fmt::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
+use tilth_core::search::walk::WalkConfig;
 
 use super::{apply_budget, resolve_scope};
 
-pub(in crate::mcp) fn tool_list(args: &Value) -> Result<String, String> {
+pub(in crate::mcp) fn tool_list(
+    args: &Value,
+    walk: WalkConfig,
+    server_root: Option<&Path>,
+) -> Result<String, String> {
     use globset::Glob;
-    let root = args
-        .get("root")
-        .and_then(|v| v.as_str())
-        .map(std::path::Path::new);
-    let (scope, scope_warning) = resolve_scope(args, root, crate::FileScopeHint::Directory)?;
+    let root = args.get("root").and_then(|v| v.as_str()).map(Path::new);
+    let (scope, scope_warning) =
+        resolve_scope(args, root, server_root, crate::FileScopeHint::Directory)?;
     let budget = args.get("budget").and_then(serde_json::Value::as_u64);
 
     let patterns_arr = args
@@ -59,7 +62,7 @@ pub(in crate::mcp) fn tool_list(args: &Value) -> Result<String, String> {
     // by `depth` (ignore's max_depth: root=0, direct children=1 — matches
     // rel.components().count() for a top-level file, so depth:1 keeps it),
     // and collect every file matching any pattern into one token-rolled-up tree.
-    let mut builder = tilth_core::search::walk::base_walk_builder(&scope);
+    let mut builder = tilth_core::search::walk::base_walk_builder(&scope, walk);
     if let Some(d) = depth {
         builder.max_depth(Some(d));
     }
@@ -93,11 +96,11 @@ pub(in crate::mcp) fn tool_list(args: &Value) -> Result<String, String> {
         if extensions.is_empty() {
             result.push_str("\nno matches\n");
         } else {
-            let exts: Vec<String> = extensions.into_iter().take(10).collect();
+            const SHOWN: usize = 10;
             let _ = write!(
                 result,
                 "\nno matches; found extensions: {}\n",
-                exts.join(", ")
+                crate::format::capped_list(extensions.iter(), SHOWN)
             );
         }
     }
@@ -127,7 +130,7 @@ mod tests {
             "patterns": ["*.rs"],
             "scope": project.path().to_str().unwrap(),
         });
-        let out = tool_list(&args).expect("tool_list should succeed");
+        let out = tool_list(&args, WalkConfig::default(), None).expect("tool_list should succeed");
         // Tree groups the src/ directory and its two .rs leaves.
         assert!(out.contains("src/"), "expected src/ dir node: {out}");
         assert!(out.contains("main.rs"), "expected main.rs leaf: {out}");
@@ -144,14 +147,16 @@ mod tests {
     #[test]
     fn tool_list_empty_patterns_errors() {
         let args = serde_json::json!({ "patterns": [], "scope": env!("CARGO_MANIFEST_DIR") });
-        let err = tool_list(&args).expect_err("expected empty-patterns error");
+        let err = tool_list(&args, WalkConfig::default(), None)
+            .expect_err("expected empty-patterns error");
         assert!(err.contains("at least one"), "unexpected error: {err}");
     }
 
     #[test]
     fn tool_list_missing_patterns_errors() {
         let args = serde_json::json!({ "scope": env!("CARGO_MANIFEST_DIR") });
-        let err = tool_list(&args).expect_err("expected missing-patterns error");
+        let err = tool_list(&args, WalkConfig::default(), None)
+            .expect_err("expected missing-patterns error");
         assert!(
             err.contains("missing required parameter"),
             "unexpected error: {err}"
@@ -163,7 +168,7 @@ mod tests {
         let twenty_one: Vec<&str> = vec!["*.rs"; 21];
         let args =
             serde_json::json!({ "patterns": twenty_one, "scope": env!("CARGO_MANIFEST_DIR") });
-        let err = tool_list(&args).expect_err("expected cap error");
+        let err = tool_list(&args, WalkConfig::default(), None).expect_err("expected cap error");
         assert!(err.contains("limited to 20"), "unexpected error: {err}");
     }
 
@@ -176,7 +181,7 @@ mod tests {
             "depth": 1,
             "scope": project.path().to_str().unwrap(),
         });
-        let out = tool_list(&args).expect("tool_list should succeed");
+        let out = tool_list(&args, WalkConfig::default(), None).expect("tool_list should succeed");
         assert!(out.contains("Cargo.toml"), "top-level toml kept: {out}");
     }
 
@@ -191,7 +196,8 @@ mod tests {
             "scope": "sub",
             "root": tmp.path().to_str().unwrap(),
         });
-        let out = tool_list(&args).expect("relative scope + absolute root resolves");
+        let out = tool_list(&args, WalkConfig::default(), None)
+            .expect("relative scope + absolute root resolves");
         assert!(
             out.contains("a.rs"),
             "expected listing under anchored root: {out}"
@@ -201,7 +207,8 @@ mod tests {
     #[test]
     fn tool_list_explicit_relative_scope_no_root_errors() {
         let args = serde_json::json!({ "patterns": ["*.rs"], "scope": "some/relative/dir" });
-        let err = tool_list(&args).expect_err("explicit relative scope must refuse without root");
+        let err = tool_list(&args, WalkConfig::default(), None)
+            .expect_err("explicit relative scope must refuse without root");
         assert!(
             err.contains("relative scope") && err.contains("root"),
             "explicit relative scope without root must refuse: {err}"
@@ -217,7 +224,8 @@ mod tests {
             "scope": "src/main.rs",
             "root": project.path().to_str().unwrap(),
         });
-        let err = tool_list(&args).expect_err("a file scope must be refused, not widened to root");
+        let err = tool_list(&args, WalkConfig::default(), None)
+            .expect_err("a file scope must be refused, not widened to root");
         assert!(
             err.contains("scope \"src/main.rs\" is a file")
                 && err.contains("scope to its directory (\"src\")"),
@@ -237,7 +245,7 @@ mod tests {
             "scope": project.path().to_str().unwrap(),
             "budget": 1,
         });
-        let out = tool_list(&args).expect("tool_list should succeed");
+        let out = tool_list(&args, WalkConfig::default(), None).expect("tool_list should succeed");
         assert!(
             out.contains("truncated ("),
             "expected truncation note: {out}"
@@ -251,10 +259,34 @@ mod tests {
             "patterns": ["*.md"],
             "scope": project.path().to_str().unwrap(),
         });
-        let out = tool_list(&args).expect("tool_list should succeed");
+        let out = tool_list(&args, WalkConfig::default(), None).expect("tool_list should succeed");
         assert!(
             out.contains("no matches; found extensions:") && out.contains("rs"),
             "expected no-match extension hint: {out}"
         );
+    }
+
+    /// A list that matched nothing named the first ten extensions in scope
+    /// and said nothing of the rest (#330).
+    #[test]
+    fn tool_list_no_match_counts_the_extensions_it_leaves_out() {
+        let names = |n: usize| (0..n).map(|i| format!("e{i:02}")).collect::<Vec<_>>();
+        for (count, tail) in [(11, ", and 1 more"), (10, "")] {
+            let project = tempfile::tempdir().unwrap();
+            for ext in names(count) {
+                std::fs::write(project.path().join(format!("a.{ext}")), "x\n").unwrap();
+            }
+            let args = serde_json::json!({
+                "patterns": ["*.nomatch"],
+                "scope": project.path().to_str().unwrap(),
+            });
+            let out =
+                tool_list(&args, WalkConfig::default(), None).expect("tool_list should succeed");
+            let shown = names(10).join(", ");
+            assert!(
+                out.ends_with(&format!("no matches; found extensions: {shown}{tail}\n")),
+                "{out}"
+            );
+        }
     }
 }
