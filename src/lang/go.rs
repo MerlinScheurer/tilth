@@ -78,6 +78,8 @@ pub(crate) const SPEC: LangSpec = LangSpec {
     has_lifetimes: false,
     strip_family: Some(StripFamily::Go),
     extract_receiver: Some(extract_go_receiver_name),
+    callee_filter: None,
+    test_site: None,
     definitions: DEFAULT_DEFS,
 };
 
@@ -103,7 +105,7 @@ pub(crate) fn extract_go_receiver_name(
         let mut matches = cursor.matches(query, tree.root_node(), bytes);
 
         if let Some(m) = matches.next() {
-            for cap in m.captures {
+            for cap in m.captures() {
                 if cap.index == recv_idx {
                     return cap.node.utf8_text(bytes).ok().map(String::from);
                 }

@@ -1,10 +1,11 @@
 [package]
 name = "tilth"
-version = "0.10.1"
+version = "0.11.0"
 edition = "2021"
-description = "Tree-sitter indexed lookups — smart code reading for AI agents"
+description = "Smart code reading for AI agents. Definitions, callers, deps and function-level diffs from tree-sitter."
 license = "MIT"
 repository = "https://github.com/jahala/tilth"
+homepage = "https://jahala.github.io/tilth/"
 readme = "README.md"
 keywords = ["mcp", "code-search", "tree-sitter", "developer-tools"]
 categories = ["command-line-utilities", "development-tools"]
@@ -19,7 +20,7 @@ clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 
 # Tree-sitter (AST outlines)
-tree-sitter = "0.26"
+tree-sitter = "0.27"
 tree-sitter-language = "0.1"
 streaming-iterator = "0.1"
 tree-sitter-rust = "0.24"
@@ -108,7 +109,7 @@ overflow-checks = false
 [profile.release.build-override]
 opt-level = 2
 
-# Optimized but fast to compile — for benchmarking during development
+# Optimized but fast to compile, for timing runs during development
 [profile.fast]
 inherits = "release"
 lto = "thin"

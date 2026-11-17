@@ -28,7 +28,7 @@ jobs:
       matrix:
         target: [outline, strip, diff_parse]
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # ratchet:actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # ratchet:actions/checkout@v6
 
       - name: Install nightly Rust
         run: rustup toolchain install nightly --profile minimal --component rust-src
@@ -51,7 +51,7 @@ jobs:
 
       - name: Upload findings on failure
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # ratchet:actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # ratchet:actions/upload-artifact@v7
         with:
           name: fuzz-${{ matrix.target }}-findings
           path: |
@@ -61,7 +61,7 @@ jobs:
 
       - name: Upload corpus
         if: success()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # ratchet:actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # ratchet:actions/upload-artifact@v7
         with:
           name: fuzz-${{ matrix.target }}-corpus
           path: fuzz/corpus/${{ matrix.target }}/

@@ -48,6 +48,8 @@ pub(crate) const SPEC: LangSpec = LangSpec {
     has_lifetimes: false,
     strip_family: None,
     extract_receiver: None,
+    callee_filter: None,
+    test_site: None,
     definitions: DefinitionOps {
         extract_name: extract_elixir_definition_name,
         weight: elixir_definition_weight,
