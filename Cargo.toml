@@ -12,7 +12,7 @@
 [package]
 edition = "2021"
 name = "tilth"
-version = "0.8.1"
+version = "0.8.2"
 build = false
 autolib = false
 autobins = false
@@ -49,8 +49,14 @@ features = ["derive"]
 [dependencies.clap_complete]
 version = "4"
 
+[dependencies.crossbeam-channel]
+version = "0.5"
+
 [dependencies.dashmap]
 version = "6"
+
+[dependencies.fastbloom]
+version = "0.17"
 
 [dependencies.globset]
 version = "0.4"
