@@ -2,10 +2,11 @@ use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
+use crate::format::fmt_tokens;
 use crate::read::outline;
 use crate::types::estimate_tokens;
 use tilth_core::cache::OutlineCache;
-use tilth_core::lang::detect_file_type;
+use tilth_core::lang::{detect_file_type, detect_file_type_with_content};
 use tilth_core::search::walk::base_walk_builder;
 use tilth_core::types::FileType;
 
@@ -32,7 +33,7 @@ pub fn generate(scope: &Path, depth: usize, budget: Option<u64>, cache: &Outline
             continue;
         }
 
-        let parent = rel.parent().unwrap_or(Path::new("")).to_path_buf();
+        let parent = rel.parent().map_or_else(PathBuf::new, Path::to_path_buf);
         let name = rel
             .file_name()
             .and_then(|n| n.to_str())
@@ -53,8 +54,9 @@ pub fn generate(scope: &Path, depth: usize, budget: Option<u64>, cache: &Outline
                 let outline_str = cache.get_or_compute(path, mtime, || {
                     // Best-effort: an unreadable file contributes no outline symbols rather than
                     // aborting the map. Errors are intentionally swallowed here.
-                    let content = std::fs::read_to_string(path).unwrap_or_default();
+                    let content = tilth_core::source::read_source(path).unwrap_or_default();
                     let buf = content.as_bytes();
+                    let file_type = detect_file_type_with_content(path, &content);
                     outline::generate(path, file_type, &content, buf, true)
                 });
 
@@ -115,24 +117,6 @@ fn compute_dir_totals(tree: &BTreeMap<PathBuf, Vec<FileEntry>>) -> BTreeMap<Path
     totals
 }
 
-/// Compact human token count for directory rollups.
-/// Uses the same scale as `tilth_list` output (`12.3k`, `1.2M`).
-///
-/// The k→M switchover triggers at `999_950` rather than `1_000_000` so values
-/// that would round to `"1000.0k"` under `{:.1}` formatting roll cleanly into
-/// the M tier (`"1.0M"`) instead of producing four-digit k labels.
-fn fmt_tokens(n: u64) -> String {
-    #[allow(clippy::cast_precision_loss)] // display-only; mantissa loss is fine for summaries
-    let f = n as f64;
-    if f >= 999_950.0 {
-        format!("{:.1}M", f / 1_000_000.0)
-    } else if n >= 1_000 {
-        format!("{:.1}k", f / 1_000.0)
-    } else {
-        n.to_string()
-    }
-}
-
 struct FileEntry {
     name: String,
     symbols: Option<Vec<String>>,
@@ -145,7 +129,9 @@ struct FileEntry {
 fn extract_symbol_names(outline: &str) -> Vec<String> {
     let mut names = Vec::new();
     for line in outline.lines() {
-        let trimmed = line.trim();
+        // The doc comment after `  // ` is prose: a kind word in it
+        // (`a trait that ...`) is no symbol.
+        let trimmed = line.split("  // ").next().unwrap_or(line).trim();
         // Skip import lines and empty lines
         if trimmed.starts_with('[') {
             // Find the symbol name after kind keywords
@@ -253,6 +239,14 @@ mod tests {
         }
     }
 
+    /// A doc that names a kind (`fn`, `struct`) put a word of the doc in
+    /// the map in place of the symbol.
+    #[test]
+    fn a_doc_naming_a_kind_is_not_read_as_the_symbol() {
+        let outline = "[71-151]     trait Flag  // A flag, as a struct or fn that parses\n[1-2]        fn plain";
+        assert_eq!(extract_symbol_names(outline), ["Flag", "plain"]);
+    }
+
     #[test]
     fn rollup_sums_descendants_into_each_ancestor() {
         // Layout:
@@ -282,29 +276,6 @@ mod tests {
         tree.insert(PathBuf::from("empty"), vec![]);
         let totals = compute_dir_totals(&tree);
         assert_eq!(totals.get(&PathBuf::from("empty")).copied(), Some(0));
-    }
-
-    #[test]
-    fn fmt_tokens_thresholds() {
-        assert_eq!(fmt_tokens(0), "0");
-        assert_eq!(fmt_tokens(999), "999");
-        assert_eq!(fmt_tokens(1_000), "1.0k");
-        assert_eq!(fmt_tokens(12_345), "12.3k");
-        assert_eq!(fmt_tokens(1_000_000), "1.0M");
-        assert_eq!(fmt_tokens(2_500_000), "2.5M");
-    }
-
-    /// Boundary: values that would round to "1000.0k" under `{:.1}`
-    /// formatting must roll over to the M tier instead of producing a
-    /// four-digit k label.
-    #[test]
-    fn fmt_tokens_rolls_over_at_999_950() {
-        // Just below the rollover boundary — still formats as k.
-        assert_eq!(fmt_tokens(999_949), "999.9k");
-        // At and above the boundary — formats as M, not "1000.0k".
-        assert_eq!(fmt_tokens(999_950), "1.0M");
-        assert_eq!(fmt_tokens(999_999), "1.0M");
-        assert_eq!(fmt_tokens(1_499_999), "1.5M");
     }
 
     #[test]

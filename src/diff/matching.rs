@@ -2,24 +2,45 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::ops::Range;
 
-use tilth_core::lang::outline::outline_language;
+use tilth_core::lang::outline::{outline_language, walk_top_level};
 use tilth_core::types::{Lang, OutlineEntry, OutlineKind};
 
-use super::{ChangeType, DiffSymbol, MatchConfidence, SymbolChange, SymbolIdentity};
+use super::{ChangeType, DiffSymbol, MatchConfidence, Span, SymbolChange, SymbolIdentity};
 
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Build `DiffSymbol` entries from an outline and its source content.
-pub(crate) fn build_diff_symbols(
-    entries: &[OutlineEntry],
-    content: &str,
-    lang: Lang,
-) -> Vec<DiffSymbol> {
+/// Build the `DiffSymbol` entries of one side of a diff from its content,
+/// parsed once: the outline and the declaration headers come from the same
+/// tree.
+///
+/// A function's signature is read from its syntax tree: the whole header
+/// before the body, however many lines it spans, keyed by its tokens. The
+/// outline's signature is display text, so keying on it would flag a
+/// header that was only re-wrapped or had a comment added. A Rust trait impl
+/// is named by its trait too (`impl From<A> for Foo`), so the impls of two
+/// traits for one type, and their methods, stay apart.
+pub(crate) fn build_diff_symbols(content: &str, lang: Lang) -> Vec<DiffSymbol> {
+    let Some(language) = outline_language(lang) else {
+        return Vec::new();
+    };
+    let mut parser = tree_sitter::Parser::new();
+    if parser.set_language(&language).is_err() {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(content, None) else {
+        return Vec::new();
+    };
     let lines: Vec<&str> = content.lines().collect();
+    let mut entries = walk_top_level(tree.root_node(), &lines, lang);
+    let nodes = DeclarationNodes::of(tree.root_node());
+    if lang == Lang::Rust {
+        name_trait_impls(&mut entries, &nodes, content.as_bytes());
+    }
     let mut out = Vec::new();
-    build_symbols_recursive(entries, &lines, lang, "", &mut out);
+    build_symbols_recursive(&entries, &lines, lang, &Parent::default(), &mut out);
+    apply_headers(&mut out, &nodes, content.as_bytes());
     out
 }
 
@@ -68,10 +89,45 @@ fn pair_overloads(
     pairs
 }
 
+/// The symbols a change is about: a matched pair, or one side alone.
+#[derive(Clone, Copy)]
+enum Sides<'a> {
+    Both(&'a DiffSymbol, &'a DiffSymbol),
+    Old(&'a DiffSymbol),
+    New(&'a DiffSymbol),
+}
+
+/// A change between an old and a new symbol, either of which may be absent.
+fn change_of(
+    sides: Sides<'_>,
+    change: ChangeType,
+    match_confidence: MatchConfidence,
+) -> SymbolChange {
+    let (old, new, named) = match sides {
+        Sides::Both(old, new) => (Some(old), Some(new), new),
+        Sides::Old(old) => (Some(old), None, old),
+        Sides::New(new) => (None, Some(new), new),
+    };
+    let span = |s: &DiffSymbol| -> Span { (s.entry.start_line, s.entry.end_line) };
+    SymbolChange {
+        name: named.identity.name.clone(),
+        parent: named.parent.clone(),
+        kind: named.identity.kind,
+        change,
+        match_confidence,
+        old_span: old.map(span),
+        new_span: new.map(span),
+        old_sig: old.and_then(|s| s.entry.signature.clone()),
+        new_sig: new.and_then(|s| s.entry.signature.clone()),
+        lines: Vec::new(),
+    }
+}
+
 /// Three-phase symbol matching: identity → structural → fuzzy.
 ///
 /// Returns a `SymbolChange` for **every** matched pair (including unchanged)
-/// plus any unmatched old (Deleted) and unmatched new (Added).
+/// plus any unmatched old (Deleted) and unmatched new (Added), in file order.
+#[expect(clippy::too_many_lines, reason = "the diff model is rebuilt in #312")]
 pub(crate) fn match_symbols(old: &[DiffSymbol], new: &[DiffSymbol]) -> Vec<SymbolChange> {
     let mut old_matched = vec![false; old.len()];
     let mut new_matched = vec![false; new.len()];
@@ -90,57 +146,19 @@ pub(crate) fn match_symbols(old: &[DiffSymbol], new: &[DiffSymbol]) -> Vec<Symbo
             // mid-list-inserted overload with its positional neighbour and
             // reports a spurious SignatureChanged/BodyChanged.
             for (oi, ni) in pair_overloads(old, new, old_indices, new_indices) {
-                let o = &old[oi];
-                let n = &new[ni];
+                let (o, n) = (&old[oi], &new[ni]);
                 old_matched[oi] = true;
                 new_matched[ni] = true;
-
-                if o.content_hash == n.content_hash {
-                    changes.push(SymbolChange {
-                        name: n.identity.name.clone(),
-                        kind: n.identity.kind,
-                        change: ChangeType::Unchanged,
-                        match_confidence: MatchConfidence::Exact,
-                        line: n.entry.start_line,
-                        old_sig: None,
-                        new_sig: None,
-                        size_delta: Some((
-                            o.entry.end_line.saturating_sub(o.entry.start_line) + 1,
-                            n.entry.end_line.saturating_sub(n.entry.start_line) + 1,
-                        )),
-                    });
-                } else if o.entry.signature != n.entry.signature {
-                    changes.push(SymbolChange {
-                        name: n.identity.name.clone(),
-                        kind: n.identity.kind,
-                        change: ChangeType::SignatureChanged,
-                        match_confidence: MatchConfidence::Exact,
-                        line: n.entry.start_line,
-                        old_sig: o.entry.signature.clone(),
-                        new_sig: n.entry.signature.clone(),
-                        size_delta: Some((
-                            o.entry.end_line.saturating_sub(o.entry.start_line) + 1,
-                            n.entry.end_line.saturating_sub(n.entry.start_line) + 1,
-                        )),
-                    });
+                let change = if o.content_hash == n.content_hash {
+                    ChangeType::Unchanged
+                } else if o.signature_key != n.signature_key {
+                    ChangeType::SignatureChanged
                 } else {
-                    changes.push(SymbolChange {
-                        name: n.identity.name.clone(),
-                        kind: n.identity.kind,
-                        change: ChangeType::BodyChanged,
-                        match_confidence: MatchConfidence::Exact,
-                        line: n.entry.start_line,
-                        old_sig: None,
-                        new_sig: None,
-                        size_delta: Some((
-                            o.entry.end_line.saturating_sub(o.entry.start_line) + 1,
-                            n.entry.end_line.saturating_sub(n.entry.start_line) + 1,
-                        )),
-                    });
-                }
+                    ChangeType::BodyChanged
+                };
+                changes.push(change_of(Sides::Both(o, n), change, MatchConfidence::Exact));
             }
-            // Leftover old with no new counterpart — handled in phase 3 remainders
-            // Leftover new with no old counterpart — handled in phase 3 remainders
+            // Leftovers on either side fall through to the later phases.
         }
     }
 
@@ -169,64 +187,38 @@ pub(crate) fn match_symbols(old: &[DiffSymbol], new: &[DiffSymbol]) -> Vec<Symbo
     for (key, old_idxs) in &struct_old {
         if let Some(new_idxs) = struct_new.get(key) {
             if old_idxs.len() == 1 && new_idxs.len() == 1 {
-                let oi = old_idxs[0];
-                let ni = new_idxs[0];
+                let (oi, ni) = (old_idxs[0], new_idxs[0]);
                 old_matched[oi] = true;
                 new_matched[ni] = true;
-                changes.push(SymbolChange {
-                    name: new[ni].identity.name.clone(),
-                    kind: new[ni].identity.kind,
-                    change: ChangeType::Renamed {
-                        old_name: old[oi].identity.name.clone(),
-                    },
-                    match_confidence: MatchConfidence::Structural,
-                    line: new[ni].entry.start_line,
-                    old_sig: old[oi].entry.signature.clone(),
-                    new_sig: new[ni].entry.signature.clone(),
-                    size_delta: Some((
-                        old[oi]
-                            .entry
-                            .end_line
-                            .saturating_sub(old[oi].entry.start_line)
-                            + 1,
-                        new[ni]
-                            .entry
-                            .end_line
-                            .saturating_sub(new[ni].entry.start_line)
-                            + 1,
-                    )),
-                });
+                let renamed = ChangeType::Renamed {
+                    old_name: old[oi].identity.name.clone(),
+                };
+                changes.push(change_of(
+                    Sides::Both(&old[oi], &new[ni]),
+                    renamed,
+                    MatchConfidence::Structural,
+                ));
             } else {
-                // Ambiguous — mark all new entries as Added with Ambiguous confidence
+                // Ambiguous — every candidate on both sides stays unpaired.
                 let count = (old_idxs.len() + new_idxs.len()) as u32;
                 for &ni in new_idxs {
                     if !new_matched[ni] {
                         new_matched[ni] = true;
-                        changes.push(SymbolChange {
-                            name: new[ni].identity.name.clone(),
-                            kind: new[ni].identity.kind,
-                            change: ChangeType::Added,
-                            match_confidence: MatchConfidence::Ambiguous(count),
-                            line: new[ni].entry.start_line,
-                            old_sig: None,
-                            new_sig: new[ni].entry.signature.clone(),
-                            size_delta: None,
-                        });
+                        changes.push(change_of(
+                            Sides::New(&new[ni]),
+                            ChangeType::Added,
+                            MatchConfidence::Ambiguous(count),
+                        ));
                     }
                 }
                 for &oi in old_idxs {
                     if !old_matched[oi] {
                         old_matched[oi] = true;
-                        changes.push(SymbolChange {
-                            name: old[oi].identity.name.clone(),
-                            kind: old[oi].identity.kind,
-                            change: ChangeType::Deleted,
-                            match_confidence: MatchConfidence::Ambiguous(count),
-                            line: old[oi].entry.start_line,
-                            old_sig: old[oi].entry.signature.clone(),
-                            new_sig: None,
-                            size_delta: None,
-                        });
+                        changes.push(change_of(
+                            Sides::Old(&old[oi]),
+                            ChangeType::Deleted,
+                            MatchConfidence::Ambiguous(count),
+                        ));
                     }
                 }
             }
@@ -263,7 +255,10 @@ pub(crate) fn match_symbols(old: &[DiffSymbol], new: &[DiffSymbol]) -> Vec<Symbo
             } else {
                 (len_b, len_a)
             };
-            #[allow(clippy::cast_precision_loss)]
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "by design: a size ratio; line lengths fit the f32 mantissa"
+            )]
             if max_len == 0 || (min_len as f32 / max_len as f32) < 0.8 {
                 continue;
             }
@@ -295,28 +290,11 @@ pub(crate) fn match_symbols(old: &[DiffSymbol], new: &[DiffSymbol]) -> Vec<Symbo
                 old_name: old[oi].identity.name.clone(),
             }
         };
-
-        changes.push(SymbolChange {
-            name: new[ni].identity.name.clone(),
-            kind: new[ni].identity.kind,
+        changes.push(change_of(
+            Sides::Both(&old[oi], &new[ni]),
             change,
-            match_confidence: MatchConfidence::Fuzzy(score),
-            line: new[ni].entry.start_line,
-            old_sig: old[oi].entry.signature.clone(),
-            new_sig: new[ni].entry.signature.clone(),
-            size_delta: Some((
-                old[oi]
-                    .entry
-                    .end_line
-                    .saturating_sub(old[oi].entry.start_line)
-                    + 1,
-                new[ni]
-                    .entry
-                    .end_line
-                    .saturating_sub(new[ni].entry.start_line)
-                    + 1,
-            )),
-        });
+            MatchConfidence::Fuzzy(score),
+        ));
     }
 
     // ------------------------------------------------------------------
@@ -324,39 +302,77 @@ pub(crate) fn match_symbols(old: &[DiffSymbol], new: &[DiffSymbol]) -> Vec<Symbo
     // ------------------------------------------------------------------
     for (i, matched) in old_matched.iter().enumerate() {
         if !matched {
-            changes.push(SymbolChange {
-                name: old[i].identity.name.clone(),
-                kind: old[i].identity.kind,
-                change: ChangeType::Deleted,
-                match_confidence: MatchConfidence::Exact,
-                line: old[i].entry.start_line,
-                old_sig: old[i].entry.signature.clone(),
-                new_sig: None,
-                size_delta: None,
-            });
+            changes.push(change_of(
+                Sides::Old(&old[i]),
+                ChangeType::Deleted,
+                MatchConfidence::Exact,
+            ));
         }
     }
     for (i, matched) in new_matched.iter().enumerate() {
         if !matched {
-            changes.push(SymbolChange {
-                name: new[i].identity.name.clone(),
-                kind: new[i].identity.kind,
-                change: ChangeType::Added,
-                match_confidence: MatchConfidence::Exact,
-                line: new[i].entry.start_line,
-                old_sig: None,
-                new_sig: new[i].entry.signature.clone(),
-                size_delta: None,
-            });
+            changes.push(change_of(
+                Sides::New(&new[i]),
+                ChangeType::Added,
+                MatchConfidence::Exact,
+            ));
         }
     }
 
+    // The phases walk hash maps, whose order changes from run to run. Sort
+    // so the output is the same every time, in file order.
+    changes.sort_by(|a, b| {
+        (a.span(), a.qualified_name(), a.old_span).cmp(&(b.span(), b.qualified_name(), b.old_span))
+    });
     changes
 }
 
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+/// The entries enclosing a symbol, outermost first.
+#[derive(Default)]
+struct Parent {
+    /// Their names joined by `::`, as the symbol's identity keys them.
+    path: String,
+    /// Their names as shown, joined by `::`.
+    display: String,
+}
+
+impl Parent {
+    /// The parent of the children of the entry named `name` inside this one.
+    /// Each name is joined as it is, never split again, since a name such
+    /// as `impl fmt::Display for Foo` holds a `::` of its own.
+    fn child(&self, name: &str) -> Self {
+        let join = |path: &str, segment: &str| {
+            if path.is_empty() {
+                segment.to_string()
+            } else {
+                format!("{path}::{segment}")
+            }
+        };
+        Self {
+            path: join(&self.path, name),
+            display: join(&self.display, &display_segment(name)),
+        }
+    }
+}
+
+/// How an enclosing entry reads in a qualified name: a Rust `impl Foo` block
+/// by its type, so a method reads `Foo::method`, and a trait impl in Rust's
+/// qualified form, `<Foo as From<A>>::from`.
+fn display_segment(name: &str) -> String {
+    name.strip_prefix("impl ").map_or_else(
+        || name.to_string(),
+        |header| {
+            header.split_once(" for ").map_or_else(
+                || header.to_string(),
+                |(trait_name, ty)| format!("<{ty} as {trait_name}>"),
+            )
+        },
+    )
+}
 
 fn index_by_identity(symbols: &[DiffSymbol]) -> HashMap<SymbolIdentity, Vec<usize>> {
     let mut map: HashMap<SymbolIdentity, Vec<usize>> = HashMap::new();
@@ -370,7 +386,7 @@ fn build_symbols_recursive(
     entries: &[OutlineEntry],
     lines: &[&str],
     lang: Lang,
-    parent_path: &str,
+    parent: &Parent,
     out: &mut Vec<DiffSymbol>,
 ) {
     for entry in entries {
@@ -380,27 +396,259 @@ fn build_symbols_recursive(
 
         let identity = SymbolIdentity {
             kind: entry.kind,
-            parent_path: parent_path.to_string(),
+            parent_path: parent.path.clone(),
             name: entry.name.clone(),
         };
 
         out.push(DiffSymbol {
             entry: clone_entry_shallow(entry),
             identity,
+            parent: parent.display.clone(),
             content_hash,
             structural_hash,
+            signature_key: text_signature_key(entry.signature.as_deref()),
             source_text: source,
         });
 
-        // Recurse into children with updated parent_path
+        // Recurse into children, with this entry as their parent.
         if !entry.children.is_empty() {
-            let child_parent = if parent_path.is_empty() {
-                entry.name.clone()
-            } else {
-                format!("{parent_path}::{}", entry.name)
-            };
+            let child_parent = parent.child(&entry.name);
             build_symbols_recursive(&entry.children, lines, lang, &child_parent, out);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Declaration headers
+// ---------------------------------------------------------------------------
+
+/// Node kinds the outline reports as functions. Their header, everything
+/// before the body, is the signature.
+const FUNCTION_NODE_KINDS: &[&str] = &[
+    "function_declaration",
+    "function_definition",
+    "function_item",
+    "generator_function_declaration",
+    "method_definition",
+    "method_declaration",
+    "constructor_declaration",
+    "init_declaration",
+    "deinit_declaration",
+    "protocol_function_declaration",
+    "abstract_method_signature",
+    "method",
+    "singleton_method",
+];
+
+/// The key of a signature known only as outline text, with runs of
+/// whitespace counted as one space.
+fn text_signature_key(signature: Option<&str>) -> u64 {
+    let text = signature.unwrap_or("");
+    hash_string(&text.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
+/// The function and Rust impl nodes of one tree, by the row each ends on,
+/// so a symbol finds its node without scanning every node.
+struct DeclarationNodes<'t> {
+    functions: HashMap<usize, Vec<tree_sitter::Node<'t>>>,
+    impls: HashMap<usize, Vec<tree_sitter::Node<'t>>>,
+}
+
+impl<'t> DeclarationNodes<'t> {
+    fn of(root: tree_sitter::Node<'t>) -> Self {
+        let mut nodes = Self {
+            functions: HashMap::new(),
+            impls: HashMap::new(),
+        };
+        let mut cursor = root.walk();
+        loop {
+            let node = cursor.node();
+            let by_end = if FUNCTION_NODE_KINDS.contains(&node.kind()) {
+                Some(&mut nodes.functions)
+            } else if node.kind() == "impl_item" {
+                Some(&mut nodes.impls)
+            } else {
+                None
+            };
+            if let Some(map) = by_end {
+                map.entry(node.end_position().row).or_default().push(node);
+            }
+            if cursor.goto_first_child() || cursor.goto_next_sibling() {
+                continue;
+            }
+            loop {
+                if !cursor.goto_parent() {
+                    return nodes;
+                }
+                if cursor.goto_next_sibling() {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// The outermost node of `by_end` for an outline entry's span. The span
+    /// runs from an `export` keyword or an attribute to the end of the
+    /// declaration, so the node ends on the last line and starts within it.
+    fn for_entry(
+        by_end: &HashMap<usize, Vec<tree_sitter::Node<'t>>>,
+        entry: &OutlineEntry,
+    ) -> Option<tree_sitter::Node<'t>> {
+        let first = (entry.start_line as usize).saturating_sub(1);
+        let last = (entry.end_line as usize).saturating_sub(1);
+        by_end
+            .get(&last)?
+            .iter()
+            .filter(|n| (first..=last).contains(&n.start_position().row))
+            .min_by_key(|n| n.start_position().row)
+            .copied()
+    }
+}
+
+/// Name each Rust impl of a trait by its trait and type, `impl From<A> for
+/// Foo`, where the outline names it by its type alone.
+fn name_trait_impls(entries: &mut [OutlineEntry], nodes: &DeclarationNodes, source: &[u8]) {
+    for entry in entries {
+        if entry.kind == OutlineKind::Module && entry.name.starts_with("impl ") {
+            let named = DeclarationNodes::for_entry(&nodes.impls, entry).and_then(|node| {
+                let text = |field| node.child_by_field_name(field)?.utf8_text(source).ok();
+                Some(format!("impl {} for {}", text("trait")?, text("type")?))
+            });
+            if let Some(name) = named {
+                entry.name = name;
+            }
+        }
+        name_trait_impls(&mut entry.children, nodes, source);
+    }
+}
+
+/// Replace each function's outline signature with its full header from the
+/// syntax tree, and key it by the header's tokens. A function whose node is
+/// not found keeps its outline signature.
+fn apply_headers(symbols: &mut [DiffSymbol], nodes: &DeclarationNodes, source: &[u8]) {
+    for symbol in symbols {
+        if symbol.entry.kind != OutlineKind::Function || symbol.entry.signature.is_none() {
+            continue;
+        }
+        let node = DeclarationNodes::for_entry(&nodes.functions, &symbol.entry);
+        if let Some(header) = node.and_then(|n| Header::of(n, source)) {
+            symbol.entry.signature = Some(header.display);
+            symbol.signature_key = header.key;
+        }
+    }
+}
+
+/// A declaration header: its tokens, minus comments and the punctuation a
+/// formatter adds or drops without changing meaning.
+struct Header {
+    /// The tokens on one line, spaced where the source had a gap.
+    display: String,
+    /// Hash of the token texts, blind to layout.
+    key: u64,
+}
+
+impl Header {
+    fn of(node: tree_sitter::Node, source: &[u8]) -> Option<Self> {
+        let end = body_start(node).unwrap_or_else(|| node.end_byte());
+        let mut tokens: Vec<Range<usize>> = Vec::new();
+        header_tokens(node, end, &mut tokens);
+        let text = |r: &Range<usize>| std::str::from_utf8(&source[r.clone()]).unwrap_or("");
+
+        // A comma before a closing bracket is a trailing comma, which
+        // formatters add when they break a list over lines. A header that
+        // ends in `:` (Python) ends at its block opener.
+        let mut kept: Vec<Range<usize>> = Vec::with_capacity(tokens.len());
+        for (i, token) in tokens.iter().enumerate() {
+            let closes_next = tokens
+                .get(i + 1)
+                .is_some_and(|next| matches!(text(next), ")" | "]" | "}" | ">"));
+            if text(token) == "," && closes_next {
+                continue;
+            }
+            kept.push(token.clone());
+        }
+        if kept.last().is_some_and(|t| text(t) == ":") {
+            kept.pop();
+        }
+        if kept.is_empty() {
+            return None;
+        }
+
+        let mut display = String::new();
+        let mut hasher = DefaultHasher::new();
+        let mut previous: Option<&Range<usize>> = None;
+        for token in &kept {
+            let t = text(token);
+            if let Some(p) = previous {
+                let gap = p.end < token.start;
+                if gap && !matches!(text(p), "(" | "[") && !matches!(t, ")" | "]" | ",") {
+                    display.push(' ');
+                }
+            }
+            display.push_str(t);
+            t.hash(&mut hasher);
+            previous = Some(token);
+        }
+        Some(Self {
+            display,
+            key: hasher.finish(),
+        })
+    }
+}
+
+/// Where a function's body starts, or `None` for a declaration with none.
+/// A C++ constructor's initializer list starts its body, and so does the
+/// `end` that closes a Ruby method with an empty one.
+fn body_start(node: tree_sitter::Node) -> Option<usize> {
+    let mut cursor = node.walk();
+    let initializers = node
+        .children(&mut cursor)
+        .find(|child| child.kind() == "field_initializer_list");
+    if let Some(list) = initializers {
+        return Some(list.start_byte());
+    }
+    if let Some(body) = node.child_by_field_name("body") {
+        return Some(body.start_byte());
+    }
+    let body = node.children(&mut cursor).find(|child| {
+        let kind = child.kind();
+        !kind.contains("comment")
+            && (kind.contains("body")
+                || kind.contains("block")
+                || kind == "compound_statement"
+                || kind == "arrow_expression_clause")
+    });
+    if let Some(body) = body {
+        return Some(body.start_byte());
+    }
+    let closing_end = node
+        .child(node.child_count().checked_sub(1)?)
+        .filter(|last| {
+            last.kind() == "end" && matches!(node.kind(), "method" | "singleton_method")
+        });
+    closing_end.map(|end| end.start_byte())
+}
+
+/// The byte ranges of the leaf tokens of `node` before `end`, without
+/// comments, and without the optional `|` or `&` that may open a TypeScript
+/// union or intersection type (`| string | number`).
+fn header_tokens(node: tree_sitter::Node, end: usize, out: &mut Vec<Range<usize>>) {
+    if node.start_byte() >= end || node.kind().contains("comment") {
+        return;
+    }
+    if node.child_count() == 0 {
+        if node.start_byte() < node.end_byte() && node.end_byte() <= end {
+            out.push(node.byte_range());
+        }
+        return;
+    }
+    let opens_type_list = matches!(node.kind(), "union_type" | "intersection_type");
+    let mut cursor = node.walk();
+    for (i, child) in node.children(&mut cursor).enumerate() {
+        if i == 0 && opens_type_list && matches!(child.kind(), "|" | "&") {
+            continue;
+        }
+        header_tokens(child, end, out);
     }
 }
 
@@ -545,13 +793,340 @@ fn trim_ascii(bytes: &[u8]) -> &[u8] {
 mod tests {
     use super::*;
 
-    fn make_sym(
-        kind: OutlineKind,
-        name: &str,
-        parent: &str,
-        source: &str,
-        sig: Option<&str>,
-    ) -> DiffSymbol {
+    /// Every language: an edit inside a body is a body change, an edit to a
+    /// parameter is a signature change, and re-wrapping the header changes
+    /// nothing in its signature.
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "by design: a table of cases, one per language; its length is the data"
+    )]
+    fn body_and_signature_edits_across_languages() {
+        // (lang, file, the edited symbol's name, base, body edit, signature edit)
+        let cases: &[(Lang, &str, &str, &str, &str, &str)] = &[
+            (
+                Lang::Rust,
+                "a.rs",
+                "f",
+                "fn f(a: i32) -> i32 {\n    a + 1\n}\n",
+                "a + 2",
+                "a: i64",
+            ),
+            (
+                Lang::TypeScript,
+                "a.ts",
+                "f",
+                "function f(a: number): number {\n  return a + 1;\n}\n",
+                "a + 2",
+                "a: string",
+            ),
+            (
+                Lang::JavaScript,
+                "a.js",
+                "f",
+                "function f(a) {\n  return a + 1;\n}\n",
+                "a + 2",
+                "f(a, b)",
+            ),
+            (
+                Lang::Python,
+                "a.py",
+                "f",
+                "def f(a: int) -> int:\n    return a + 1\n",
+                "a + 2",
+                "a: str",
+            ),
+            (
+                Lang::Go,
+                "a.go",
+                "f",
+                "package p\n\nfunc f(a int) int {\n\treturn a + 1\n}\n",
+                "a + 2",
+                "a int64",
+            ),
+            (
+                Lang::Java,
+                "A.java",
+                "f",
+                "class A {\n  int f(int a) {\n    return a + 1;\n  }\n}\n",
+                "a + 2",
+                "long a",
+            ),
+            (
+                Lang::Scala,
+                "a.scala",
+                "f",
+                "object A {\n  def f(a: Int): Int = {\n    a + 1\n  }\n}\n",
+                "a + 2",
+                "a: Long",
+            ),
+            (
+                Lang::C,
+                "a.c",
+                "f",
+                "int f(int a) {\n    return a + 1;\n}\n",
+                "a + 2",
+                "long a",
+            ),
+            (
+                Lang::Cpp,
+                "a.cpp",
+                "f",
+                "int f(int a) {\n    return a + 1;\n}\n",
+                "a + 2",
+                "long a",
+            ),
+            (
+                Lang::Ruby,
+                "a.rb",
+                "f",
+                "def f(a)\n  a + 1\nend\n",
+                "a + 2",
+                "f(a, b)",
+            ),
+            (
+                Lang::Php,
+                "a.php",
+                "f",
+                "<?php\nfunction f($a) {\n    return $a + 1;\n}\n",
+                "$a + 2",
+                "f($a, $b)",
+            ),
+            (
+                Lang::CSharp,
+                "A.cs",
+                "F",
+                "class A {\n  int F(int a) {\n    return a + 1;\n  }\n}\n",
+                "a + 2",
+                "long a",
+            ),
+            (
+                Lang::Swift,
+                "a.swift",
+                "f",
+                "func f(a: Int) -> Int {\n    return a + 1\n}\n",
+                "a + 2",
+                "a: Int64",
+            ),
+            (
+                Lang::Kotlin,
+                "a.kt",
+                "f",
+                "fun f(a: Int): Int {\n    return a + 1\n}\n",
+                "a + 2",
+                "a: Long",
+            ),
+            (
+                Lang::Elixir,
+                "a.ex",
+                "f",
+                "defmodule M do\n  def f(a) do\n    a + 1\n  end\nend\n",
+                "a + 2",
+                "f(a, b)",
+            ),
+            (
+                Lang::Bash,
+                "a.sh",
+                "f",
+                "f() {\n  echo 1\n}\n",
+                "echo 2",
+                "",
+            ),
+        ];
+        let find = |changes: &[SymbolChange], name: &str| {
+            changes
+                .iter()
+                .find(|c| c.name == name)
+                .map(|c| c.change.clone())
+        };
+        for &(lang, file, name, base, body_edit, sig_edit) in cases {
+            let first_use = |old: &str| base.find(old).expect("edit target in base");
+            let body = {
+                let (from, to) = match lang {
+                    Lang::Bash => ("echo 1", body_edit),
+                    Lang::Php => ("$a + 1", body_edit),
+                    _ => ("a + 1", body_edit),
+                };
+                let at = first_use(from);
+                format!("{}{to}{}", &base[..at], &base[at + from.len()..])
+            };
+            let changes = changes_for(lang, base, &body);
+            assert!(
+                matches!(find(&changes, name), Some(ChangeType::BodyChanged)),
+                "{file}: body edit must be a body change: {changes:#?}"
+            );
+            if sig_edit.is_empty() {
+                continue;
+            }
+            let from = match sig_edit {
+                "f(a, b)" => "f(a)",
+                "f($a, $b)" => "f($a)",
+                "long a" => "int a",
+                e if e.starts_with("a: ") => &base[first_use("a: ")..]
+                    .split([',', ')'])
+                    .next()
+                    .unwrap()
+                    .to_string()[..],
+                e if e.starts_with("a ") => "a int",
+                _ => unreachable!("{sig_edit}"),
+            };
+            let at = first_use(from);
+            let sig = format!("{}{sig_edit}{}", &base[..at], &base[at + from.len()..]);
+            let changes = changes_for(lang, base, &sig);
+            assert!(
+                matches!(find(&changes, name), Some(ChangeType::SignatureChanged)),
+                "{file}: signature edit must be a signature change: {changes:#?}"
+            );
+        }
+    }
+
+    /// A header wrapped over several lines: re-wrapping it (with a trailing
+    /// comma) is no signature change, and a parameter changed on its second
+    /// line is one, with the whole header in BEFORE and AFTER.
+    #[test]
+    fn multiline_headers_compare_by_tokens() {
+        let cases: &[(Lang, &str, &str, &str)] = &[
+            (
+                Lang::Rust,
+                "fn f(a: i32, b: i32) -> i32 {\n    a + b\n}\n",
+                "fn f(\n    a: i32,\n    b: i32,\n) -> i32 {\n    a + b\n}\n",
+                "fn f(\n    a: i32,\n    b: i64,\n) -> i32 {\n    a + b\n}\n",
+            ),
+            (
+                Lang::Python,
+                "def f(a: int, b: int) -> int:\n    return a + b\n",
+                "def f(\n    a: int,\n    b: int,\n) -> int:\n    return a + b\n",
+                "def f(\n    a: int,\n    b: str,\n) -> int:\n    return a + b\n",
+            ),
+            (
+                Lang::Go,
+                "package p\n\nfunc f(a int, b int) int {\n\treturn a + b\n}\n",
+                "package p\n\nfunc f(\n\ta int,\n\tb int,\n) int {\n\treturn a + b\n}\n",
+                "package p\n\nfunc f(\n\ta int,\n\tb int64,\n) int {\n\treturn a + b\n}\n",
+            ),
+            (
+                Lang::JavaScript,
+                "function* f(a, b) {\n  yield a + b;\n}\n",
+                "function* f(\n  a,\n  b,\n) {\n  yield a + b;\n}\n",
+                "function* f(\n  a,\n  c,\n) {\n  yield a + b;\n}\n",
+            ),
+            (
+                Lang::Java,
+                "class A {\n  int f(int a, int b) {\n    return a + b;\n  }\n}\n",
+                "class A {\n  int f(\n      int a,\n      int b) {\n    return a + b;\n  }\n}\n",
+                "class A {\n  int f(\n      int a,\n      long b) {\n    return a + b;\n  }\n}\n",
+            ),
+        ];
+        for &(lang, base, rewrapped, retyped) in cases {
+            let changes = changes_for(lang, base, rewrapped);
+            let f = changes.iter().find(|c| c.name == "f").unwrap();
+            assert!(
+                matches!(f.change, ChangeType::BodyChanged),
+                "{lang:?}: re-wrapping is no signature change: {f:#?}"
+            );
+            let changes = changes_for(lang, rewrapped, retyped);
+            let f = changes.iter().find(|c| c.name == "f").unwrap();
+            assert!(
+                matches!(f.change, ChangeType::SignatureChanged),
+                "{lang:?}: {f:#?}"
+            );
+            let (old, new) = (f.old_sig.as_deref().unwrap(), f.new_sig.as_deref().unwrap());
+            assert!(!old.contains('\n') && !new.contains('\n'), "{old} / {new}");
+            assert_ne!(old, new);
+        }
+    }
+
+    /// Two impls of one trait for one type, `From<A>` and `From<B>`, each
+    /// define `from`. Named `Foo::from` both, they could not be told apart.
+    #[test]
+    fn trait_impls_of_one_type_keep_their_trait() {
+        let base = "struct Foo;\n\nimpl From<A> for Foo {\n    fn from(_: A) -> Foo {\n        Foo\n    }\n}\n\nimpl From<B> for Foo {\n    fn from(_: B) -> Foo {\n        Foo\n    }\n}\n\nimpl Foo {\n    fn new() -> Foo {\n        Foo\n    }\n}\n";
+        let edited = base.replacen(
+            "        Foo\n    }\n}\n\nimpl Foo",
+            "        { Foo }\n    }\n}\n\nimpl Foo",
+            1,
+        );
+        let changes = changes_for(Lang::Rust, base, &edited);
+        let named = |q: &str| {
+            changes
+                .iter()
+                .find(|c| c.qualified_name() == q)
+                .unwrap_or_else(|| panic!("no {q} in {changes:#?}"))
+        };
+        assert!(matches!(
+            named("<Foo as From<A>>::from").change,
+            ChangeType::Unchanged
+        ));
+        assert!(matches!(
+            named("<Foo as From<B>>::from").change,
+            ChangeType::BodyChanged
+        ));
+        assert!(matches!(named("Foo::new").change, ChangeType::Unchanged));
+        assert!(matches!(
+            named("impl From<B> for Foo").change,
+            ChangeType::BodyChanged
+        ));
+    }
+
+    /// A trait or a type written as a path keeps its `::` inside the
+    /// qualifier: the method of `impl fmt::Display for Foo` is
+    /// `<Foo as fmt::Display>::fmt`, not `fmt::Display for Foo::fmt`.
+    #[test]
+    fn a_path_in_an_impl_header_stays_in_its_qualifier() {
+        let cases = [
+            ("impl fmt::Display for Foo", "<Foo as fmt::Display>::f"),
+            ("impl std::ops::Add for X", "<X as std::ops::Add>::f"),
+            ("impl Display for crate::Foo", "<crate::Foo as Display>::f"),
+            ("impl From<a::B> for Foo", "<Foo as From<a::B>>::f"),
+            ("impl crate::Foo", "crate::Foo::f"),
+        ];
+        for (header, method) in cases {
+            let old = format!("{header} {{\n    fn f() {{\n        1;\n    }}\n}}\n");
+            let changes = changes_for(Lang::Rust, &old, &old.replace('1', "2"));
+            let names: Vec<String> = changes.iter().map(SymbolChange::qualified_name).collect();
+            assert!(names.iter().any(|n| n == method), "{header}: {names:?}");
+        }
+        let nested = "mod m {\n    impl fmt::Display for Foo {\n        fn f() {\n            1;\n        }\n    }\n}\n";
+        let changes = changes_for(Lang::Rust, nested, &nested.replace('1', "2"));
+        let names: Vec<String> = changes.iter().map(SymbolChange::qualified_name).collect();
+        assert!(
+            names.iter().any(|n| n == "m::<Foo as fmt::Display>::f"),
+            "{names:?}"
+        );
+    }
+
+    /// A C++ constructor's initializer list and the `end` of an empty Ruby
+    /// method are not part of the signature: editing them is a body change.
+    #[test]
+    fn initializer_lists_and_a_closing_end_are_body() {
+        let cpp = "A::A(int x) : x_(x) {\n}\n";
+        let changes = changes_for(Lang::Cpp, cpp, &cpp.replace("x_(x)", "x_(x + 1)"));
+        assert!(
+            changes
+                .iter()
+                .all(|c| !matches!(c.change, ChangeType::SignatureChanged)),
+            "{changes:#?}"
+        );
+        assert!(
+            changes
+                .iter()
+                .any(|c| matches!(c.change, ChangeType::BodyChanged)),
+            "{changes:#?}"
+        );
+
+        let ruby = "def save\nend\n";
+        let changes = changes_for(Lang::Ruby, ruby, "def save\n  1\nend\n");
+        let save = changes.iter().find(|c| c.name == "save").unwrap();
+        assert!(matches!(save.change, ChangeType::BodyChanged), "{save:#?}");
+        assert_eq!(save.new_sig.as_deref(), Some("def save"), "{save:#?}");
+    }
+
+    fn changes_for(lang: Lang, old: &str, new: &str) -> Vec<SymbolChange> {
+        let symbols = |content: &str| build_diff_symbols(content, lang);
+        match_symbols(&symbols(old), &symbols(new))
+    }
+
+    fn make_sym(kind: OutlineKind, name: &str, source: &str, sig: Option<&str>) -> DiffSymbol {
         let content_hash = hash_string(source);
         let structural_hash = compute_structural_hash(source, name, Lang::Rust);
         DiffSymbol {
@@ -567,11 +1142,13 @@ mod tests {
             },
             identity: SymbolIdentity {
                 kind,
-                parent_path: parent.to_string(),
+                parent_path: String::new(),
                 name: name.to_string(),
             },
+            parent: String::new(),
             content_hash,
             structural_hash,
+            signature_key: text_signature_key(sig),
             source_text: source.to_string(),
         }
     }
@@ -582,14 +1159,12 @@ mod tests {
         let old = vec![make_sym(
             OutlineKind::Function,
             "foo",
-            "",
             "fn foo() { 1 }",
             Some("fn foo()"),
         )];
         let new = vec![make_sym(
             OutlineKind::Function,
             "foo",
-            "",
             "fn foo() { 2 }",
             Some("fn foo()"),
         )];
@@ -608,14 +1183,12 @@ mod tests {
         let old = vec![make_sym(
             OutlineKind::Function,
             "foo",
-            "",
             "fn foo(x: i32) { x }",
             Some("fn foo(x: i32)"),
         )];
         let new = vec![make_sym(
             OutlineKind::Function,
             "foo",
-            "",
             "fn foo(x: i32, y: i32) { x + y }",
             Some("fn foo(x: i32, y: i32)"),
         )];
@@ -636,14 +1209,12 @@ mod tests {
         let old = vec![make_sym(
             OutlineKind::Function,
             "foo",
-            "",
             src,
             Some("fn foo()"),
         )];
         let new = vec![make_sym(
             OutlineKind::Function,
             "foo",
-            "",
             src,
             Some("fn foo()"),
         )];
@@ -659,14 +1230,12 @@ mod tests {
             make_sym(
                 OutlineKind::Function,
                 "process",
-                "",
                 "fn process() { a }",
                 Some("fn process()"),
             ),
             make_sym(
                 OutlineKind::Function,
                 "process",
-                "",
                 "fn process() { b }",
                 Some("fn process()"),
             ),
@@ -675,25 +1244,23 @@ mod tests {
             make_sym(
                 OutlineKind::Function,
                 "process",
-                "",
                 "fn process() { a_new }",
                 Some("fn process()"),
             ),
             make_sym(
                 OutlineKind::Function,
                 "process",
-                "",
                 "fn process() { b_new }",
                 Some("fn process()"),
             ),
         ];
         let changes = match_symbols(&old, &new);
         // Both should be matched (by position order) — both changed
-        let body_changes: Vec<_> = changes
+        let body_changes = changes
             .iter()
             .filter(|c| matches!(c.change, ChangeType::BodyChanged))
-            .collect();
-        assert_eq!(body_changes.len(), 2);
+            .count();
+        assert_eq!(body_changes, 2);
     }
 
     // 4b. reordered overload: the unchanged twin must match exactly, not
@@ -704,14 +1271,12 @@ mod tests {
             make_sym(
                 OutlineKind::Function,
                 "process",
-                "",
                 "fn process() { a }",
                 Some("fn process()"),
             ),
             make_sym(
                 OutlineKind::Function,
                 "process",
-                "",
                 "fn process() { b }",
                 Some("fn process()"),
             ),
@@ -721,14 +1286,12 @@ mod tests {
             make_sym(
                 OutlineKind::Function,
                 "process",
-                "",
                 "fn process() { b }",
                 Some("fn process()"),
             ),
             make_sym(
                 OutlineKind::Function,
                 "process",
-                "",
                 "fn process() { a_new }",
                 Some("fn process()"),
             ),
@@ -758,14 +1321,12 @@ mod tests {
         let old = vec![make_sym(
             OutlineKind::Function,
             "foo",
-            "",
             "fn foo(x: i32) -> i32 { x + 1 }",
             Some("fn foo(x: i32) -> i32"),
         )];
         let new = vec![make_sym(
             OutlineKind::Function,
             "bar",
-            "",
             "fn bar(x: i32) -> i32 { x + 1 }",
             Some("fn bar(x: i32) -> i32"),
         )];
@@ -819,14 +1380,12 @@ mod tests {
             make_sym(
                 OutlineKind::Function,
                 "alpha",
-                "",
                 "fn alpha(x: i32) -> i32 { x + 1 }",
                 None,
             ),
             make_sym(
                 OutlineKind::Function,
                 "beta",
-                "",
                 "fn beta(x: i32) -> i32 { x + 1 }",
                 None,
             ),
@@ -835,25 +1394,23 @@ mod tests {
             make_sym(
                 OutlineKind::Function,
                 "gamma",
-                "",
                 "fn gamma(x: i32) -> i32 { x + 1 }",
                 None,
             ),
             make_sym(
                 OutlineKind::Function,
                 "delta",
-                "",
                 "fn delta(x: i32) -> i32 { x + 1 }",
                 None,
             ),
         ];
         let changes = match_symbols(&old, &new);
-        let ambiguous: Vec<_> = changes
+        let ambiguous = changes
             .iter()
             .filter(|c| matches!(c.match_confidence, MatchConfidence::Ambiguous(_)))
-            .collect();
+            .count();
         assert!(
-            ambiguous.len() >= 2,
+            ambiguous >= 2,
             "multiple structural matches should produce Ambiguous entries"
         );
     }
@@ -867,14 +1424,12 @@ mod tests {
         let old = vec![make_sym(
             OutlineKind::Function,
             "handle_request",
-            "",
             "fn handle_request(a: i32, b: i32, c: i32) { let x = a + b + c; println!(x); x }",
             None,
         )];
         let new = vec![make_sym(
             OutlineKind::Function,
             "process_request",
-            "",
             "fn process_request(a: i32, b: i32, c: i32) { let x = a + b + c; println!(x); x + 0 }",
             None,
         )];
@@ -896,14 +1451,12 @@ mod tests {
         let old = vec![make_sym(
             OutlineKind::Function,
             "aaa",
-            "",
             "fn aaa() { completely different code here with unique tokens alpha beta gamma }",
             None,
         )];
         let new = vec![make_sym(
             OutlineKind::Function,
             "bbb",
-            "",
             "fn bbb() { nothing similar at all with other words delta epsilon zeta }",
             None,
         )];
@@ -924,25 +1477,22 @@ mod tests {
         let old = vec![make_sym(
             OutlineKind::Function,
             "tiny",
-            "",
             "fn tiny() { x }",
             None,
         )];
         let new = vec![make_sym(
             OutlineKind::Function,
             "huge",
-            "",
             "fn huge() { a b c d e f g h i j k l m n o p q r s t u v w x y z aa bb cc dd ee ff gg hh ii jj kk ll mm nn oo pp qq rr ss tt uu vv ww xx }",
             None,
         )];
         let changes = match_symbols(&old, &new);
         // Should not fuzzy-match due to size ratio pre-filter
-        let fuzzy: Vec<_> = changes
+        let any_fuzzy = changes
             .iter()
-            .filter(|c| matches!(c.match_confidence, MatchConfidence::Fuzzy(_)))
-            .collect();
+            .any(|c| matches!(c.match_confidence, MatchConfidence::Fuzzy(_)));
         assert!(
-            fuzzy.is_empty(),
+            !any_fuzzy,
             "vastly different sizes should be skipped by pre-filter"
         );
     }
@@ -953,14 +1503,12 @@ mod tests {
         let old = vec![make_sym(
             OutlineKind::Function,
             "old_fn",
-            "",
             "fn old_fn() { removed }",
             None,
         )];
         let new = vec![make_sym(
             OutlineKind::Function,
             "new_fn",
-            "",
             "fn new_fn() { completely brand new unique code that is nothing like the old }",
             None,
         )];
@@ -978,7 +1526,7 @@ mod tests {
     fn empty_inputs() {
         assert!(match_symbols(&[], &[]).is_empty());
         // One side empty
-        let sym = vec![make_sym(OutlineKind::Function, "f", "", "fn f() {}", None)];
+        let sym = vec![make_sym(OutlineKind::Function, "f", "fn f() {}", None)];
         let del = match_symbols(&sym, &[]);
         assert_eq!(del.len(), 1);
         assert!(matches!(del[0].change, ChangeType::Deleted));
@@ -991,8 +1539,7 @@ mod tests {
     #[test]
     fn impl_block_parent_path() {
         let src = "impl Foo {\n    fn bar(&self) { 1 }\n}";
-        let entries = tilth_core::lang::outline::get_outline_entries(src, Lang::Rust);
-        let symbols = build_diff_symbols(&entries, src, Lang::Rust);
+        let symbols = build_diff_symbols(src, Lang::Rust);
         let bar = symbols
             .iter()
             .find(|s| s.identity.name == "bar")
@@ -1008,8 +1555,7 @@ mod tests {
     #[test]
     fn build_diff_symbols_rust() {
         let src = "fn hello() -> i32 { 42 }\nstruct Point { x: f64, y: f64 }";
-        let entries = tilth_core::lang::outline::get_outline_entries(src, Lang::Rust);
-        let symbols = build_diff_symbols(&entries, src, Lang::Rust);
+        let symbols = build_diff_symbols(src, Lang::Rust);
         assert!(symbols.len() >= 2);
         let hello = symbols.iter().find(|s| s.identity.name == "hello");
         assert!(hello.is_some());
@@ -1021,8 +1567,7 @@ mod tests {
     #[test]
     fn build_diff_symbols_impl_children() {
         let src = "impl MyStruct {\n    fn method_a(&self) { }\n    fn method_b(&self) { }\n}";
-        let entries = tilth_core::lang::outline::get_outline_entries(src, Lang::Rust);
-        let symbols = build_diff_symbols(&entries, src, Lang::Rust);
+        let symbols = build_diff_symbols(src, Lang::Rust);
         let methods: Vec<_> = symbols
             .iter()
             .filter(|s| s.identity.name == "method_a" || s.identity.name == "method_b")

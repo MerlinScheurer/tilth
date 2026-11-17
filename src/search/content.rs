@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
@@ -13,7 +13,6 @@ use tilth_core::error::TilthError;
 
 const MAX_MATCHES: usize = 10;
 const FULL_MAX_MATCHES: usize = 100;
-const MAX_SEARCH_FILE_SIZE: u64 = 500_000;
 
 /// Content search using ripgrep crates. Literal by default, regex if `is_regex`.
 pub fn search(
@@ -39,6 +38,10 @@ pub fn search(
 /// The display cap and the per-file collection bound are the same number in
 /// production. They are separate parameters so a test can raise one without
 /// the other and show that the bound leaves the displayed set untouched.
+#[expect(
+    clippy::too_many_lines,
+    reason = "reading goes through one Source in #308"
+)]
 fn search_capped(
     pattern: &str,
     scope: &Path,
@@ -58,15 +61,27 @@ fn search_capped(
         reason: e.to_string(),
     })?;
 
+    let check = if is_regex {
+        super::size_check_matcher(pattern)
+    } else {
+        super::size_check_matcher(&regex_syntax::escape(pattern))
+    };
+
     let matches: Mutex<Vec<Match>> = Mutex::new(Vec::new());
+    let skipped_large: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
     // Relaxed is correct: walker.run() joins all threads before we read the final value.
     let total_found = AtomicUsize::new(0);
 
     let walker = tilth_core::search::walk::walker(scope, glob)?;
+    // One clock for the per-file bound and the final sort, so both rank by
+    // the same scores.
+    let now = std::time::SystemTime::now();
 
     walker.run(|| {
         let matcher = &matcher;
+        let check = check.as_ref();
         let matches = &matches;
+        let skipped_large = &skipped_large;
         let total_found = &total_found;
 
         Box::new(move |entry| {
@@ -92,7 +107,10 @@ fn search_capped(
             // Skip oversized files — tree-sitter and ripgrep shouldn't spend time on minified bundles
             let file_size = match std::fs::metadata(path) {
                 Ok(meta) => {
-                    if meta.len() > MAX_SEARCH_FILE_SIZE {
+                    if meta.len() > tilth_core::source::MAX_FILE_SIZE {
+                        if check.is_some_and(|c| super::oversized_holds(path, c)) {
+                            super::record(skipped_large, path);
+                        }
                         return ignore::WalkState::Continue;
                     }
                     meta.len()
@@ -104,13 +122,14 @@ fn search_capped(
             // so the minified-check (when triggered) and the actual search
             // share a single kernel read — no double I/O, no TOCTOU window
             // between the heuristic and the search.
-            let Ok(bytes) = std::fs::read(path) else {
+            let Ok(bytes) = tilth_core::source::read(path) else {
                 return ignore::WalkState::Continue;
             };
+            let bytes = tilth_core::source::strip_bom_bytes(&bytes);
 
-            // Catch unmarked minified bundles in the 100KB–500KB range.
+            // Catch unmarked minified bundles between 100 KB and the size cap.
             if file_size >= tilth_core::lang::detection::MINIFIED_CHECK_THRESHOLD
-                && tilth_core::lang::detection::is_minified_by_content(&bytes)
+                && tilth_core::lang::detection::is_minified_by_content(bytes)
             {
                 return ignore::WalkState::Continue;
             }
@@ -120,9 +139,11 @@ fn search_capped(
             let mut file_matches = Vec::new();
             let mut searcher = Searcher::new();
 
+            // The UTF8 sink ends this file's search at its first matched line
+            // that is not UTF-8, and the error is dropped here: #308.
             let _ = searcher.search_slice(
                 matcher,
-                &bytes,
+                bytes,
                 UTF8(|line_num, line| {
                     file_matches.push(Match {
                         path: path.to_path_buf(),
@@ -148,7 +169,14 @@ fn search_capped(
                 // the same comparator, so nothing displayed changes, while the
                 // collected set stays bounded by files × cap rather than by the
                 // hit count — which is what the early quit used to bound.
-                rank::retain_top_k(&mut file_matches, pattern, scope, context, per_file_cap);
+                rank::retain_top_k(
+                    &mut file_matches,
+                    pattern,
+                    scope,
+                    context,
+                    now,
+                    per_file_cap,
+                );
                 let mut all = matches
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -169,7 +197,7 @@ fn search_capped(
         .into_inner()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-    rank::sort(&mut all_matches, pattern, scope, context);
+    rank::sort(&mut all_matches, pattern, scope, context, now);
     all_matches.truncate(max_matches);
 
     Ok(SearchResult {
@@ -178,8 +206,12 @@ fn search_capped(
         matches: all_matches,
         total_found: total,
         definitions: 0,
+        code_definitions: 0,
         usages: total,
         facet_totals: FacetTotals::default(),
+        skipped_large: super::sorted(skipped_large),
+        skipped_for: pattern.to_string(),
+        other_owners: Vec::new(),
     })
 }
 

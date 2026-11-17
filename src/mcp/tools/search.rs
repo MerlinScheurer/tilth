@@ -9,6 +9,7 @@ use tilth_core::index::bloom::BloomFilterCache;
 
 use super::{apply_budget, resolve_scope};
 
+#[expect(clippy::too_many_lines, reason = "split by responsibility in #315")]
 pub(in crate::mcp) fn tool_search(
     args: &Value,
     cache: &OutlineCache,
@@ -39,7 +40,12 @@ pub(in crate::mcp) fn tool_search(
         .map(PathBuf::from);
     let context = context_path.as_deref();
     let glob = args.get("glob").and_then(|v| v.as_str());
-    let budget = args.get("budget").and_then(serde_json::Value::as_u64);
+    // Expanded search and the response cap must use the same budget.
+    let budget = Some(
+        args.get("budget")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(crate::budget::DEFAULT_BUDGET),
+    );
 
     let output = match kind {
         "symbol" => {
@@ -348,21 +354,11 @@ mod tests {
         );
     }
 
-    /// MED finding from PR review: `BATCH_EARLY_QUIT` (50 raw matches) is a
-    /// walk-wide budget shared by every target in a batch search. The walker
-    /// (`find_callers_batch`) checks this budget once per **file** visited
-    /// (an `AtomicUsize` compared before each file read — see
-    /// `src/search/callers.rs`'s `found_count.load(..) >= early_quit_threshold`
-    /// gate), so it only starves later files, not later matches within one
-    /// already-open file. To reproduce real starvation this test spreads 60
-    /// `alpha` call sites across 60 separate files (one call site per file:
-    /// `a_00.rs`..`a_59.rs`) — comfortably above the un-scaled 50-match
-    /// walk-wide budget — and puts `beta`'s lone call site in a file that
-    /// sorts after all of them (`z_beta.rs`). With an unscaled budget the
-    /// walk can quit after visiting ~50 of the `a_*.rs` files, before
-    /// `z_beta.rs` is ever read, starving beta entirely. Scaling the budget
-    /// by target count (2x for 2 targets = 100) gives the walk enough
-    /// headroom to reach `z_beta.rs`.
+    /// A multi-target callers search walks once for all targets. When that
+    /// walk quit on a shared count of 50 sites, 60 `alpha` call sites in 60
+    /// files could use it up before the walk reached `z_beta.rs`, and `beta`
+    /// came back with no callers. The walk now visits every file and counts
+    /// each target on its own.
     #[test]
     fn callers_multi_target_later_target_not_starved_by_hit_rich_earlier_target() {
         let tmp = tempfile::tempdir().unwrap();
@@ -374,8 +370,7 @@ mod tests {
             )
             .unwrap();
         }
-        // Sorts after every "a_*.rs" file — only reached if the walk's
-        // early-quit budget has enough headroom to visit all 61 prior files.
+        // Sorts after every "a_*.rs" file.
         std::fs::write(tmp.path().join("z_beta.rs"), "fn uses_beta() { beta(); }\n").unwrap();
 
         let cache = OutlineCache::new();
@@ -391,8 +386,11 @@ mod tests {
 
         assert!(
             out.contains("uses_beta"),
-            "beta call site starved by alpha's hit-rich budget consumption \
-             (early-quit budget was not scaled by target count): {out}"
+            "beta call site starved by alpha's hit-rich budget consumption: {out}"
+        );
+        assert!(
+            out.contains("— 10 of 60 call sites"),
+            "alpha's total counts every file: {out}"
         );
     }
 
@@ -555,6 +553,82 @@ mod tests {
         for i in 0..n {
             std::fs::write(dir.join(format!("{prefix}_{i:02}.rs")), body(i)).unwrap();
         }
+    }
+
+    #[test]
+    fn later_search_expands_a_definition_omitted_by_the_budget() {
+        use std::fmt::Write as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut source = String::from("pub fn big_target() {\n");
+        for i in 0..400 {
+            let _ = writeln!(source, "    let v{i} = {i} + 1;");
+        }
+        source.push_str("}\n\nfn user() {\n    big_target();\n}\n");
+        std::fs::write(tmp.path().join("big.rs"), source).unwrap();
+
+        check_budgeted_expansion(
+            tmp.path(),
+            "big_target",
+            300,
+            "big_target",
+            "let v0 =",
+            "expansion omitted to fit budget",
+        );
+    }
+
+    #[test]
+    fn later_search_expands_a_definition_cut_from_a_multi_search() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (file, symbol, marker) in [
+            ("first.rs", "first_target", "marker_one"),
+            ("second.rs", "second_target", "marker_two"),
+        ] {
+            let source = format!("pub fn {symbol}() {{\n    let {marker} = 1;\n}}\n");
+            std::fs::write(tmp.path().join(file), source).unwrap();
+        }
+
+        check_budgeted_expansion(
+            tmp.path(),
+            "first_target,second_target",
+            100,
+            "second_target",
+            "let marker_two =",
+            "... truncated (",
+        );
+    }
+
+    fn check_budgeted_expansion(
+        scope: &std::path::Path,
+        tight_query: &str,
+        tight_budget: u64,
+        next_query: &str,
+        source: &str,
+        omission: &str,
+    ) {
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        let search = |query: &str, budget: u64| {
+            let args = serde_json::json!({ "query": query, "scope": scope, "budget": budget });
+            tool_search(&args, &cache, &session, &bloom).unwrap()
+        };
+
+        let tight = search(tight_query, tight_budget);
+        assert!(
+            tight.contains(omission) && !tight.contains(source),
+            "{tight}"
+        );
+        let roomy = search(next_query, 10_000);
+        assert!(
+            roomy.contains(source) && !roomy.contains("[shown earlier]"),
+            "{roomy}"
+        );
+        let repeated = search(next_query, 10_000);
+        assert!(
+            repeated.contains("[shown earlier]") && !repeated.contains(source),
+            "{repeated}"
+        );
     }
 
     fn run_search(args: &Value) -> String {

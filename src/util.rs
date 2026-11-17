@@ -31,8 +31,8 @@ pub(crate) fn atomic_write_bytes_if_unchanged(
 /// Write `bytes` to `path` atomically: write to a temp file in the same
 /// directory, preserve the original file's permissions (if it exists), then
 /// rename into place. A crash mid-write leaves the original intact, and a
-/// reader holding an mmap of the original keeps a valid mapping — the inode is
-/// replaced, never truncated.
+/// concurrent reader sees the whole old file or the whole new one: the inode
+/// is replaced, never truncated.
 ///
 /// The temp name is qualified with the process ID and a process-wide counter
 /// so concurrent or batched writes in the same directory can't collide.
@@ -55,12 +55,17 @@ fn write_via_temp(
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     let tmp = dir.join(format!(".tilth-tmp.{}.{n}", std::process::id()));
+    // Every remove of `tmp` below is cleanup on a path that already failed
+    // or was refused. The caller needs that outcome, not a second error from
+    // the cleanup, and at worst one dot-named temp file stays behind.
     std::fs::write(&tmp, bytes).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
     })?;
     // Preserve original file permissions so the rename doesn't widen or strip
-    // the mode. Ignore errors — target may not exist yet or platform may not
-    // support it; the write already succeeded.
+    // the mode. A target that does not exist yet has none to keep. The temp
+    // file is ours, so setting its mode fails only on a filesystem without
+    // Unix modes (FAT, some network mounts), where there is no mode to keep
+    // either; the write goes ahead.
     if let Ok(meta) = std::fs::metadata(path) {
         let _ = std::fs::set_permissions(&tmp, meta.permissions());
     }
@@ -69,7 +74,7 @@ fn write_via_temp(
     // rather than clobbering their write. An unreadable target counts as
     // changed — the file the caller verified is no longer there to write over.
     if let Some(expected) = expected {
-        if !std::fs::read(path).is_ok_and(|current| current == expected) {
+        if !tilth_core::source::read(path).is_ok_and(|current| current == expected) {
             let _ = std::fs::remove_file(&tmp);
             return Ok(WriteOutcome::Stale);
         }
@@ -82,6 +87,10 @@ fn write_via_temp(
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "by design: tests read the files they check directly"
+)]
 mod tests {
     use super::*;
 

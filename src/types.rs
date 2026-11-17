@@ -24,18 +24,9 @@ pub enum ViewMode {
     Outline,
     Signature,
     Keys,
-    // Reserved/roadmap: planned head+tail view mode, not yet wired.
-    #[allow(dead_code)]
-    HeadTail,
     Empty,
     Generated,
     Minified,
-    // Reserved/roadmap: binary file view variant, not yet wired.
-    #[allow(dead_code)]
-    Binary,
-    // Reserved/roadmap: error view variant, not yet wired.
-    #[allow(dead_code)]
-    Error,
     Section,
     Stripped,
 }
@@ -47,12 +38,9 @@ impl std::fmt::Display for ViewMode {
             Self::Outline => write!(f, "outline"),
             Self::Signature => write!(f, "signature"),
             Self::Keys => write!(f, "keys"),
-            Self::HeadTail => write!(f, "head+tail"),
             Self::Empty => write!(f, "empty"),
             Self::Generated => write!(f, "generated — skipped"),
             Self::Minified => write!(f, "minified — skipped"),
-            Self::Binary => write!(f, "skipped"),
-            Self::Error => write!(f, "error"),
             Self::Section => write!(f, "section"),
             Self::Stripped => write!(f, "stripped"),
         }
@@ -89,11 +77,35 @@ pub struct SearchResult {
     pub matches: Vec<Match>,
     pub total_found: usize,
     pub definitions: usize,
+    /// The definitions in code files: `definitions` without the Markdown
+    /// headings that name the query.
+    pub code_definitions: usize,
     pub usages: usize,
     /// Pre-cap subfacet counts. Computed in `symbol::search` by faceting the
     /// merged set before truncation; used by the renderer to print
     /// `displayed/total` headings and the per-facet hidden-count tail line.
     pub facet_totals: FacetTotals,
+    /// Files over `tilth_core::source::MAX_FILE_SIZE` that the walk skipped
+    /// even though they contain the query, sorted. The renderer names them,
+    /// so a match that lives in a big file is never silently missing.
+    pub skipped_large: Vec<PathBuf>,
+    /// What the walk looked for in the files it skipped for size: the
+    /// query, or for a qualified symbol query its bare name, which a
+    /// definition carries.
+    pub skipped_for: String,
+    /// For a qualified query (`Owner::name`, `Owner.name`) that matched no
+    /// definition: the definitions of the bare name that other owners hold,
+    /// sorted by path and line. Empty otherwise.
+    pub other_owners: Vec<OtherOwner>,
+}
+
+/// A definition of a qualified query's bare name that another owner holds,
+/// or no owner (`owner: None`, a top-level definition).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct OtherOwner {
+    pub path: PathBuf,
+    pub line: u32,
+    pub owner: Option<String>,
 }
 
 /// Pre-cap counts per subfacet. Defaults to all-zero for callers that don't

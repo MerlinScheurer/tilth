@@ -1,21 +1,8 @@
-#![warn(clippy::pedantic)]
-#![allow(
-    clippy::cast_possible_truncation,  // line numbers as u32, token counts — we target 64-bit
-    clippy::cast_sign_loss,            // same
-    clippy::cast_possible_wrap,        // u32→i32 for tree-sitter APIs
-    clippy::module_name_repetitions,   // Rust naming conventions
-    clippy::similar_names,             // common in parser/search code
-    clippy::too_many_lines,            // crate-wide to cover find_definitions in src/search/symbol.rs;
-                                       // narrow to a per-function allow once a refactor shrinks that file
-    clippy::too_many_arguments,        // internal recursive AST walker
-    clippy::unnecessary_wraps,         // Result return for API consistency
-    clippy::struct_excessive_bools,    // CLI struct derives clap
-    clippy::missing_errors_doc,        // internal pub(crate) fns don't need error docs
-    clippy::missing_panics_doc,        // same
-)]
+#![forbid(unsafe_code)]
 
 pub(crate) mod budget;
 pub(crate) mod classify;
+pub mod diag;
 pub mod diff;
 pub(crate) mod edit;
 pub(crate) mod edit_parse_check;
@@ -56,7 +43,7 @@ pub mod __fuzz {
     }
 }
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use classify::classify;
 use tilth_core::cache::OutlineCache;
@@ -103,6 +90,142 @@ pub fn refuse_file_scope(raw: &Path, resolved: &Path, hint: FileScopeHint) -> Re
         "scope \"{}\" is a file, and scope must be an existing directory. {fix}",
         raw.display()
     ))
+}
+
+/// A hint for a `scope` that is not an existing directory, usually a typo.
+/// One rule for the CLI, which refuses the scope, and the MCP tools, which
+/// warn and fall back to `root`.
+///
+/// `raw` is the scope as the caller wrote it and `resolved` the path that
+/// was checked, as in [`refuse_file_scope`]. The hint names up to three
+/// existing directories whose name is close to the scope's last component,
+/// found under the nearest existing parent and up to three levels below it,
+/// so `src/serach` suggests `src/search` and `read` suggests `src/read`.
+/// With nothing close, it names that nearest existing parent. Suggested
+/// paths stay in the caller's frame: a relative scope gets relative paths.
+/// The scan runs only when that parent lies inside `project` (the CLI's
+/// working directory, or the MCP call's root) or inside a checkout, and
+/// neither is the filesystem root or the home directory; anywhere else, the
+/// hint names the parent alone.
+#[must_use]
+pub fn missing_scope_hint(raw: &Path, resolved: &Path, project: &Path) -> String {
+    scope_hint(raw, resolved, project, home::home_dir().as_deref())
+}
+
+/// [`missing_scope_hint`] with the home directory given.
+fn scope_hint(raw: &Path, resolved: &Path, project: &Path, home: Option<&Path>) -> String {
+    let Some(wanted) = resolved
+        .file_name()
+        .map(|n| n.to_string_lossy().to_lowercase())
+    else {
+        return String::new();
+    };
+    // A relative path's last parent is "", which names the current directory.
+    let dir_or_cwd = |p: &Path| -> PathBuf {
+        if p.as_os_str().is_empty() {
+            PathBuf::from(".")
+        } else {
+            p.to_path_buf()
+        }
+    };
+    let mut base = resolved;
+    let mut raw_base = raw;
+    while !dir_or_cwd(base).is_dir() {
+        let (Some(parent), Some(raw_parent)) = (base.parent(), raw_base.parent()) else {
+            return String::new();
+        };
+        base = parent;
+        raw_base = raw_parent;
+    }
+    let base = dir_or_cwd(base);
+
+    // Scan for close names only inside a project: the caller's own, or the
+    // checkout the scope points into. Anywhere else the nearest parent can
+    // be `/` or a mount point, where listing directories is slow or, on a
+    // stale network mount, blocks. A desktop MCP server often runs in `/`
+    // or the home directory, which hold every path, so neither counts.
+    let home = home.and_then(|h| h.canonicalize().ok());
+    let scannable = |frame: &Path| frame.parent().is_some() && home.as_deref() != Some(frame);
+    let in_project = base.canonicalize().is_ok_and(|base| {
+        project
+            .canonicalize()
+            .is_ok_and(|project| scannable(&project) && base.starts_with(project))
+            || in_a_checkout(&base, scannable)
+    });
+    let close = if in_project {
+        close_directories(&base, &wanted)
+    } else {
+        Vec::new()
+    };
+    if close.is_empty() {
+        return format!(
+            "The nearest existing directory is \"{}\".",
+            dir_or_cwd(raw_base).display()
+        );
+    }
+    let named: Vec<String> = close
+        .iter()
+        .map(|rel| format!("\"{}\"", raw_base.join(rel).display()))
+        .collect();
+    format!("Did you mean {}?", named.join(" or "))
+}
+
+/// Is `dir` inside a checkout: below a `scannable` directory that holds
+/// `.git` or a package manifest?
+fn in_a_checkout(dir: &Path, scannable: impl Fn(&Path) -> bool) -> bool {
+    dir.ancestors()
+        .any(|d| scannable(d) && d.join(".git").exists())
+        || tilth_core::lang::package_root(dir).is_some_and(scannable)
+}
+
+/// Directories under `base` (relative to it) whose name is within a small
+/// edit distance of `wanted`, one edit per three characters and at least
+/// one, closest and shallowest first. The search goes three levels down and
+/// stops after 2,000 directories, skips the walker's `SKIP_DIRS` and hidden
+/// directories, and returns at most three names.
+fn close_directories(base: &Path, wanted: &str) -> Vec<PathBuf> {
+    /// Directories at depth 0 (`base`) to 2 are listed, so their children
+    /// reach three levels below `base`.
+    const MAX_DEPTH: usize = 3;
+    const MAX_DIRS: usize = 2_000;
+    let limit = (wanted.chars().count() / 3).max(1);
+    let mut found: Vec<(usize, usize, PathBuf)> = Vec::new();
+    let mut queue = std::collections::VecDeque::from([(PathBuf::new(), 0usize)]);
+    let mut visited = 0;
+    while let Some((rel, depth)) = queue.pop_front() {
+        if depth >= MAX_DEPTH || visited >= MAX_DIRS {
+            break;
+        }
+        let Ok(entries) = std::fs::read_dir(base.join(&rel)) else {
+            continue;
+        };
+        let mut children: Vec<PathBuf> = entries
+            .flatten()
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+            .filter_map(|e| {
+                let name = e.file_name().to_str()?.to_string();
+                let skip = name.starts_with('.')
+                    || tilth_core::search::walk::SKIP_DIRS.contains(&name.as_str());
+                (!skip).then(|| rel.join(name))
+            })
+            .collect();
+        children.sort();
+        for child in children {
+            visited += 1;
+            let name = child
+                .file_name()
+                .map_or_else(String::new, |n| n.to_string_lossy().to_lowercase());
+            // Optimal string alignment counts a swapped pair (`scr` for
+            // `src`) as one edit, the most common typo in a path.
+            let distance = strsim::osa_distance(wanted, &name);
+            if distance <= limit {
+                found.push((distance, depth, child.clone()));
+            }
+            queue.push_back((child, depth + 1));
+        }
+    }
+    found.sort();
+    found.into_iter().take(3).map(|(_, _, p)| p).collect()
 }
 
 /// Holds expanded search dependencies, allocated once.
@@ -179,6 +302,10 @@ pub fn run_full(
 /// `cli.full || !is_tty`). `cli_full` is the *parsed* `--full` flag and
 /// alone gates the search match-cap bump; piped invocation must not raise
 /// the cap (see `piped_invocation_does_not_auto_expand` pin).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "per-call options become one Request in #307"
+)]
 pub fn run_expanded(
     query: &str,
     scope: &Path,
@@ -227,11 +354,17 @@ pub fn run_deps(
     path: &Path,
     scope: &Path,
     budget_tokens: Option<u64>,
+    full: bool,
 ) -> Result<String, TilthError> {
     let bloom = tilth_core::BloomFilterCache::new();
     let result = tilth_core::analyze_deps(path, scope, &bloom)?;
     let budget_usize = budget_tokens.map(|b| b as usize);
-    Ok(search::deps::format_deps(&result, scope, budget_usize))
+    Ok(search::deps::format_deps(
+        &result,
+        scope,
+        budget_usize,
+        full,
+    ))
 }
 
 /// Grok a symbol: return def + doc + callees + callers + siblings + tests in one call.
@@ -250,6 +383,10 @@ pub fn run_grok(target_spec: &str, scope: &Path, full: bool) -> Result<String, T
     Ok(search::grok::format_grok(&result, scope))
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "per-call options become one Request in #307"
+)]
 fn run_inner(
     query: &str,
     scope: &Path,
@@ -280,7 +417,7 @@ fn run_inner(
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .collect();
-        let all_identifiers = parts.iter().all(|p| classify::is_identifier(p));
+        let all_identifiers = parts.iter().all(|p| classify::is_symbol_name(p));
         if parts.len() > 5 && all_identifiers {
             return Err(TilthError::InvalidQuery {
                 query: query.to_string(),
@@ -316,12 +453,13 @@ fn run_inner(
     // FilePath and Glob are read operations, not search — handle before expanded dispatch
     let output = match query_type {
         QueryType::FilePath(path) => {
-            let mut out = read::read_file(&path, section, full, cache, false)?;
+            let mut out = read::read_file(&path, section, full, cache, false, budget_tokens)?;
             if section.is_none() && !full && read::would_outline(&path) {
                 let related = tilth_core::imports::resolve_related_files(&path, cache);
                 if !related.is_empty() {
                     let hints: Vec<String> = related
                         .iter()
+                        .take(read::RELATED_HINT_LIMIT)
                         .filter_map(|p| p.strip_prefix(scope).ok().or(Some(p.as_path())))
                         .map(|p| p.display().to_string())
                         .collect();
@@ -437,8 +575,8 @@ fn run_query_expanded(
 /// Only called for search query types — FilePath/Glob are handled before this.
 /// `full_search` is the parsed `--full` flag. It is named apart from
 /// `run_inner`'s `full`, which means full-*file* display: this one raises the
-/// match cap and the walker's early-quit thresholds and expands nothing,
-/// which is exactly what `--full --expand=0` asks for.
+/// match cap and expands nothing, which is exactly what `--full --expand=0`
+/// asks for.
 fn run_query_basic(
     query_type: &QueryType,
     scope: &Path,
@@ -502,9 +640,31 @@ fn single_query_search(
         return search::format_raw_result(&sym_result, cache);
     }
 
-    Err(TilthError::NotFound {
-        path: scope.join(text),
-        suggestion: read::suggest_similar_file(scope, text),
+    // Fallthrough only carries path-shaped queries (`src/foo.rs`) that name
+    // no existing file, so for them "not found" is the true answer.
+    if !prefer_definitions {
+        return Err(TilthError::NotFound {
+            path: scope.join(text),
+            suggestion: read::suggest_similar_file(scope, text),
+        });
+    }
+    no_matches(&content_result, cache, scope, text)
+}
+
+/// A word or phrase that matched nothing: the standard `0 matches` result,
+/// plus a did-you-mean when a file in `scope` has a close name. This used to
+/// be `TilthError::NotFound`, which printed `not found: <scope>/<query>` and
+/// exited 2, as if the query had named a missing file.
+fn no_matches(
+    result: &types::SearchResult,
+    cache: &OutlineCache,
+    scope: &Path,
+    name: &str,
+) -> Result<String, TilthError> {
+    let out = search::format_raw_result(result, cache)?;
+    Ok(match read::suggest_similar_file(scope, name) {
+        Some(file) => format!("{out}\n\n> A file has a similar name: {file}"),
+        None => out,
     })
 }
 
@@ -549,10 +709,7 @@ fn multi_word_concept_search(
     }
 
     let first_word = words.first().copied().unwrap_or(text);
-    Err(TilthError::NotFound {
-        path: scope.join(text),
-        suggestion: read::suggest_similar_file(scope, first_word),
-    })
+    no_matches(&content_result, cache, scope, first_word)
 }
 
 #[cfg(test)]
@@ -578,6 +735,108 @@ mod tests {
             "scope \"x.py\" is a file, and scope must be an existing directory. \
              Set scope to its directory (\".\") instead."
         );
+    }
+
+    /// A checkout with `src/search`, `src/read` and `docs`.
+    fn dir_tree() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for d in ["src/search", "src/read", "docs"] {
+            std::fs::create_dir_all(dir.path().join(d)).unwrap();
+        }
+        dir
+    }
+
+    /// A typo in the last component names the close sibling, in the frame
+    /// the caller wrote the scope in.
+    #[test]
+    fn missing_scope_hint_names_a_close_sibling() {
+        let dir = dir_tree();
+        let hint = missing_scope_hint(
+            Path::new("src/serach"),
+            &dir.path().join("src/serach"),
+            dir.path(),
+        );
+        assert_eq!(hint, "Did you mean \"src/search\"?");
+    }
+
+    /// A directory given without its parent is found deeper in the tree.
+    #[test]
+    fn missing_scope_hint_finds_the_name_deeper() {
+        let dir = dir_tree();
+        let hint = missing_scope_hint(Path::new("read"), &dir.path().join("read"), dir.path());
+        assert_eq!(hint, "Did you mean \"src/read\"?");
+    }
+
+    /// With nothing close, the hint names the nearest directory that exists.
+    #[test]
+    fn missing_scope_hint_falls_back_to_the_nearest_parent() {
+        let dir = dir_tree();
+        let raw = dir.path().join("src/zzqqxx/deeper");
+        let hint = missing_scope_hint(&raw, &raw, dir.path());
+        let src = dir.path().join("src");
+        assert_eq!(
+            hint,
+            format!("The nearest existing directory is \"{}\".", src.display())
+        );
+    }
+
+    /// The close-name scan stays inside the project. A scope whose nearest
+    /// existing parent is above it (`/`, `/Users`, a mount point) used to
+    /// list up to 2,000 directories there, and a stale network mount can
+    /// block that. Such a hint names the nearest directory and scans nothing.
+    #[test]
+    fn missing_scope_hint_does_not_scan_above_the_project() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for d in ["src/search", "docs"] {
+            std::fs::create_dir_all(dir.path().join(d)).unwrap();
+        }
+        let project = dir.path().join("src");
+        let raw = dir.path().join("dosc");
+        let hint = missing_scope_hint(&raw, &raw, &project);
+        assert_eq!(
+            hint,
+            format!(
+                "The nearest existing directory is \"{}\".",
+                dir.path().display()
+            )
+        );
+    }
+
+    /// A frame of `/` or the home directory, the usual working directory of
+    /// a desktop MCP server, holds every path, so it let the scan run
+    /// anywhere. Such a frame grants no scan.
+    #[test]
+    fn missing_scope_hint_does_not_scan_from_a_frame_of_root_or_home() {
+        let dir = dir_tree();
+        let raw = dir.path().join("dosc");
+        let nearest = format!(
+            "The nearest existing directory is \"{}\".",
+            dir.path().display()
+        );
+        assert_eq!(missing_scope_hint(&raw, &raw, Path::new("/")), nearest);
+        assert_eq!(
+            scope_hint(&raw, &raw, dir.path(), Some(dir.path())),
+            nearest
+        );
+        // A checkout at home is no project either.
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        let elsewhere = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            scope_hint(&raw, &raw, elsewhere.path(), Some(dir.path())),
+            nearest
+        );
+    }
+
+    /// An absolute scope into another checkout still gets the close name.
+    #[test]
+    fn missing_scope_hint_scans_the_checkout_the_scope_points_into() {
+        let dir = dir_tree();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        let elsewhere = tempfile::tempdir().expect("tempdir");
+        let raw = dir.path().join("dosc");
+        let hint = missing_scope_hint(&raw, &raw, elsewhere.path());
+        let docs = dir.path().join("docs");
+        assert_eq!(hint, format!("Did you mean \"{}\"?", docs.display()));
     }
 
     /// 15 files, each carrying one instance of every query shape that reaches
@@ -703,5 +962,50 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A word or phrase that matches nothing is a search with no results,
+    /// not a missing path. It used to fail with `not found: <scope>/<query>`
+    /// and exit 2, as if the query named a file.
+    #[test]
+    fn zero_hit_search_says_no_matches() {
+        let dir = fixture();
+        let cache = OutlineCache::new();
+        for query in ["zzqqxx", "zzqq xxyy"] {
+            let out = run(query, dir.path(), None, None, None, &cache)
+                .unwrap_or_else(|e| panic!("{query:?} must not be an error, got: {e}"));
+            assert!(
+                out.starts_with(&format!("# Search: \"{query}\" in "))
+                    && out.contains("— 0 matches"),
+                "{query:?}: {out}"
+            );
+            assert!(!out.contains("not found"), "{query:?}: {out}");
+        }
+    }
+
+    /// A name close to an existing file keeps its did-you-mean, now as a hint
+    /// under the empty result.
+    #[test]
+    fn zero_hit_search_keeps_the_file_name_hint() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("config"), "x\n").unwrap();
+        let cache = OutlineCache::new();
+        let out = run("confg", dir.path(), None, None, None, &cache).expect("no error");
+        assert!(out.contains("— 0 matches"), "{out}");
+        assert!(
+            out.contains("config"),
+            "the hint must name the close file: {out}"
+        );
+    }
+
+    /// A path-shaped query that names no file still says so: there the
+    /// query really is a missing path.
+    #[test]
+    fn zero_hit_path_query_still_reports_the_missing_path() {
+        let dir = fixture();
+        let cache = OutlineCache::new();
+        let err = run("src/nothing_here.rs", dir.path(), None, None, None, &cache)
+            .expect_err("a missing path is an error");
+        assert!(err.to_string().starts_with("not found: "), "{err}");
     }
 }

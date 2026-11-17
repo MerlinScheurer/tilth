@@ -13,6 +13,7 @@ use tilth_core::types::{FileType, OutlineEntry, OutlineKind};
 
 use super::apply_budget;
 
+#[expect(clippy::too_many_lines, reason = "split by responsibility in #315")]
 pub(in crate::mcp) fn tool_read(
     args: &Value,
     cache: &OutlineCache,
@@ -20,6 +21,10 @@ pub(in crate::mcp) fn tool_read(
     edit_mode: bool,
 ) -> Result<String, String> {
     let budget = args.get("budget").and_then(serde_json::Value::as_u64);
+    // The budget every read is fitted to. With no `budget` argument it is
+    // the default cap the response gets anyway, so the outline is fitted
+    // to it instead of being cut there mid-entry.
+    let read_budget = budget.unwrap_or(crate::budget::DEFAULT_BUDGET);
     // Extract optional root for anchoring relative paths. A relative path
     // without an absolute `root` is unresolvable (the server cannot see the
     // caller's shell cwd) — propagate that refusal at each path-resolution site.
@@ -63,7 +68,12 @@ pub(in crate::mcp) fn tool_read(
             .unwrap_or(60);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(batch_timeout);
 
+        // Every file is read at its own size first. Only when the batch is
+        // over the budget do the biggest files shrink, each to a fair share
+        // (`fair_share`), so small files stay whole.
         let mut results = Vec::with_capacity(paths_arr.len());
+        // The files whose view a budget can shrink, by index in `results`.
+        let mut fitted: Vec<(usize, PathBuf)> = Vec::new();
         for (i, p) in paths_arr.iter().enumerate() {
             // Check deadline before each file
             if std::time::Instant::now() > deadline {
@@ -80,15 +90,46 @@ pub(in crate::mcp) fn tool_read(
             let path = super::resolve_read_path(&PathBuf::from(path_str), root)?;
             session.record_read(&path);
             let read = if force_signature {
-                read_signature_file(&path, cache).map(|(body, _)| body)
+                read_signature_file(&path, cache)
             } else if force_stripped {
-                read_stripped_file(&path, cache).map(|(body, _, _)| body)
+                read_stripped_file(&path, cache)
             } else {
-                crate::read::read_file(&path, None, force_full, cache, edit_mode)
+                let read = crate::read::read_file(
+                    &path,
+                    None,
+                    force_full,
+                    cache,
+                    edit_mode,
+                    Some(read_budget),
+                );
+                if read.is_ok() {
+                    fitted.push((results.len(), path.clone()));
+                }
+                read
             };
-            match read {
-                Ok(output) => results.push(output),
-                Err(e) => results.push(format!("# {} — error: {}", path.display(), e)),
+            results.push(match read {
+                Ok(output) => output,
+                Err(e) => format!("# {} — error: {}", path.display(), e),
+            });
+        }
+        // Each file's cost in the joined batch, its separator included.
+        let cost = |view: &str| crate::types::estimate_tokens(view.len() as u64 + 2);
+        let sizes: Vec<u64> = results.iter().map(|r| cost(r)).collect();
+        if let Some(share) = fair_share(&sizes, read_budget) {
+            for (i, path) in fitted {
+                if sizes[i] > share {
+                    if let Ok(view) = crate::read::read_file(
+                        &path,
+                        None,
+                        force_full,
+                        cache,
+                        edit_mode,
+                        // One token of the share is the separator's.
+                        Some(share.saturating_sub(1)),
+                    ) {
+                        results[i] = view;
+                    }
+                }
             }
         }
         let combined = results.join("\n\n");
@@ -134,44 +175,51 @@ pub(in crate::mcp) fn tool_read(
             ));
         }
         session.record_read(&path);
-        let output = match budget {
-            Some(b) => crate::read::read_ranges_with_budget(&path, &ranges, edit_mode, b)
-                .map_err(|e| e.to_string())?,
-            None => {
-                crate::read::read_ranges(&path, &ranges, edit_mode).map_err(|e| e.to_string())?
-            }
-        };
-        return Ok(output);
+        return crate::read::read_ranges_with_budget(&path, &ranges, edit_mode, read_budget)
+            .map_err(|e| e.to_string());
     }
 
     session.record_read(&path);
 
-    let mut output = if section.is_none() && force_signature {
-        read_signature_file(&path, cache)
-            .map(|(body, _)| body)
-            .map_err(|e| e.to_string())?
-    } else if section.is_none() && force_stripped {
-        read_stripped_file(&path, cache)
-            .map(|(body, _, _)| body)
-            .map_err(|e| e.to_string())?
-    } else {
-        crate::read::read_file(&path, section, force_full, cache, edit_mode)
-            .map_err(|e| e.to_string())?
-    };
-
-    // Append related-file hint for outlined code files (not section reads, not batch).
+    // The related-file hint for outlined code files (not section reads, not
+    // batch). It is built first, so the read is fitted to the room it leaves
+    // and the final cut never removes the note that says what a fit left out.
+    let mut related_hint = String::new();
     if section.is_none() && crate::read::would_outline(&path) {
         let related = tilth_core::imports::resolve_related_files(&path, cache);
         if !related.is_empty() {
-            output.push_str("\n\n> Related: ");
-            for (i, p) in related.iter().enumerate() {
+            related_hint.push_str("\n\n> Related: ");
+            for (i, p) in related
+                .iter()
+                .take(crate::read::RELATED_HINT_LIMIT)
+                .enumerate()
+            {
                 if i > 0 {
-                    output.push_str(", ");
+                    related_hint.push_str(", ");
                 }
-                let _ = write!(output, "{}", p.display());
+                let _ = write!(related_hint, "{}", p.display());
             }
         }
     }
+    let file_budget =
+        read_budget.saturating_sub(crate::types::estimate_tokens(related_hint.len() as u64));
+
+    let mut output = if section.is_none() && force_signature {
+        read_signature_file(&path, cache).map_err(|e| e.to_string())?
+    } else if section.is_none() && force_stripped {
+        read_stripped_file(&path, cache).map_err(|e| e.to_string())?
+    } else {
+        crate::read::read_file(
+            &path,
+            section,
+            force_full,
+            cache,
+            edit_mode,
+            Some(file_budget),
+        )
+        .map_err(|e| e.to_string())?
+    };
+    output.push_str(&related_hint);
 
     Ok(apply_budget(&output, budget))
 }
@@ -180,42 +228,33 @@ pub(in crate::mcp) fn tool_read(
 // formatted outline strings, not Vec<OutlineEntry>, so get_outline_entries below
 // re-parses every call. Wiring a structured cache is a separate change. The param
 // is still used by the non-code fallback (read_file), so it keeps its real name.
-fn read_signature_file(path: &Path, cache: &OutlineCache) -> Result<(String, u32), TilthError> {
-    let content = std::fs::read_to_string(path).map_err(|e| match e.kind() {
-        std::io::ErrorKind::NotFound => TilthError::NotFound {
-            path: path.to_path_buf(),
-            suggestion: None,
-        },
-        std::io::ErrorKind::PermissionDenied => TilthError::PermissionDenied {
-            path: path.to_path_buf(),
-        },
-        _ => TilthError::IoError {
-            path: path.to_path_buf(),
-            source: e,
-        },
-    })?;
-    let meta = std::fs::metadata(path).map_err(|e| TilthError::IoError {
-        path: path.to_path_buf(),
-        source: e,
-    })?;
-    let line_count = u32::try_from(content.lines().count()).unwrap_or(u32::MAX);
-
+fn read_signature_file(path: &Path, cache: &OutlineCache) -> Result<String, TilthError> {
+    // The path says whether a file is code; its content only settles which
+    // language a `.h` is. Any other file gets its default view, streamed.
     let FileType::Code(lang) = detect_file_type(path) else {
-        let body = crate::read::read_file(path, None, false, cache, false)?;
-        return Ok((body, line_count));
+        return crate::read::non_code_view(path, cache);
     };
+    // A pipe, socket or device has no fixed contents and shows as empty.
+    let Some((content, byte_len)) = crate::read::read_text(path)? else {
+        return Ok(crate::read::empty_view(path));
+    };
+    let lang = tilth_core::lang::refine_lang(lang, path, &content);
+    let line_count = u32::try_from(content.lines().count()).unwrap_or(u32::MAX);
 
     // Build the signature header only on the code path — the non-code fallback
     // above returns the normal read and never uses it.
-    let header = crate::format::file_header(path, meta.len(), line_count, ViewMode::Signature);
-    let entries = get_outline_entries(&content, lang);
+    let header = crate::format::file_header(path, byte_len, line_count, ViewMode::Signature);
+    // Parse without the byte-order mark, so a line-1 import is still one,
+    // but print the file's own lines: their hash anchors must match what
+    // `tilth_write` reads from disk. Removing the mark keeps line numbers.
+    let entries = get_outline_entries(tilth_core::source::strip_bom(&content), lang);
     let lines: Vec<&str> = content.lines().collect();
     let mut body = String::new();
     render_signature_entries(&entries, &lines, &mut body);
     if body.is_empty() {
         body = crate::format::hashlines(&content, 1);
     }
-    Ok((format!("{header}\n\n{}", body.trim_end()), line_count))
+    Ok(format!("{header}\n\n{}", body.trim_end()))
 }
 
 fn render_signature_entries(entries: &[OutlineEntry], lines: &[&str], out: &mut String) {
@@ -240,32 +279,20 @@ fn render_signature_entries(entries: &[OutlineEntry], lines: &[&str], out: &mut 
 // formatted outline strings, not Vec<OutlineEntry>, so strip_noise re-parses every
 // call. Wiring a structured cache is a separate change. The param is still used by
 // the non-code fallback (read_file), so it keeps its real name.
-fn read_stripped_file(path: &Path, cache: &OutlineCache) -> Result<(String, u32, u32), TilthError> {
-    let content = std::fs::read_to_string(path).map_err(|e| match e.kind() {
-        std::io::ErrorKind::NotFound => TilthError::NotFound {
-            path: path.to_path_buf(),
-            suggestion: None,
-        },
-        std::io::ErrorKind::PermissionDenied => TilthError::PermissionDenied {
-            path: path.to_path_buf(),
-        },
-        _ => TilthError::IoError {
-            path: path.to_path_buf(),
-            source: e,
-        },
-    })?;
-    let meta = std::fs::metadata(path).map_err(|e| TilthError::IoError {
-        path: path.to_path_buf(),
-        source: e,
-    })?;
+fn read_stripped_file(path: &Path, cache: &OutlineCache) -> Result<String, TilthError> {
+    // Any file that is not code gets its default view, streamed.
+    if !matches!(detect_file_type(path), FileType::Code(_)) {
+        return crate::read::non_code_view(path, cache);
+    }
+    // A pipe, socket or device has no fixed contents and shows as empty.
+    let Some((raw, byte_len)) = crate::read::read_text(path)? else {
+        return Ok(crate::read::empty_view(path));
+    };
+    // A non-editable view, so it reads like search does: without the mark.
+    let content = tilth_core::source::strip_bom(&raw);
     let total_lines = u32::try_from(content.lines().count()).unwrap_or(u32::MAX);
 
-    if !matches!(detect_file_type(path), FileType::Code(_)) {
-        let body = crate::read::read_file(path, None, false, cache, false)?;
-        return Ok((body, total_lines, 0));
-    }
-
-    let skip_lines = crate::search::strip::strip_noise(&content, path, Some((1, total_lines)));
+    let skip_lines = crate::search::strip::strip_noise(content, path, Some((1, total_lines)));
     let width = total_lines.max(1).to_string().len();
     let mut body = String::with_capacity(content.len());
     let mut kept: u32 = 0;
@@ -279,20 +306,103 @@ fn read_stripped_file(path: &Path, cache: &OutlineCache) -> Result<(String, u32,
     }
 
     let stripped = total_lines.saturating_sub(kept);
-    let header = crate::format::file_header(path, meta.len(), total_lines, ViewMode::Stripped);
+    let header = crate::format::file_header(path, byte_len, total_lines, ViewMode::Stripped);
     let note = format!(
         "// stripped {stripped} of {total_lines} lines (plain comments, debug logs, blank collapse) — non-editable view"
     );
-    Ok((
-        format!("{header}\n{note}\n\n{}", body.trim_end()),
-        total_lines,
-        stripped,
-    ))
+    Ok(format!("{header}\n{note}\n\n{}", body.trim_end()))
+}
+
+/// The most each file of a batch may take so the batch fits in `budget`,
+/// when its files' `sizes` add up to more: files under the share keep their
+/// size, and what they leave is split evenly between the bigger ones.
+/// `None` when the batch fits as it is.
+fn fair_share(sizes: &[u64], budget: u64) -> Option<u64> {
+    if sizes.iter().sum::<u64>() <= budget {
+        return None;
+    }
+    let mut sorted = sizes.to_vec();
+    sorted.sort_unstable();
+    let mut left = budget;
+    for (k, &size) in sorted.iter().enumerate() {
+        let share = left / (sorted.len() - k) as u64;
+        if size > share {
+            return Some(share);
+        }
+        left -= size;
+    }
+    None
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "by design: tests read the files they check directly"
+)]
 mod tests {
     use super::*;
+
+    /// A pipe, socket or device shows as empty in the signature and stripped
+    /// views too. Both used to open the path with a blocking read, which
+    /// hung on a pipe that has no writer.
+    #[cfg(unix)]
+    #[test]
+    fn signature_and_stripped_views_show_a_pipe_as_empty() {
+        use tilth_core::test_readers::{make_pipe, unless_blocked_on};
+        let dir = tempfile::tempdir().unwrap();
+        let pipe = dir.path().join("pipe.rs");
+        make_pipe(&pipe);
+        let null = std::path::Path::new("/dev/null");
+        for path in [pipe.as_path(), null] {
+            let views = unless_blocked_on(&pipe, || {
+                let cache = OutlineCache::new();
+                [
+                    read_signature_file(path, &cache),
+                    read_stripped_file(path, &cache),
+                ]
+                .map(Result::unwrap)
+            })
+            .expect("a view blocked on the pipe");
+            for view in views {
+                assert_eq!(view, crate::read::empty_view(path));
+            }
+        }
+    }
+
+    /// A file that is not code gets its default view in the signature and
+    /// stripped views. One that is not UTF-8 fails with the error reading
+    /// it to a string gives, as those views always made it fail.
+    #[test]
+    fn signature_and_stripped_views_of_a_non_code_file() {
+        use std::fmt::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("app.log");
+        let mut text = String::new();
+        for i in 0..2_000 {
+            writeln!(text, "2026-11-11T12:00:00 line {i}").unwrap();
+        }
+        std::fs::write(&log, &text).unwrap();
+        let cache = OutlineCache::new();
+        let default = crate::read::read_file(&log, None, false, &cache, false, None).unwrap();
+        assert!(default.contains("[outline]"), "{default}");
+        assert_eq!(read_signature_file(&log, &cache).unwrap(), default);
+        assert_eq!(read_stripped_file(&log, &cache).unwrap(), default);
+
+        let bad = dir.path().join("bad.log");
+        std::fs::write(&bad, b"ok\n\xff\n").unwrap();
+        let expected = TilthError::IoError {
+            path: bad.clone(),
+            source: std::fs::read_to_string(&bad).unwrap_err(),
+        }
+        .to_string();
+        for view in [
+            read_signature_file(&bad, &cache),
+            read_stripped_file(&bad, &cache),
+        ] {
+            assert_eq!(view.unwrap_err().to_string(), expected);
+        }
+    }
+
     use crate::mcp::tools::tool_definitions;
 
     #[test]
@@ -660,5 +770,165 @@ mod tests {
             err.contains("src/foo.rs") && err.contains("root"),
             "relative path without root must refuse with an actionable message: {err}"
         );
+    }
+
+    /// A JS file with one function per line: its outline is nearly as long
+    /// as the file, and both are far over the default budget.
+    fn write_dense_js(dir: &Path, name: &str) -> PathBuf {
+        let mut src = String::from("import { helper } from './helper';\n");
+        for i in 0..6000 {
+            let _ = writeln!(
+                src,
+                "export function functionNumber{i:05}(alpha, beta) {{ return alpha + beta; }}"
+            );
+        }
+        let path = dir.join(name);
+        std::fs::write(&path, src).unwrap();
+        std::fs::write(dir.join("helper.js"), "export function helper() {}\n").unwrap();
+        path
+    }
+
+    fn read_args(args: &Value) -> String {
+        tool_read(args, &OutlineCache::new(), &Session::new(), false).unwrap()
+    }
+
+    /// With no `budget`, the read skipped the outline fit: the full view
+    /// came back and the default cap cut it after the first functions,
+    /// hiding the rest. It reads like an explicit default budget now.
+    #[test]
+    fn tool_read_without_a_budget_fits_the_outline_to_the_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_dense_js(dir.path(), "dense.js");
+        let path = path.to_str().unwrap();
+        let implicit = read_args(&serde_json::json!({ "path": path }));
+        let explicit = read_args(&serde_json::json!({
+            "path": path,
+            "budget": crate::budget::DEFAULT_BUDGET,
+        }));
+        assert_eq!(implicit, explicit);
+        assert!(implicit.contains("[outline]"), "{}", &implicit[..200]);
+    }
+
+    /// The `> Related:` line went on after the outline was fitted, so the
+    /// final cut removed the note that says what the fit left out.
+    #[test]
+    fn tool_read_keeps_the_fit_note_with_the_related_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_dense_js(dir.path(), "dense.js");
+        let out = read_args(&serde_json::json!({
+            "path": path.to_str().unwrap(),
+            "budget": 24_000,
+        }));
+        assert!(
+            out.contains("> outline cut to fit the budget"),
+            "{}",
+            tail(&out)
+        );
+        assert!(out.contains("> Related: "), "{}", tail(&out));
+        assert!(!out.contains("... truncated"), "{}", tail(&out));
+    }
+
+    /// A batch gave each file the whole budget, so the first big file used
+    /// it up and the next was cut off behind "truncated".
+    #[test]
+    fn tool_read_batch_shares_the_budget_between_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = write_dense_js(dir.path(), "a.js");
+        let b = write_dense_js(dir.path(), "b.js");
+        let out = read_args(&serde_json::json!({
+            "paths": [a.to_str().unwrap(), b.to_str().unwrap()],
+        }));
+        assert!(out.contains("b.js"), "{}", tail(&out));
+        assert_eq!(
+            out.matches("> outline cut to fit the budget").count(),
+            2,
+            "{}",
+            tail(&out)
+        );
+        assert!(!out.contains("... truncated"), "{}", tail(&out));
+    }
+
+    /// Each file in a batch got an equal share of the budget up front, so a
+    /// 5k-token file next to nine small ones came back outlined although
+    /// the whole batch is about 6k tokens. A batch that fits keeps every
+    /// file as a lone read shows it.
+    #[test]
+    fn tool_read_batch_keeps_files_whole_when_the_batch_fits() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut big = String::new();
+        for i in 0..240 {
+            let _ = writeln!(
+                big,
+                "export function handler{i:03}(request, response) {{ return response.send(request.body); }}"
+            );
+        }
+        std::fs::write(dir.path().join("big.js"), &big).unwrap();
+        let big_tokens = crate::types::estimate_tokens(big.len() as u64);
+        assert!((4_500..6_000).contains(&big_tokens), "{big_tokens} tokens");
+        let mut paths = vec![dir.path().join("big.js")];
+        for i in 0..9 {
+            let path = dir.path().join(format!("small{i}.js"));
+            std::fs::write(&path, format!("export const value{i} = {i};\n").repeat(20)).unwrap();
+            paths.push(path);
+        }
+        let names: Vec<&str> = paths.iter().map(|p| p.to_str().unwrap()).collect();
+        let out = read_args(&serde_json::json!({ "paths": names }));
+        for path in &names {
+            let alone = read_args(&serde_json::json!({ "path": path }));
+            assert!(
+                out.contains(&alone),
+                "{path} changed in the batch:\n{}",
+                tail(&out)
+            );
+        }
+    }
+
+    #[test]
+    fn fair_share_caps_only_the_files_over_it() {
+        assert_eq!(fair_share(&[5_000, 100, 100], 24_000), None);
+        assert_eq!(fair_share(&[30_000, 100], 24_000), Some(23_900));
+        assert_eq!(fair_share(&[20_000, 100, 20_000], 24_000), Some(11_950));
+    }
+
+    /// Over the budget, the biggest files shrink first and the small ones
+    /// stay whole.
+    #[test]
+    fn tool_read_batch_over_the_budget_shrinks_the_biggest_file_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = write_dense_js(dir.path(), "a.js");
+        let small = dir.path().join("small.js");
+        std::fs::write(&small, "export const answer = 42;\n").unwrap();
+        let out = read_args(&serde_json::json!({
+            "paths": [a.to_str().unwrap(), small.to_str().unwrap()],
+        }));
+        let alone = read_args(&serde_json::json!({ "path": small.to_str().unwrap() }));
+        assert!(out.contains(&alone), "{}", tail(&out));
+        assert_eq!(
+            out.matches("> outline cut to fit the budget").count(),
+            1,
+            "{}",
+            tail(&out)
+        );
+        let tokens = crate::types::estimate_tokens(out.len() as u64);
+        assert!(tokens <= crate::budget::DEFAULT_BUDGET, "{tokens} tokens");
+        assert!(!out.contains("... truncated"), "{}", tail(&out));
+    }
+
+    /// `sections` with no budget had no cap at all, so two big ranges
+    /// went past the host's response limit. They share the default now.
+    #[test]
+    fn tool_read_sections_without_a_budget_stay_under_the_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_dense_js(dir.path(), "dense.js");
+        let out = read_args(&serde_json::json!({
+            "path": path.to_str().unwrap(),
+            "sections": ["1-3000", "3001-6000"],
+        }));
+        let tokens = crate::types::estimate_tokens(out.len() as u64);
+        assert!(tokens <= crate::budget::DEFAULT_BUDGET, "{tokens} tokens");
+    }
+
+    fn tail(out: &str) -> &str {
+        &out[out.floor_char_boundary(out.len().saturating_sub(400))..]
     }
 }

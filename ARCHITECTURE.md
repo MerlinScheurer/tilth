@@ -49,6 +49,10 @@ crates/tilth-core/src/
 │                    tree_sitter::Tree, both keyed by (path, mtime)
 ├── imports.rs       Imports as data (one per module named), import lines, related-file resolution
 ├── test_structure.rs describe/it/test calls as TestEntry data
+├── source.rs        OpenFile, the one way tilth opens a file to read
+│                    it; read_source: reads a file for parsing or search
+│                    without its byte-order mark; MAX_FILE_SIZE, the
+│                    one size limit every parse and search walk shares
 │
 ├── search/          Cross-file queries
 │   ├── walk.rs          Walker and ignore policy (SKIP_DIRS, .tilthignore,
@@ -122,6 +126,8 @@ src/
 │   ├── mod.rs           read_file decision tree, multi-section reader
 │   │                    (`read_ranges`), heading resolver, suggestion
 │   │                    fallback
+│   ├── ends.rs          A text's first and last lines and line count,
+│   │                    from memory or a stream
 │   └── outline/
 │       ├── mod.rs       Dispatch by FileType
 │       ├── code.rs      Tree-sitter outline for code
@@ -183,7 +189,18 @@ explicit `--scope` argument > MCP `roots/list` response > nearest
 `package_root(cwd)` > `cwd`. The chosen root becomes the process's
 working directory, so every later tool call resolves relative paths
 against it. This was added specifically to handle MCP hosts (Codex was
-the documented case) that launch tilth with `cwd=/`.
+the documented case) that launch tilth with `cwd=/`. A `--scope` that
+is not a directory stops the launch with a usage error naming the
+close directories (`missing_scope_hint`).
+
+Per call, a `scope` that does not exist falls back to the caller's
+`root` with a warning that carries the same hint, so a typo still
+finds the answer and the next call can narrow. The CLI refuses a
+missing `--scope` with that hint instead of answering "0 matches".
+The hint lists directories for close names only inside the project (the
+CLI's working directory or the call's `root`) or a checkout (a `.git` or
+package manifest above it); above those, such as at `/` or a mount
+point, it names the nearest existing directory and lists nothing.
 
 The request loop (`mcp.rs:139-219`) parses each line as JSON and hands
 off to `handle_request`, which switches on `method`. The handler
@@ -271,9 +288,11 @@ non-obvious twists:
   (concept queries prefer real defs), accept; otherwise try
   `search_content_raw`; otherwise — if the original symbol search had
   any usages even without definitions — fall back to those; otherwise
-  `NotFound` with a similar-file suggestion. The `Fallthrough` arm
-  (path-like-but-didn't-resolve queries) shares the same cascade with
-  `prefer_definitions: false` so any symbol match is accepted.
+  the standard `0 matches` result, with a similar-file hint when one
+  exists. The `Fallthrough` arm (path-like-but-didn't-resolve queries)
+  shares the same cascade with `prefer_definitions: false` so any symbol
+  match is accepted; with no match at all it ends in `NotFound`, because
+  that query really named a missing path.
 - **Multi-word concept relaxation.** `Concept(text)` with whitespace
   goes through `multi_word_concept_search`. First tries an exact-phrase
   content search; on no hits, escapes each word and runs a relaxed
@@ -296,7 +315,11 @@ up the one symbol." This explicit gate prevents collisions with regex
 Token budgeting (`budget::apply`) is a final filter applied to whatever
 string came out of the dispatch. It walks the output and snips off
 content past the budget; the entry-format header is preserved so the
-caller knows truncation happened.
+caller knows truncation happened. Search output goes through
+`alloc::fit_to_budget` first, which cuts by value instead of position:
+the lowest-value match blocks lose their expanded source first and are
+dropped only after that, so a definition whose body alone overruns the
+budget still shows where it is.
 
 ## Classification (`src/classify.rs`)
 
@@ -309,7 +332,10 @@ ladder, in priority order:
    regex when it's actually a path.
 2. **Glob** — contains `*`, `?`, `{`, or `[` and no spaces. The
    no-spaces guard distinguishes real globs from content like
-   `import { X }`.
+   `import { X }`. A query in this shape that also uses syntax no file
+   glob needs (`|`, a leading `^`, `.*` between name characters as in
+   `Searcher.*Builder`, a `+` or `{n}` quantifier, a backslash escape)
+   is a `Regex` instead (`is_regex_shaped`).
 3. **Path** — starts with `./` or `../`, or contains `/` without
    spaces. If the resolved path exists, returns `FilePath`; otherwise
    `Fallthrough` so the symbol/content cascades still get a shot.
@@ -386,17 +412,55 @@ gitignore-style with whitelist, negation (`!`), and brace expansion.
 
 The biggest production-only file in the subsystem. Three layers stacked:
 
-1. **`search()`** — top-level entry. Walks files via `walker`, parses
-   each via `OutlineCache::get_or_parse` (cap: 500 KB), dispatches to
-   the right per-language definition extractor, runs a usage scan,
-   merges definitions + usages, ranks, facets (when >5 matches), and
-   computes `FacetTotals` from the pre-cap merged set. Returns a
-   `SearchResult`.
+1. **`search()`** — top-level entry. One walk via `walker` reads each
+   file once (cap: `MAX_FILE_SIZE`), finds its definitions with the right
+   per-language extractor and its usages with a word-boundary scan,
+   and drops a usage that sits on a definition's line. The walk always
+   runs to the end, so the totals are exact and the same query gives
+   the same result on every run. Each file is counted in full, by
+   facet, and only the first matches in display order are kept: each
+   file's are merged into a running top N as it arrives. The display
+   order (`display_order`: rank, then code definitions, doc-heading
+   definitions, usages) ends on path and line, so it is total, and a
+   match in the overall top N is in its own file's top N; the bound
+   loses nothing. `FacetTotals` are summed from the per-file counts,
+   and a file skipped for size that holds the query is named in
+   `skipped_large`. Returns a `SearchResult`.
 2. **Per-language definition extraction**:
    - `find_defs_treesitter` walks the tree-sitter tree and picks
-     definitions whose name field equals the query. Uses
-     `DEFINITION_KINDS` from `lang/treesitter.rs` (about 30 node-kind
-     strings spanning every supported grammar).
+     definitions whose name field equals the query. The node kinds come
+     from `spec(lang).definition_kinds`: `DEFINITION_KINDS` in
+     `lang/treesitter.rs` for most languages, a list of their own for
+     Go, C, C++ and Elixir. The walk stops three nesting levels down, so
+     declarations nested deeper are locals. Only real nesting counts:
+     `WRAPPER_KINDS` (`export`, decorators, `declare`), namespaces and
+     modules, pass-through nodes (`#ifdef`, `extern "C"`, templates),
+     a statement at the top of a file that defines nothing (`if`, `try`,
+     `with`), and the body of a `TYPE_KINDS` node are free (Python's root
+     `module` is no type). A variable declared in a function body
+     (`is_local_binding`) is never a definition; in Bash only `local`,
+     `declare` and `typeset` make one local, and a flag with `g` in it
+     (`-g`, `-gA`) makes it global. A wrapper is not a
+     definition of its own; the declaration it wraps is. A definition's
+     line is the line of its name, and its range opens with the
+     decorators or attributes beside it (`treesitter::decorators_start`),
+     so its name line is not also a usage and an expanded result shows
+     its decorators. Each name of `const a = 1, b = 2` is a definition.
+   - A qualified query (`B::run`, `B.run`, `crate::m::B::run`) is split
+     by `scope::split_qualified` into an owner and a bare name. Its
+     definitions are those of the bare name that
+     `scope::names_definition` matches: the query's segments agree,
+     from the end, with the definition's owner (`scope::definition_owner`:
+     the enclosing type, the type of a Rust `impl`, a Go receiver, or the
+     class in a C++ out-of-line declarator) followed by its own name, so
+     an Elixir `defmodule MyApp.Accounts` or a Ruby `class Admin::User`
+     is found by its full name. `Self`, `self`, `this` and `cls` match
+     any owner, and never a definition with none. A top-level definition also matches when the qualifier
+     names its module (`scope::names_module`: the file's stem, its
+     directory, or a Go package clause), as in `gin.New`. Its usages are
+     the qualified text itself. When nothing matches, the definitions
+     other owners hold come back in `other_owners`; grok lists them, and
+     search notes them when one of them has an owner.
    - `find_defs_heuristic_buf` is a regex-free fallback for languages
      without grammars (Dockerfile, Make).
    - `find_defs_markdown_buf` handles ATX headings as
@@ -481,10 +545,32 @@ machinery:
   (`tilth-core`) is the single tree-sitter walk that resolves call sites for any number of target
   symbols (1 to N) — `search_callers_expanded` calls it with a
   one-element set, the deps / blast / 2nd-hop paths call it with the
-  full set. Each caller is annotated with its enclosing scope via
+  full set. The walk runs to the end unless the caller passes a
+  `stop_after` bound; only the two blast paths do (see Blast). It hands each file's call
+  sites, in line order, to a function the caller passes, and returns
+  that function's results in path order. Each caller counts there and
+  keeps only what it shows, merged into a running top N under a total
+  order, so totals are exact, output is the same on every run, and
+  memory stays flat on a large tree (each `CallerMatch` holds its
+  file's text). A capped list says how many it left out. Code files
+  over `MAX_FILE_SIZE` are not parsed; the walk lists the ones whose
+  text names a target, and callers, grok and deps name them in a note. Each caller is annotated with its enclosing scope via
   `scope::walk_to_enclosing_definition` so the user sees
-  `[caller: foo]` instead of just a line number. When the walk returns
-  empty, a small `target_seen_in_scope` helper in the binary does an mmap-based
+  `[caller: foo]` instead of just a line number. The label is the
+  nearest enclosing definition that is not a variable declared in a
+  function (`binds_in_function`), qualified by its owner (`Service.run`,
+  `Context.reset`): a call in `const result = target()` inside `outer`
+  is labelled `outer`. A label passed back as a target is looked up by
+  its bare name, and the header says the receiver's type is not
+  checked. The 2nd hop looks for the bare names of these labels. A call
+  names a method without its type, so a method name that more than one
+  type defines cannot be traced by name; `find_callers_and_owners`
+  finds the sites and those types in one walk and one parse. Its sites
+  are counted on one line (`__init__: 21 call sites, not
+  attributed (52 types define it)`) and left out of the functions
+  affected. When one type defines it, its sites are counted, and the
+  affected total says method calls were matched by name. When the walk returns
+  empty, a small `target_seen_in_scope` helper in the binary does a
   literal scan so `no_callers_message` can distinguish typo from
   "real symbol with no direct callers" (indirect dispatch, dead code,
   framework registration).
@@ -500,12 +586,29 @@ machinery:
   queries against the same language stay separated.
 - **Deps** (`deps.rs`, both crates) — `analyze_deps` (`tilth-core`)
   is what `tilth_deps` runs. Returns a `DepsResult` with `Uses` (local
-  + external) and `Used by`. `format_deps` (binary) does the human
-  output. The external-dep stdlib
+  + external) and every dependent in `Used by`. A dependent calls one
+  of the file's names (at most `MAX_EXPORTED_SYMBOLS`, chosen by what
+  other files import by name, then by length; the rest are named in
+  the result), or imports the file: a walk resolves the imports of
+  every file whose text names the file's module, then follows the
+  files that re-export it (`index.ts`, `__init__.py`, `export … from`,
+  `export * from` at any depth) to their importers. Python absolute
+  imports resolve where Python 3 looks: the importer's directories that
+  are not packages, up to the project root, and their `src/`; without a
+  root, only the nearest. `from pkg import mod` resolves to the
+  submodule `pkg/mod.py` when there is one. `format_deps` (binary)
+  does the human output: it lists the first 15 dependents, or all of
+  them with `--full`, and says how many it left out, under a budget
+  too, and how many were found by a call alone. The external-dep stdlib
   heuristic (`is_stdlib`) is per-language; module-path validation
   (`is_valid_module_path`) avoids treating relative paths as packages.
-- **Blast** (`blast.rs`) — symbol-level blast radius for diff
-  workflows; called by `tilth_diff --blast`.
+- **Blast** (`blast.rs`) — symbol-level blast radius, printed after
+  every edit-mode write that touches a definition and counted by
+  `tilth_diff --blast`. A write must stay fast on any tree, so both
+  walks stop at `BLAST_STOP_AFTER` (50) call sites, and a count that
+  reached the bound reads "at least N". A touched symbol the walk found
+  no call for by then reads "callers not counted". A write's own file
+  is no part of its blast radius, so its own calls raise the bound.
 
 ### Glob (`glob.rs`)
 
@@ -519,11 +622,15 @@ division.
 `read::read_file(path, section, full, cache, edit_mode)` is the
 gateway. The decision tree, in order:
 
-1. `metadata` errors → typed `TilthError::NotFound` /
-   `PermissionDenied` / `IoError` with a `suggest_similar` fallback
-   (Levenshtein on directory siblings).
+1. `metadata` and open errors → typed `TilthError::NotFound` /
+   `PermissionDenied` / `IoError` (`TilthError::from_io`, one mapping
+   for every step and for the edit read), with a `suggest_similar`
+   fallback (Levenshtein on directory siblings).
 2. **Directory** → `list_directory` (sorted entries, file types).
-3. **Empty file** → header with `ViewMode::Empty`.
+3. **Empty file, or not a regular file** → header with
+   `ViewMode::Empty`. A pipe, socket or device has no fixed contents and
+   is not opened. The path's metadata decides this before any open, so
+   an empty file shows as empty whatever its section or permissions.
 4. **`section: Some(...)` or `sections: [...]`** → `read_ranges`.
    Each range is either a line range (`"45-89"`) or a heading address
    (`"## Architecture"`, resolved by `resolve_heading`'s walk over
@@ -534,24 +641,57 @@ gateway. The decision tree, in order:
    header followed by per-block `─── lines X-Y ───` delimiters and are
    emitted in user-supplied order — overlap is honored verbatim, no
    coalescing. Returns the verbatim slice regardless of file size.
-5. **mmap + binary check** — `is_binary` looks for null bytes in the
-   first 512 bytes via `memchr`. Binary files emit just a header.
-6. **Generated** — by name (`Cargo.lock`, `package-lock.json`, etc.) or
-   content marker (`@generated`, `DO NOT EDIT`, `auto-generated`,
-   etc.).
-7. **Minified** — `.min.<ext>` convention or, for files >100KB, a
-   newline-density heuristic.
-8. **Full mode + oversized** — guard for `--full` on huge files. Caps
+   Line ranges stream through `LineSelector`, which copies the requested
+   lines out of each chunk, only counts the others and stops at the last
+   requested line. A heading needs the whole text to find its lines. An
+   empty file shows as empty, whatever its well-formed ranges; a
+   malformed range fails there as on any file.
+5. **The head decides first.** `detection::read_head` reads the first
+   `HEAD_WINDOW` bytes, and `is_binary` (null bytes in the first 512),
+   the generated markers (`@generated`, `DO NOT EDIT`, …, or a name such
+   as `Cargo.lock`) and the minified check (`.min.<ext>`, or for files
+   over 100 KB a newline-density heuristic) all look only there. A binary
+   file emits just a header; a generated or minified one emits a header
+   whose line count is streamed.
+6. **Log, CSV or unknown type, outlined.** Past the token threshold, or
+   over the cap with `--full`, these views show only a file's first and
+   last lines and its line count (`outline::EndsView`). The file streams
+   into `ends::EndsCollector`, so only the lines shown are held, each
+   once. A file with no more lines than the view shows is then held
+   whole by that pass, and goes on to step 7 without a second read. A
+   file whose outline OGATE rejects goes on to step 7 too, which reads
+   it whole.
+7. **Full mode + oversized.** This guards `--full` on huge files. Caps
    at `TILTH_FULL_SIZE_CAP` (default in `full_read_size_cap()`); above
    the cap, returns the outline with a banner explaining how to
-   override.
-9. **Below the token threshold or `--full`** → return full content
+   override. From this step on the file is read whole, up to the length
+   its open handle reported.
+8. **Below the token threshold or `--full`** → return full content
    (with `format::hashlines` if `edit_mode`, plain `number_lines`
-   otherwise).
-10. **Otherwise** → `outline::generate` per `FileType`, cached in
-    `OutlineCache::get_or_compute`.
+   otherwise). Without `--full`, a full view over the caller's budget
+   goes on to the outline instead.
+9. **Otherwise** → `outline::generate` per `FileType`, cached in
+   `OutlineCache::get_or_compute`. OGATE returns the full view instead
+   when the outline saves too little. An outline over the budget is cut
+   by `outline::fit`: a code outline drops its signatures and docs
+   first (`outline::names_only`), so every symbol stays listed, then
+   whole entries from the end, and a closing line says which.
 
-The `outline/` submodule dispatches on `FileType`:
+Every read opens the file through `tilth_core::source::OpenFile`, as
+do `read_source`, `source::read` and `source::read_to_string`, which
+every parse, search and edit read goes through. On Unix it opens with
+`O_NONBLOCK`, checks the handle's own metadata and clears the flag on a
+regular file, so a pipe swapped in after the path was checked is still
+never read. A pipe, socket or device reads as empty everywhere. The one
+read that waits on a pipe is `tilth diff --patch`, which may be handed
+one.
+
+The signature and stripped views reshape only code. Any other file gets
+its default view, after a streamed check that it is UTF-8, so it fails
+as those views always made it fail.
+
+The `outline/` submodule dispatches on `FileType` through
+`outline::View`, the one mapping from file type to view:
 
 - `code.rs` — calls `lang::outline::walk_top_level` with the parsed
   tree-sitter tree, formats `OutlineEntry` instances as `[start-end]
@@ -561,10 +701,12 @@ The `outline/` submodule dispatches on `FileType`:
   indented code blocks).
 - `structured.rs` — JSON/YAML/TOML "keys" view (top-level keys + their
   shapes).
-- `tabular.rs` — CSV/TSV header + first/last few rows.
+- `tabular.rs`: CSV/TSV header + first/last few rows, rendered from
+  the text's `Ends`.
 - `test_file.rs` — describe/it grouping for test files, rendered over
   `tilth_core::test_entries`.
-- `fallback.rs` — last-resort head/tail when nothing else applies.
+- `fallback.rs`: last-resort head/tail and the log view, rendered from
+  the text's `Ends`.
 
 Two helpers feed the MCP layer:
 
@@ -572,7 +714,9 @@ Two helpers feed the MCP layer:
   hints (`"Related: foo.ts, bar.ts"`) — only meaningful when the user
   is going to see an outline.
 - `tilth_core::imports::resolve_related_files` does the related-file
-  resolution for the same hint.
+  resolution for the same hint. It returns every local import; the
+  hint names the first `RELATED_HINT_LIMIT` (8). Deps and callee
+  resolution use the full list.
 
 ## Language layer (`crates/tilth-core/src/lang/`)
 
@@ -603,7 +747,17 @@ Make.
 `lang::treesitter::DEFINITION_KINDS` is the canonical list of
 tree-sitter node kinds tilth treats as definitions across all
 languages. It's a flat `&[&str]` slice — additions are line-noise
-edits.
+edits. Beside it, `WRAPPER_KINDS`, `TYPE_KINDS`, `NAMESPACE_KINDS`,
+`PASS_THROUGH_KINDS` and `FUNCTION_KINDS` say how definitions nest.
+
+`.h` is the one extension two languages share. `detect_file_type` reads
+it as C; `detect_file_type_with_content` (and `refine_lang`, for a
+caller that already holds the path's language) reads a header that
+holds C++ syntax as C++. An `extern "C" { ... }` block alone does not
+count: portable C headers guard one for C++ includers. Every site that
+parses content uses the content-aware form, including each side of a
+structural diff and every outline stored in the shared `OutlineCache`;
+the overview's language counts stay path-only.
 
 `lang::package_root(path)` walks up looking for known manifests
 (`Cargo.toml`, `package.json`, `pyproject.toml`, `go.mod`, etc.) and is
@@ -634,10 +788,26 @@ file repeatedly modified will accumulate stale entries until the
 process exits. In practice the working set of active files is small
 enough that this hasn't been a concern.
 
-The 500 KB ceiling on `get_or_parse` keeps tree-sitter parses from
-blowing up memory on generated TypeScript bundles or vendored
-single-file libraries. Above the cap, `get_or_parse` returns `None` and
-callers fall back to text-based heuristics.
+The ceiling on `get_or_parse` (`tilth_core::source::MAX_FILE_SIZE`,
+500 KB) keeps tree-sitter parses from blowing up memory on generated
+TypeScript bundles or vendored single-file libraries. Above the cap,
+`get_or_parse` returns `None` and callers fall back to text-based
+heuristics. The search walkers skip files over the same limit; a
+skipped file that contains what the walk looked for is named under the
+result (``> 1 file over 500 KB contains `run` and was not searched: …``).
+The check (`tilth_core::source::file_holds`) streams the file in 64 KB
+chunks and stops at the first match, so a multi-gigabyte file in the
+scope costs a few chunks of memory whatever its line length. A NUL byte
+in the first 512 bytes makes the file binary, which holds nothing.
+Symbol search, callers, grok and deps look for whole identifiers
+(`file_mentions`); content and regex search for the query's match.
+Deps checks a big file for the target's names and its module's name,
+which for a package's entry file (`mod.rs`, `index.ts`, `__init__.py`)
+is its directory's name. grok names each imported file over the limit
+that holds an extern callee's name: those callees may be defined there.
+Parsing grows linearly with size, about 0.2 ms per KB for Rust and
+Python, so a 1 MB file costs about twice what a 500 KB one does; that
+is why the limit stays where it is.
 
 ### `Session` (`session.rs`)
 
@@ -681,36 +851,62 @@ single tool each.
 1. **Resolve source** (`resolve_source`) — `DiffSource` is a
    six-armed enum: `GitUncommitted` (default), `GitStaged`, `GitRef`
    (any rev or rev range), `Files(a, b)` (file-to-file), `Patch(path)`
-   (read a `.patch` file), `Log(range)` (per-commit summaries).
+   (read a `.patch` file), `Log(range)` (per-commit summaries). For a git
+   source, every git command and working-tree read then runs at the
+   repository top (`git rev-parse --show-toplevel`), because git prints
+   paths from there.
 2. **`run_git_diff`** shells out to `git diff` with the right args
-   (or reads the patch file).
-3. **`parse::parse_unified_diff`** turns the raw text into
-   `Vec<FileDiff>` — header, hunks, lines.
-4. **`overlay::compute_overlay`** combines each `FileDiff` with the
-   on-disk source to produce a `FileOverlay` — a structural view of
-   changed *symbols* with confidence scores
-   (`MatchConfidence::High/Medium/Low/None`).
-5. **`overlay::cross_file_matching`** detects symbols moved between
+   (or reads the patch file). Before the first commit, `HEAD` is the
+   empty tree.
+3. **`resolve_sides`** decides where each side reads file content from
+   (`Side`: a revision, the index, the working tree, a file). It is the
+   one place that knows what a range means: `a..b` compares `a` with `b`,
+   `a...b` compares their merge base with `b`, a bare revision compares
+   it with the working tree.
+4. **`parse::parse_unified_diff`** turns the raw text into
+   `Vec<FileDiff>` — header, hunks, and lines numbered in the old file
+   (removed lines) or the new file (the rest).
+5. **`overlay::compute_overlay`** reads both sides of each `FileDiff`,
+   outlines them and matches their symbols (`matching::match_symbols`:
+   identity, then structural hash, then fuzzy similarity). Members are
+   qualified by their type (`A::run`), so same-named methods stay apart.
+   A function's signature is its whole header from the syntax tree,
+   compared by tokens, so a re-wrapped header is not a signature change
+   and a change on its third line is one. Each patch line goes to the
+   innermost changed symbol that holds it; lines outside every changed
+   symbol, and all lines of a non-code file, stay in `other_lines`. The
+   overlay's `+N/−M` counts come from the patch itself.
+6. **`overlay::cross_file_matching`** detects symbols moved between
    files.
-6. **`overlay::signature_warnings`** flags signature changes that
-   might break callers.
-7. **Search filter** (`filter_by_search`) — narrows to symbols/files
+7. **Scope** (`ScopeSpec`) — a `--scope` resolves against `root` (or the
+   cwd) to a path from the repository top. A changed file at that path
+   (or at its path before a rename) gives the file detail; a directory
+   gives the overview of the changed files under it; a trailing part of
+   a path (`main.rs`) must name one changed file. An existing path with
+   no changes says so; anything else is an error.
+8. **`overlay::signature_warnings`** flags a signature changed in several
+   files.
+9. **Search filter** (`keep_search_matches`) — narrows to symbols/files
    matching a substring, if `--search` was passed.
-8. **Blast radius** (`compute_blast`) — for each signature-changed
-   symbol, list of impacted files, gated on `--blast`.
-9. **Format** — dispatched by scope shape: `format::format_overview`
-   (no scope), `format::format_file_detail` (single file scope), or
-   `format::format_function_detail` (`file:fn` scope). Marker line
-   prefixes are `[+]`/`[-]`/`[~]`/`[~:sig]`; the overview header is
-   budgeted via `budget::apply`.
-10. **Conflict detection** — only on `DiffSource::GitUncommitted`,
+10. **Blast radius** (`compute_blast`) — for each signature-changed
+    symbol, count its callers, gated on `--blast`.
+11. **Format** — `format::format_overview` (no scope, or a directory),
+    `format::format_file_detail` (one file) or
+    `format::format_function_detail` (`file:fn`, where `fn` may be
+    qualified as `Type::fn`). Marker line prefixes are
+    `[+]`/`[-]`/`[~]`/`[~:sig]`; output is budgeted via `budget::apply`.
+12. **Conflict detection** — only on `DiffSource::GitUncommitted`,
     `overlay::detect_conflicts` scans each affected file for git
     merge-conflict markers and `format::format_conflicts` appends the
     findings to the output.
 
+Matching walks hash maps, so `match_symbols` sorts its result by file
+position; the same diff prints the same bytes every run.
+
 `diff_log(range, scope, budget)` is a separate pipeline for `--log
-HEAD~5..HEAD` summaries — runs `git log --pretty + git show` per commit
-and emits a structural change list per commit.
+HEAD~5..HEAD` summaries — runs `git log`, then diffs each commit against
+its first parent (a root commit against the empty tree) and emits a
+structural change list per commit.
 
 ### Edit (`src/edit.rs`)
 

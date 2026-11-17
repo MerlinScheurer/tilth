@@ -1,40 +1,34 @@
-use std::fs;
-use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::SystemTime;
 
 use super::file_metadata;
-use tilth_core::lang::elixir::is_elixir_definition;
+use tilth_core::lang::elixir::{is_elixir_container, is_elixir_definition};
 use tilth_core::lang::spec::{spec, DefinitionOps, DEFAULT_DEFS, DEFAULT_DEF_KINDS};
 use tilth_core::lang::treesitter::{
-    extract_definition_name, extract_impl_trait, extract_impl_type, extract_implemented_interfaces,
-    is_or_body_of, node_text_simple, NodeTextMode, NAMESPACE_KINDS, PASS_THROUGH_KINDS,
+    decorators_start, extract_definition_name, extract_impl_trait, extract_impl_type,
+    extract_implemented_interfaces, is_local_binding, is_or_body_of, node_text_simple,
+    NodeTextMode, NAMESPACE_KINDS, PASS_THROUGH_KINDS, TYPE_KINDS, WRAPPER_KINDS,
 };
 
 use crate::search::rank;
-use crate::types::{FacetTotals, Match, SearchResult};
+use crate::types::{Match, OtherOwner, SearchResult};
 use grep_regex::RegexMatcher;
 use grep_searcher::sinks::UTF8;
 use grep_searcher::Searcher;
 use tilth_core::error::TilthError;
-use tilth_core::lang::detect_file_type;
+use tilth_core::lang::detect_file_type_with_content;
 use tilth_core::lang::outline::{heading_text, outline_language, parse_markdown};
+use tilth_core::search::scope::{
+    definition_owner, names_definition, names_module, split_qualified,
+};
 use tilth_core::types::FileType;
 
 const MAX_MATCHES: usize = 10;
-/// Stop walking once we have this many raw definition matches.
-const EARLY_QUIT_THRESHOLD_DEFINITIONS: usize = 50;
-/// Stop walking once we have this many raw usage matches.
-const EARLY_QUIT_THRESHOLD_USAGES: usize = MAX_MATCHES * 3;
 
 /// Match-count cap when `--full` is set. Generous but bounded so a `tilth
 /// foo --full` on a huge repo can't blow up output.
 const FULL_MAX_MATCHES: usize = 100;
-/// Walker early-quit threshold when `--full` is set. Proportional to
-/// `FULL_MAX_MATCHES` the same way the default thresholds are.
-const FULL_EARLY_QUIT_USAGES: usize = FULL_MAX_MATCHES * 3;
-const FULL_EARLY_QUIT_DEFINITIONS: usize = FULL_MAX_MATCHES * 3;
 
 /// Display-side stratum: 0 = code def, 1 = doc-heading def, 2 = usage. Used
 /// as a stable sort key after `rank::sort` so the `MAX_MATCHES` cap can't drop
@@ -47,13 +41,30 @@ fn stratum_for_display(m: &Match) -> u8 {
     }
 }
 
-/// Symbol search: find definitions via tree-sitter, usages via ripgrep, concurrently.
-/// Merge results, deduplicate, definitions first.
+/// Put matches in display order: by rank, then stratified so a real code
+/// definition always comes before a markdown-heading "definition" of the same
+/// query, and both before usages. Stable within each stratum, so the
+/// relevance ordering from `rank::sort` is kept. The walk applies this to
+/// each file and keeps its first `k`, then to the union with what it kept so
+/// far. That loses nothing: the order restricted to one file is the same
+/// order, so a match in the overall first `k` is in its own file's first `k`.
+fn display_order(
+    matches: &mut Vec<Match>,
+    query: &str,
+    scope: &Path,
+    context: Option<&Path>,
+    now: SystemTime,
+) {
+    rank::sort(matches, query, scope, context, now);
+    matches.sort_by_key(stratum_for_display);
+}
+
+/// Symbol search: find definitions via tree-sitter and usages via ripgrep in
+/// one walk over `scope`. The walk always runs to the end, so the totals are
+/// exact and the result does not depend on thread timing.
 ///
-/// `full` controls the truncation cap and walker early-quit thresholds:
-/// `false` (default) uses the tight defaults that keep agent token budgets
-/// in check; `true` raises both caps so interactive `--full` callers see
-/// every match instead of "... and N more matches."
+/// `full` raises the number of matches returned from `MAX_MATCHES` to
+/// `FULL_MAX_MATCHES`. It does not change the totals.
 pub fn search(
     query: &str,
     scope: &Path,
@@ -61,86 +72,83 @@ pub fn search(
     glob: Option<&str>,
     full: bool,
 ) -> Result<SearchResult, TilthError> {
-    let (max_matches, def_threshold, usage_threshold) = if full {
-        (
-            FULL_MAX_MATCHES,
-            FULL_EARLY_QUIT_DEFINITIONS,
-            FULL_EARLY_QUIT_USAGES,
-        )
-    } else {
-        (
-            MAX_MATCHES,
-            EARLY_QUIT_THRESHOLD_DEFINITIONS,
-            EARLY_QUIT_THRESHOLD_USAGES,
-        )
-    };
+    let max_matches = if full { FULL_MAX_MATCHES } else { MAX_MATCHES };
+    search_capped(query, scope, context, glob, max_matches, max_matches)
+}
 
-    // Compile regex once, share across both arms
-    let word_pattern = format!(r"\b{}\b", regex_syntax::escape(query));
-    let matcher = RegexMatcher::new(&word_pattern).map_err(|e| TilthError::InvalidQuery {
+/// What a symbol query asks for. A qualified query (`B::run`, `B.run`) asks
+/// for the definitions of `name` that `owner` holds, and for the usages of
+/// its literal text; a bare query has no owner, and `name` is the query.
+#[derive(Clone, Copy)]
+struct Wanted<'a> {
+    query: &'a str,
+    name: &'a str,
+    owner: Option<&'a str>,
+}
+
+/// Match `text` as a whole word. A boundary is asserted only next to a word
+/// character: `\b` cannot follow the `!` of Ruby's `save!`.
+fn word_matcher(query: &str, text: &str) -> Result<RegexMatcher, TilthError> {
+    let is_word = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
+    let start = if is_word(text.chars().next()) {
+        r"\b"
+    } else {
+        ""
+    };
+    let end = if is_word(text.chars().last()) {
+        r"\b"
+    } else {
+        ""
+    };
+    let word_pattern = format!("{start}{}{end}", regex_syntax::escape(text));
+    RegexMatcher::new(&word_pattern).map_err(|e| TilthError::InvalidQuery {
         query: query.to_string(),
         reason: e.to_string(),
-    })?;
+    })
+}
 
-    let gitignore = tilth_core::search::walk::call_gitignore_override();
-    let (defs, usages) = rayon::join(
-        || {
-            tilth_core::search::walk::with_gitignore_override(gitignore, || {
-                find_definitions(query, scope, glob, def_threshold)
-            })
-        },
-        || {
-            tilth_core::search::walk::with_gitignore_override(gitignore, || {
-                find_usages(query, &matcher, scope, glob, usage_threshold)
-            })
-        },
-    );
+/// The display cap and the collection bound are the same number in
+/// production. They are separate parameters so a test can raise one without
+/// the other and show that the bound leaves the result untouched.
+fn search_capped(
+    query: &str,
+    scope: &Path,
+    context: Option<&Path>,
+    glob: Option<&str>,
+    max_matches: usize,
+    keep: usize,
+) -> Result<SearchResult, TilthError> {
+    let (owner, name) = split_qualified(query);
+    let wanted = Wanted { query, name, owner };
+    // The query's text, whose occurrences are its usages.
+    let usage = word_matcher(query, query)?;
 
-    let defs = defs?;
-    let usages = usages?;
+    // One clock for the per-file bound and the final sort, so both rank by
+    // the same scores.
+    let now = SystemTime::now();
+    let walked = walk(wanted, &usage, scope, context, glob, now, keep)?;
 
-    // Deduplicate: remove usage matches that overlap with definition matches.
-    // Linear scan — max ~30 defs from EARLY_QUIT_THRESHOLD, no allocation needed.
-    let mut merged: Vec<Match> = defs;
-    let def_count = merged.len();
-
-    for m in usages {
-        let dominated = merged[..def_count]
-            .iter()
-            .any(|d| d.path == m.path && d.line == m.line);
-        if !dominated {
-            merged.push(m);
-        }
+    let definitions: usize = walked.per_file.iter().map(|f| f.definitions).sum();
+    let code_definitions: usize = walked
+        .per_file
+        .iter()
+        .filter(|f| f.in_code)
+        .map(|f| f.definitions)
+        .sum();
+    let total: usize = walked.per_file.iter().map(|f| f.total).sum();
+    let mut merged = walked.kept;
+    let mut skipped_large = walked.skipped_large;
+    skipped_large.sort();
+    let mut other_owners = walked.other_owners;
+    if definitions > 0 {
+        other_owners.clear();
     }
+    other_owners.sort();
+    display_order(&mut merged, name, scope, context, now);
 
-    let total = merged.len();
-    let usage_count = total - def_count;
-
-    rank::sort(&mut merged, query, scope, context);
-
-    // Stratify so the cap can't drop a real code definition in favor of a
-    // markdown-heading "definition" of the same query. Stable within each
-    // stratum, so the relevance ordering from rank::sort is preserved. Code
-    // defs (def_weight >= 60) come first, doc-heading defs (def_weight 30)
-    // second, usages last. Display-side only — pre-cap totals below and the
-    // underlying ranking semantics for `--json` callers are unchanged.
-    merged.sort_by_key(stratum_for_display);
-
-    // Compute per-subfacet totals on the *pre-cap* set so the renderer can
-    // print `displayed/total` headings + per-facet hidden-count lines.
-    // `merged` is bounded by the early-quit thresholds (~80 entries), so the
-    // clone is cheap. Faceting is pure / side-effect-free.
-    let totals = {
-        let snapshot = merged.clone();
-        let f = super::facets::facet_matches(snapshot, scope);
-        FacetTotals {
-            definitions: f.definitions.len(),
-            implementations: f.implementations.len(),
-            tests: f.tests.len(),
-            usages_local: f.usages_local.len(),
-            usages_cross: f.usages_cross.len(),
-        }
-    };
+    let file_facets: Vec<super::facets::FileFacets> =
+        walked.per_file.into_iter().map(|f| f.facets).collect();
+    let facet_totals = super::facets::totals(&file_facets, merged.iter().find(|m| m.is_definition));
 
     merged.truncate(max_matches);
 
@@ -149,44 +157,78 @@ pub fn search(
         scope: scope.to_path_buf(),
         matches: merged,
         total_found: total,
-        definitions: def_count,
-        usages: usage_count,
-        facet_totals: totals,
+        definitions,
+        code_definitions,
+        usages: total - definitions,
+        facet_totals,
+        skipped_large,
+        skipped_for: name.to_string(),
+        other_owners,
     })
 }
 
-/// Find definitions using tree-sitter structural detection.
-/// For each file containing the query string, parse with tree-sitter and walk
-/// definition nodes to see if any declare the queried symbol.
-/// Falls back to keyword heuristic for files without grammars.
-///
-/// Single-read design: reads each file once, checks for symbol via
-/// `memchr::memmem` (SIMD), then reuses the buffer for tree-sitter parsing.
-/// Early termination: quits the parallel walker once enough defs are found.
-fn find_definitions(
-    query: &str,
+/// What the walk found in one file, beyond the matches it kept.
+struct FileCount {
+    total: usize,
+    definitions: usize,
+    /// The file is code, so its definitions are not doc headings.
+    in_code: bool,
+    facets: super::facets::FileFacets,
+}
+
+struct Walked {
+    /// The first `keep` matches in display order.
+    kept: Vec<Match>,
+    per_file: Vec<FileCount>,
+    /// Files skipped for size although they hold the query.
+    skipped_large: Vec<PathBuf>,
+    /// Definitions of a qualified query's name that other owners hold.
+    other_owners: Vec<OtherOwner>,
+}
+
+/// What one file adds to a symbol search.
+enum Scan {
+    Matches(FileDefs),
+    /// Over the size cap, and the query occurs in it.
+    TooLarge,
+}
+
+/// The matches found in one file, definitions first, and the definitions
+/// of a qualified query's name that another owner holds.
+#[derive(Default)]
+struct FileDefs {
+    matches: Vec<Match>,
+    others: Vec<OtherOwner>,
+}
+
+/// Walk `scope` once and collect the definitions and usages of `query`.
+/// Every file is visited and counted, so the totals are exact. Only the
+/// first `keep` matches in display order are held: each file's first `keep`
+/// are merged into the running first `keep` as the file is read. The display
+/// order is total across files, since it ends on path and line, so what is
+/// kept does not depend on the order files arrive in.
+fn walk(
+    wanted: Wanted,
+    usage: &RegexMatcher,
     scope: &Path,
+    context: Option<&Path>,
     glob: Option<&str>,
-    early_quit_threshold: usize,
-) -> Result<Vec<Match>, TilthError> {
-    let matches: Mutex<Vec<Match>> = Mutex::new(Vec::new());
-    // Relaxed is correct: walker.run() joins all threads before we read the final value.
-    // Early-quit checks are approximate by design — one extra iteration is harmless.
-    let found_count = AtomicUsize::new(0);
-    let needle = query.as_bytes();
+    now: SystemTime,
+    keep: usize,
+) -> Result<Walked, TilthError> {
+    let found: Mutex<Walked> = Mutex::new(Walked {
+        kept: Vec::new(),
+        per_file: Vec::new(),
+        skipped_large: Vec::new(),
+        other_owners: Vec::new(),
+    });
 
     let walker = tilth_core::search::walk::walker(scope, glob)?;
 
     walker.run(|| {
-        let matches = &matches;
-        let found_count = &found_count;
+        let found = &found;
 
         Box::new(move |entry| {
-            // Early termination: enough definitions found
-            if found_count.load(Ordering::Relaxed) >= early_quit_threshold {
-                return ignore::WalkState::Quit;
-            }
-
             let Ok(entry) = entry else {
                 return ignore::WalkState::Continue;
             };
@@ -196,152 +238,261 @@ fn find_definitions(
             }
 
             let path = entry.path();
-
-            // Skip files that look minified by filename — `.min.js`, `app-min.css`.
-            if path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(tilth_core::lang::detection::is_minified_by_name)
-            {
-                return ignore::WalkState::Continue;
-            }
-
-            // Skip oversized files — avoid tree-sitter parsing multi-MB minified bundles
-            let file_size = match std::fs::metadata(path) {
-                Ok(meta) => {
-                    if meta.len() > 500_000 {
-                        return ignore::WalkState::Continue;
-                    }
-                    meta.len()
+            let (mut file_matches, others) = match matches_in_file(path, wanted, usage) {
+                Scan::Matches(found) if found.matches.is_empty() && found.others.is_empty() => {
+                    return ignore::WalkState::Continue
                 }
-                Err(_) => 0,
+                Scan::Matches(found) => (found.matches, found.others),
+                Scan::TooLarge => {
+                    found
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .skipped_large
+                        .push(path.to_path_buf());
+                    return ignore::WalkState::Continue;
+                }
             };
 
-            // Single read: read file once, use buffer for both check and parse
-            let Ok(content) = fs::read_to_string(path) else {
-                return ignore::WalkState::Continue;
+            let count = FileCount {
+                total: file_matches.len(),
+                definitions: file_matches.iter().filter(|m| m.is_definition).count(),
+                in_code: matches!(
+                    tilth_core::lang::detect_file_type(path),
+                    tilth_core::types::FileType::Code(_)
+                ),
+                facets: super::facets::count_file(path, &file_matches),
             };
+            display_order(&mut file_matches, wanted.name, scope, context, now);
+            file_matches.truncate(keep);
 
-            // Fast byte check via memchr::memmem (SIMD) — skip files without the symbol
-            if memchr::memmem::find(content.as_bytes(), needle).is_none() {
-                return ignore::WalkState::Continue;
-            }
-
-            // Catch unmarked minified bundles that slipped past the filename check.
-            if file_size >= tilth_core::lang::detection::MINIFIED_CHECK_THRESHOLD
-                && tilth_core::lang::detection::is_minified_by_content(content.as_bytes())
-            {
-                return ignore::WalkState::Continue;
-            }
-
-            // Get file metadata once per file
-            let (file_lines, mtime) = file_metadata(path);
-
-            // Try tree-sitter structural detection
-            let file_type = detect_file_type(path);
-            let lang = match file_type {
-                FileType::Code(l) => Some(l),
-                _ => None,
-            };
-
-            let ts_language = lang.and_then(outline_language);
-
-            let mut file_defs = if let Some(ref ts_lang) = ts_language {
-                find_defs_treesitter(path, query, ts_lang, lang, &content, file_lines, mtime)
-            } else {
-                Vec::new()
-            };
-
-            // Per-file-type fallback dispatch. The semantics of "definition"
-            // differ by file kind, so handle them separately:
-            //
-            // * Code without a tree-sitter grammar: keyword heuristic (looks
-            //   for lines starting with `function`/`const`/`class`/etc.).
-            // * Markdown / RST: heading-as-definition. A heading whose text
-            //   contains the query (`## parseCitations` in a doc) marks that
-            //   section AS being about the symbol — that is the documentation
-            //   analogue of a code definition. Quoted code blocks inside
-            //   docs are NOT treated as definitions; they're usages, because
-            //   the keyword heuristic would false-positive on every snippet
-            //   that quotes the real source. Heading defs carry a lower
-            //   `def_weight` (30) than code definitions (60-80) so the real
-            //   source still ranks first.
-            // * Structured data / tabular / log / other: no fallback.
-            //   Mentions are config values, data, or noise — not definitions.
-            //   (A future patch could treat top-level config keys matching
-            //   the query as soft definitions, but that's ambiguous enough
-            //   to skip for now.)
-            if file_defs.is_empty() && ts_language.is_none() {
-                file_defs = match file_type {
-                    FileType::Code(_) => {
-                        find_defs_heuristic_buf(path, query, &content, file_lines, mtime)
-                    }
-                    FileType::Markdown => {
-                        find_defs_markdown_buf(path, query, &content, file_lines, mtime)
-                    }
-                    _ => Vec::new(),
-                };
-            }
-
-            if !file_defs.is_empty() {
-                found_count.fetch_add(file_defs.len(), Ordering::Relaxed);
-                let mut all = matches
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                all.extend(file_defs);
-            }
+            let mut found = found
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            found.kept.extend(file_matches);
+            display_order(&mut found.kept, wanted.name, scope, context, now);
+            found.kept.truncate(keep);
+            found.per_file.push(count);
+            found.other_owners.extend(others);
 
             ignore::WalkState::Continue
         })
     });
 
-    Ok(matches
+    Ok(found
         .into_inner()
         .unwrap_or_else(std::sync::PoisonError::into_inner))
+}
+
+/// The definitions and usages of `query` in one file, with a usage on a
+/// definition's line dropped in favour of the definition.
+///
+/// Single-read design: reads the file once, checks for the symbol via
+/// `memchr::memmem` (SIMD), then reuses the buffer for both the tree-sitter
+/// definition pass and the word-boundary usage pass. Definitions fall back
+/// to a keyword heuristic for code without a grammar.
+fn matches_in_file(path: &Path, wanted: Wanted, usage: &RegexMatcher) -> Scan {
+    let none = || Scan::Matches(FileDefs::default());
+    let query = wanted.query;
+    // Skip files that look minified by filename — `.min.js`, `app-min.css`.
+    if path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(tilth_core::lang::detection::is_minified_by_name)
+    {
+        return none();
+    }
+
+    // Skip oversized files — avoid tree-sitter parsing multi-MB minified
+    // bundles — but say so when one holds the query.
+    let file_size = match std::fs::metadata(path) {
+        Ok(meta) => {
+            if meta.len() > tilth_core::source::MAX_FILE_SIZE {
+                // A file may define `name` without spelling the qualified
+                // text, so a file skipped for size is named when it holds
+                // the bare name.
+                if tilth_core::source::file_mentions(path, &[wanted.name]) {
+                    return Scan::TooLarge;
+                }
+                return none();
+            }
+            meta.len()
+        }
+        Err(_) => 0,
+    };
+
+    let Ok(raw) = tilth_core::source::read(path) else {
+        return none();
+    };
+    let bytes = tilth_core::source::strip_bom_bytes(&raw);
+
+    // Fast byte check — a word-boundary usage or a definition both need the
+    // name's bytes somewhere in the file.
+    if memchr::memmem::find(bytes, wanted.name.as_bytes()).is_none() {
+        return none();
+    }
+
+    // Catch unmarked minified bundles that slipped past the filename check.
+    if file_size >= tilth_core::lang::detection::MINIFIED_CHECK_THRESHOLD
+        && tilth_core::lang::detection::is_minified_by_content(bytes)
+    {
+        return none();
+    }
+
+    let (file_lines, mtime) = file_metadata(path);
+
+    // A file that is not UTF-8 yields no definitions; one decoding rule in #308.
+    let FileDefs {
+        mut matches,
+        others,
+    } = std::str::from_utf8(bytes).map_or_else(
+        |_| FileDefs::default(),
+        |content| definitions_in(path, wanted, content, file_lines, mtime),
+    );
+    let def_count = matches.len();
+
+    let mut searcher = Searcher::new();
+    // The UTF8 sink ends this file's usage scan at its first matching line
+    // that is not UTF-8, and the error is dropped here: #308.
+    let _ = searcher.search_slice(
+        usage,
+        bytes,
+        UTF8(|line_num, line| {
+            let line_num = line_num as u32;
+            let on_definition = matches[..def_count].iter().any(|d| d.line == line_num);
+            if !on_definition {
+                matches.push(Match {
+                    path: path.to_path_buf(),
+                    line: line_num,
+                    text: line.trim_end().to_string(),
+                    is_definition: false,
+                    exact: line.contains(query),
+                    file_lines,
+                    mtime,
+                    def_range: None,
+                    def_name: None,
+                    def_weight: 0,
+                    impl_target: None,
+                });
+            }
+            Ok(true)
+        }),
+    );
+
+    Scan::Matches(FileDefs { matches, others })
+}
+
+/// The definitions of `query` in one file's content.
+fn definitions_in(
+    path: &Path,
+    wanted: Wanted,
+    content: &str,
+    file_lines: u32,
+    mtime: SystemTime,
+) -> FileDefs {
+    // Try tree-sitter structural detection
+    let file_type = detect_file_type_with_content(path, content);
+    let lang = match file_type {
+        FileType::Code(l) => Some(l),
+        _ => None,
+    };
+
+    let ts_language = lang.and_then(outline_language);
+
+    if let Some(ref ts_lang) = ts_language {
+        return find_defs_treesitter(path, wanted, ts_lang, lang, content, file_lines, mtime);
+    }
+
+    // Without a syntax tree no definition has a known owner, so the query is
+    // matched as written.
+    let query = wanted.query;
+
+    // Per-file-type fallback dispatch. The semantics of "definition"
+    // differ by file kind, so handle them separately:
+    //
+    // * Code without a tree-sitter grammar: keyword heuristic (looks
+    //   for lines starting with `function`/`const`/`class`/etc.).
+    // * Markdown / RST: heading-as-definition. A heading whose text
+    //   contains the query (`## parseCitations` in a doc) marks that
+    //   section AS being about the symbol — that is the documentation
+    //   analogue of a code definition. Quoted code blocks inside
+    //   docs are NOT treated as definitions; they're usages, because
+    //   the keyword heuristic would false-positive on every snippet
+    //   that quotes the real source. Heading defs carry a lower
+    //   `def_weight` (30) than code definitions (60-80) so the real
+    //   source still ranks first.
+    // * Structured data / tabular / log / other: no fallback.
+    //   Mentions are config values, data, or noise — not definitions.
+    //   (A future patch could treat top-level config keys matching
+    //   the query as soft definitions, but that's ambiguous enough
+    //   to skip for now.)
+    let matches = match file_type {
+        FileType::Code(_) => find_defs_heuristic_buf(path, query, content, file_lines, mtime),
+        FileType::Markdown => find_defs_markdown_buf(path, query, content, file_lines, mtime),
+        _ => Vec::new(),
+    };
+    FileDefs {
+        matches,
+        others: Vec::new(),
+    }
 }
 
 /// Tree-sitter structural definition detection.
 /// Accepts pre-read content — no redundant file read.
 fn find_defs_treesitter(
     path: &Path,
-    query: &str,
+    wanted: Wanted,
     ts_lang: &tree_sitter::Language,
     lang: Option<tilth_core::types::Lang>,
     content: &str,
     file_lines: u32,
     mtime: SystemTime,
-) -> Vec<Match> {
+) -> FileDefs {
     let mut parser = tree_sitter::Parser::new();
     if parser.set_language(ts_lang).is_err() {
-        return Vec::new();
+        return FileDefs::default();
     }
 
     let Some(tree) = parser.parse(content, None) else {
-        return Vec::new();
+        return FileDefs::default();
     };
 
     let lines: Vec<&str> = content.lines().collect();
     let root = tree.root_node();
-    let mut defs = Vec::new();
+    let mut found = FileDefs::default();
 
     walk_for_definitions(
-        root, query, path, &lines, file_lines, mtime, &mut defs, lang, 0,
+        root, None, wanted, path, &lines, file_lines, mtime, &mut found, lang, 0, None,
     );
 
-    defs
+    found
 }
 
 /// Recursively walk AST nodes looking for definitions of the queried symbol.
+///
+/// `depth` counts nesting levels, and the walk stops below three: a
+/// declaration nested deeper is a local, not a definition. Only levels that
+/// nest count, so wrappers, namespaces and type bodies are free (see
+/// [`adds_nesting`]). `parent` is `node`'s parent, passed down because
+/// tree-sitter finds a parent by walking from the root. `wrapper_start` is the
+/// first row of the `export` or `declare` wrapper around `node`, which a
+/// definition's range covers.
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "a WalkCtx struct and a split in #315"
+)]
 fn walk_for_definitions(
     node: tree_sitter::Node,
-    query: &str,
+    parent: Option<tree_sitter::Node>,
+    wanted: Wanted,
     path: &Path,
     lines: &[&str],
     file_lines: u32,
     mtime: SystemTime,
-    defs: &mut Vec<Match>,
+    found: &mut FileDefs,
     lang: Option<tilth_core::types::Lang>,
     depth: usize,
+    wrapper_start: Option<usize>,
 ) {
     if depth > 3 {
         return;
@@ -349,28 +500,64 @@ fn walk_for_definitions(
 
     let kind = node.kind();
 
+    // A wrapper is not a definition of its own: the declaration it wraps is,
+    // at the same depth. An `export` or `declare` keyword shares the
+    // declaration's line, and the range starts at it. A Python decorator is
+    // beside the `def` inside its wrapper, so the range takes it in below.
+    if WRAPPER_KINDS.contains(&kind) {
+        let start = if kind == "decorated_definition" {
+            wrapper_start
+        } else {
+            Some(wrapper_start.unwrap_or_else(|| node.start_position().row))
+        };
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            walk_for_definitions(
+                child,
+                Some(node),
+                wanted,
+                path,
+                lines,
+                file_lines,
+                mtime,
+                found,
+                lang,
+                depth,
+                start,
+            );
+        }
+        return;
+    }
+    let end_row = node.end_position().row as u32 + 1;
+    // A definition's range starts at its wrapper or at the decorators beside
+    // it, whichever is first: an expanded result shows a route's decorator.
+    let start_row = || {
+        let own = wrapper_start.unwrap_or_else(|| node.start_position().row);
+        decorators_start(node).map_or(own, |d| d.min(own)) as u32 + 1
+    };
+
     // Definition kinds and name/weight ops come from the per-language spec. For
     // a known language these are `spec(lang).definition_kinds` / `.definitions`
     // (the shared defaults, except where a language such as Elixir or Go
     // carries its own); when `lang` is unknown we fall back to the shared
     // defaults.
-    let (def_kinds, def_ops): (&[&str], &DefinitionOps) = match lang {
-        Some(l) => {
+    let (def_kinds, def_ops): (&[&str], &DefinitionOps) =
+        lang.map_or((DEFAULT_DEF_KINDS, &DEFAULT_DEFS), |l| {
             let s = spec(l);
             (s.definition_kinds, &s.definitions)
-        }
-        None => (DEFAULT_DEF_KINDS, &DEFAULT_DEFS),
-    };
+        });
 
+    let query = wanted.name;
     if def_kinds.contains(&kind) {
         // Check if this node defines the queried symbol
-        if defines_name(node, lines, query, def_ops) {
-            let line_num = node.start_position().row as u32 + 1;
-            let line_text = lines
-                .get(node.start_position().row)
-                .unwrap_or(&"")
-                .trim_end();
-            defs.push(Match {
+        if defines_name(node, lines, query, def_ops).is_some_and(|defined| {
+            !is_local_binding(node, lines)
+                && owned_as_wanted(node, &defined, lines, lang, wanted, path, found)
+        }) {
+            let row = name_row(node);
+            let line_num = row as u32 + 1;
+            let line_text = lines.get(row).unwrap_or(&"").trim_end();
+            found.matches.push(Match {
                 path: path.to_path_buf(),
                 line: line_num,
                 text: line_text.to_string(),
@@ -378,10 +565,7 @@ fn walk_for_definitions(
                 exact: true,
                 file_lines,
                 mtime,
-                def_range: Some((
-                    node.start_position().row as u32 + 1,
-                    node.end_position().row as u32 + 1,
-                )),
+                def_range: Some((start_row(), end_row)),
                 def_name: Some(query.to_string()),
                 def_weight: (def_ops.weight)(node, lines),
                 impl_target: None,
@@ -389,8 +573,10 @@ fn walk_for_definitions(
         }
 
         // Impl/interface detection: surface `impl Trait for Type` and
-        // `class X implements Interface` blocks when searching for the trait/interface.
-        if kind == "impl_item" {
+        // `class X implements Interface` blocks when searching for the
+        // trait/interface. A qualified query names a member, not a trait.
+        let bare = wanted.owner.is_none();
+        if bare && kind == "impl_item" {
             if let Some(trait_name) = extract_impl_trait(node, lines) {
                 if trait_name == query {
                     let impl_type =
@@ -400,7 +586,7 @@ fn walk_for_definitions(
                         .get(node.start_position().row)
                         .unwrap_or(&"")
                         .trim_end();
-                    defs.push(Match {
+                    found.matches.push(Match {
                         path: path.to_path_buf(),
                         line: line_num,
                         text: line_text.to_string(),
@@ -408,27 +594,27 @@ fn walk_for_definitions(
                         exact: true,
                         file_lines,
                         mtime,
-                        def_range: Some((
-                            node.start_position().row as u32 + 1,
-                            node.end_position().row as u32 + 1,
-                        )),
+                        def_range: Some((start_row(), end_row)),
                         def_name: Some(format!("impl {query} for {impl_type}")),
                         def_weight: 80,
                         impl_target: Some(query.to_string()),
                     });
                 }
             }
-        } else if kind == "class_declaration" || kind == "class_definition" {
+        } else if bare
+            && matches!(
+                kind,
+                "class_declaration" | "class_definition" | "abstract_class_declaration"
+            )
+        {
             let interfaces = extract_implemented_interfaces(node, lines);
             if interfaces.iter().any(|i| i == query) {
                 let class_name = extract_definition_name(node, lines)
                     .unwrap_or_else(|| "<anonymous>".to_string());
-                let line_num = node.start_position().row as u32 + 1;
-                let line_text = lines
-                    .get(node.start_position().row)
-                    .unwrap_or(&"")
-                    .trim_end();
-                defs.push(Match {
+                let row = name_row(node);
+                let line_num = row as u32 + 1;
+                let line_text = lines.get(row).unwrap_or(&"").trim_end();
+                found.matches.push(Match {
                     path: path.to_path_buf(),
                     line: line_num,
                     text: line_text.to_string(),
@@ -436,10 +622,7 @@ fn walk_for_definitions(
                     exact: true,
                     file_lines,
                     mtime,
-                    def_range: Some((
-                        node.start_position().row as u32 + 1,
-                        node.end_position().row as u32 + 1,
-                    )),
+                    def_range: Some((start_row(), end_row)),
                     def_name: Some(format!("{class_name} implements {query}")),
                     def_weight: 80,
                     impl_target: Some(query.to_string()),
@@ -450,13 +633,15 @@ fn walk_for_definitions(
         // Elixir: definitions are `call` nodes — check separately. Name and
         // weight come from `spec(Elixir).definitions` via `def_ops`.
         if let Some(name) = (def_ops.extract_name)(node, lines) {
-            if name == query {
+            if last_segment(&name) == query
+                && owned_as_wanted(node, &name, lines, lang, wanted, path, found)
+            {
                 let line_num = node.start_position().row as u32 + 1;
                 let line_text = lines
                     .get(node.start_position().row)
                     .unwrap_or(&"")
                     .trim_end();
-                defs.push(Match {
+                found.matches.push(Match {
                     path: path.to_path_buf(),
                     line: line_num,
                     text: line_text.to_string(),
@@ -477,30 +662,106 @@ fn walk_for_definitions(
     }
 
     // Recurse into children (for nested definitions, class bodies, impl blocks,
-    // etc.). Namespaces and pass-through wrappers (`#ifdef`, `extern "C"`,
-    // `template <...>`) add no nesting, so they do not count toward the depth
-    // limit: a method in a class in a namespace is found like one in a
-    // top-level class.
-    let child_depth =
-        if is_or_body_of(node, NAMESPACE_KINDS) || is_or_body_of(node, PASS_THROUGH_KINDS) {
-            depth
-        } else {
-            depth + 1
-        };
+    // etc.).
+    let child_depth = if adds_nesting(node, parent, def_kinds.contains(&kind), lang, lines) {
+        depth + 1
+    } else {
+        depth
+    };
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         walk_for_definitions(
             child,
-            query,
+            Some(node),
+            wanted,
             path,
             lines,
             file_lines,
             mtime,
-            defs,
+            found,
             lang,
             child_depth,
+            None,
         );
     }
+}
+
+/// Whether the children of `node`, a definition when `defines`, sit one
+/// nesting level deeper than `node`. The file's root nests its top-level
+/// declarations. A statement at the top that defines nothing (`if`, `try`,
+/// `with`) opens no scope, so it adds no nesting. Nor do namespaces, modules,
+/// pass-through wrappers (`#ifdef`, `extern "C"`, `template <...>`) or a
+/// type's body: a method of a class in a namespace, or of a class nested in
+/// another class, is found like one in a top-level class, while a
+/// declaration in a function body stays a level deeper.
+fn adds_nesting(
+    node: tree_sitter::Node,
+    parent: Option<tree_sitter::Node>,
+    defines: bool,
+    lang: Option<tilth_core::types::Lang>,
+    lines: &[&str],
+) -> bool {
+    let Some(parent) = parent else {
+        return true;
+    };
+    let at_top = parent.parent().is_none();
+    let free = (at_top && !defines)
+        || is_or_body_of(node, Some(parent), NAMESPACE_KINDS)
+        || is_or_body_of(node, Some(parent), PASS_THROUGH_KINDS)
+        // Python's file root is a `module`, a type kind, but a root is no type.
+        || (TYPE_KINDS.contains(&parent.kind()) && !at_top)
+        || (lang == Some(tilth_core::types::Lang::Elixir)
+            && is_elixir_container(node, Some(parent), lines));
+    !free
+}
+
+/// Whether definition `node`, which defines `defined`, is the one a qualified
+/// query names: by its owner (see [`names_definition`]), or, for a
+/// definition no type holds, by the module its file is (see
+/// [`names_module`]). A bare query takes any owner. A definition another
+/// owner holds is recorded in `found.others`, so a search that matches none
+/// can say where the name is.
+fn owned_as_wanted(
+    node: tree_sitter::Node,
+    defined: &str,
+    lines: &[&str],
+    lang: Option<tilth_core::types::Lang>,
+    wanted: Wanted,
+    path: &Path,
+    found: &mut FileDefs,
+) -> bool {
+    let Some(want) = wanted.owner else {
+        return true;
+    };
+    let owner = lang.and_then(|l| definition_owner(node, lines, l));
+    if names_definition(wanted.query, defined, owner.as_deref()) {
+        return true;
+    }
+    if owner.is_none() && !defined.contains(['.', ':']) {
+        let mut root = node;
+        while let Some(parent) = root.parent() {
+            root = parent;
+        }
+        if names_module(want, path, root, lines) {
+            return true;
+        }
+    }
+    found.others.push(OtherOwner {
+        path: path.to_path_buf(),
+        line: name_row(node) as u32 + 1,
+        owner,
+    });
+    false
+}
+
+/// The row of a definition's name: below its first row when decorators or
+/// annotations open the node (`@Injectable()` above `class Service`). A
+/// definition with no name field is found on its first row.
+fn name_row(node: tree_sitter::Node) -> usize {
+    ["name", "identifier", "declarator"]
+        .iter()
+        .find_map(|field| node.child_by_field_name(field))
+        .map_or_else(|| node.start_position().row, |n| n.start_position().row)
 }
 
 /// Whether definition `node` binds the name `query`. Most definitions bind
@@ -508,18 +769,40 @@ fn walk_for_definitions(
 /// several (`var a, b int`), each a named child under the `name` field, so
 /// the later names are checked too. A node `extract_name` gives no name binds
 /// nothing: a C `struct point` without a body names a type, it defines none.
-fn defines_name(node: tree_sitter::Node, lines: &[&str], query: &str, ops: &DefinitionOps) -> bool {
-    let Some(first) = (ops.extract_name)(node, lines) else {
-        return false;
-    };
-    if first == query {
-        return true;
+fn defines_name(
+    node: tree_sitter::Node,
+    lines: &[&str],
+    query: &str,
+    ops: &DefinitionOps,
+) -> Option<String> {
+    let first = (ops.extract_name)(node, lines)?;
+    if last_segment(&first) == query {
+        return Some(first);
     }
+    let text = |n: tree_sitter::Node| node_text_simple(n, lines, NodeTextMode::Full);
+    // Every name a declaration binds: each `name` of Go's `var x, y`, and
+    // each declarator of `const a = 1, b = 2` (JS, TS) or `const A = 1,
+    // B = 2;` (PHP).
     let mut cursor = node.walk();
-    let found = node
+    let named = node
         .children_by_field_name("name", &mut cursor)
-        .any(|n| n.is_named() && node_text_simple(n, lines, NodeTextMode::Full) == query);
-    found
+        .any(|n| n.is_named() && text(n) == query);
+    let mut cursor = node.walk();
+    let declared = node.named_children(&mut cursor).any(|n| {
+        let name = match n.kind() {
+            "variable_declarator" => n.child_by_field_name("name"),
+            "const_element" => n.named_child(0),
+            _ => None,
+        };
+        name.is_some_and(|n| text(n) == query)
+    });
+    (named || declared).then(|| query.to_string())
+}
+
+/// The last segment of a name a definition carries: `User` for Ruby's
+/// `class Admin::User`, `Accounts` for Elixir's `defmodule MyApp.Accounts`.
+fn last_segment(name: &str) -> &str {
+    split_qualified(name).1
 }
 
 /// Keyword heuristic fallback for files without tree-sitter grammars.
@@ -552,119 +835,6 @@ fn find_defs_heuristic_buf(
     }
 
     defs
-}
-
-/// Find all usages via ripgrep (word-boundary matching).
-/// Collects per-file, locks once per file (not per line).
-/// Early termination once enough usages found.
-fn find_usages(
-    query: &str,
-    matcher: &RegexMatcher,
-    scope: &Path,
-    glob: Option<&str>,
-    early_quit_threshold: usize,
-) -> Result<Vec<Match>, TilthError> {
-    let matches: Mutex<Vec<Match>> = Mutex::new(Vec::new());
-    // Relaxed: same reasoning as find_definitions — approximate early-quit, joined before read
-    let found_count = AtomicUsize::new(0);
-
-    let walker = tilth_core::search::walk::walker(scope, glob)?;
-
-    walker.run(|| {
-        let matches = &matches;
-        let found_count = &found_count;
-
-        Box::new(move |entry| {
-            // Early termination: enough usages found
-            if found_count.load(Ordering::Relaxed) >= early_quit_threshold {
-                return ignore::WalkState::Quit;
-            }
-
-            let Ok(entry) = entry else {
-                return ignore::WalkState::Continue;
-            };
-
-            if !entry.file_type().is_some_and(|ft| ft.is_file()) {
-                return ignore::WalkState::Continue;
-            }
-
-            let path = entry.path();
-
-            // Skip files that look minified by filename — `.min.js`, `app-min.css`.
-            if path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(tilth_core::lang::detection::is_minified_by_name)
-            {
-                return ignore::WalkState::Continue;
-            }
-
-            // Skip oversized files
-            let file_size = match std::fs::metadata(path) {
-                Ok(meta) => {
-                    if meta.len() > 500_000 {
-                        return ignore::WalkState::Continue;
-                    }
-                    meta.len()
-                }
-                Err(_) => 0,
-            };
-
-            // Read once and dispatch via `search_slice` so the minified
-            // heuristic and the search share a single kernel read.
-            let Ok(bytes) = std::fs::read(path) else {
-                return ignore::WalkState::Continue;
-            };
-
-            // Catch unmarked minified bundles between 100KB and 500KB — they
-            // were not skipped by the filename check or the size cap above.
-            if file_size >= tilth_core::lang::detection::MINIFIED_CHECK_THRESHOLD
-                && tilth_core::lang::detection::is_minified_by_content(&bytes)
-            {
-                return ignore::WalkState::Continue;
-            }
-
-            let (file_lines, mtime) = file_metadata(path);
-
-            let mut file_matches = Vec::new();
-            let mut searcher = Searcher::new();
-
-            let _ = searcher.search_slice(
-                matcher,
-                &bytes,
-                UTF8(|line_num, line| {
-                    file_matches.push(Match {
-                        path: path.to_path_buf(),
-                        line: line_num as u32,
-                        text: line.trim_end().to_string(),
-                        is_definition: false,
-                        exact: line.contains(query),
-                        file_lines,
-                        mtime,
-                        def_range: None,
-                        def_name: None,
-                        def_weight: 0,
-                        impl_target: None,
-                    });
-                    Ok(true)
-                }),
-            );
-
-            if !file_matches.is_empty() {
-                found_count.fetch_add(file_matches.len(), Ordering::Relaxed);
-                let mut all = matches
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                all.extend(file_matches);
-            }
-
-            ignore::WalkState::Continue
-        })
-    });
-
-    Ok(matches
-        .into_inner()
-        .unwrap_or_else(std::sync::PoisonError::into_inner))
 }
 
 /// Markdown heading definition detector.
@@ -706,7 +876,6 @@ fn find_defs_markdown_buf(
     defs
 }
 
-#[allow(clippy::too_many_arguments)]
 fn walk_md_sections(
     node: tree_sitter::Node,
     lines: &[&str],
@@ -730,7 +899,6 @@ fn walk_md_sections(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn emit_md_section_match(
     section: tree_sitter::Node,
     lines: &[&str],
@@ -859,8 +1027,30 @@ fn is_definition_line(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
     use std::path::PathBuf;
     use std::time::SystemTime;
+
+    /// The definitions of bare `name` the tree-sitter walker finds in `code`.
+    fn ts_defs(
+        path: &Path,
+        name: &str,
+        ts_lang: &tree_sitter::Language,
+        lang: Option<tilth_core::types::Lang>,
+        code: &str,
+        file_lines: u32,
+        mtime: SystemTime,
+    ) -> Vec<Match> {
+        // The query is split as `search_capped` splits it, so a dotted name
+        // such as Elixir's `MyApp.Greeter` takes the path a search takes.
+        let (owner, bare) = split_qualified(name);
+        let wanted = Wanted {
+            query: name,
+            name: bare,
+            owner,
+        };
+        find_defs_treesitter(path, wanted, ts_lang, lang, code, file_lines, mtime).matches
+    }
 
     #[test]
     fn rust_definitions_detected() {
@@ -882,7 +1072,7 @@ pub(crate) fn dispatch_tool(tool: &str) -> Result<String, String> {
         let ts_lang =
             tilth_core::lang::outline::outline_language(tilth_core::types::Lang::Rust).unwrap();
 
-        let defs = find_defs_treesitter(
+        let defs = ts_defs(
             std::path::Path::new("test.rs"),
             "hello",
             &ts_lang,
@@ -895,7 +1085,7 @@ pub(crate) fn dispatch_tool(tool: &str) -> Result<String, String> {
         assert!(defs[0].is_definition);
         assert!(defs[0].def_range.is_some());
 
-        let defs = find_defs_treesitter(
+        let defs = ts_defs(
             std::path::Path::new("test.rs"),
             "Foo",
             &ts_lang,
@@ -906,7 +1096,7 @@ pub(crate) fn dispatch_tool(tool: &str) -> Result<String, String> {
         );
         assert!(!defs.is_empty(), "should find 'Foo' definition");
 
-        let defs = find_defs_treesitter(
+        let defs = ts_defs(
             std::path::Path::new("test.rs"),
             "dispatch_tool",
             &ts_lang,
@@ -931,7 +1121,7 @@ const unexported = "hello";
                 .unwrap();
         let lines = code.lines().count() as u32;
 
-        let defs = find_defs_treesitter(
+        let defs = ts_defs(
             std::path::Path::new("test.ts"),
             "UNTAGGED_REQUESTS_SQL",
             &ts_lang,
@@ -948,7 +1138,7 @@ const unexported = "hello";
         assert!(defs[0].def_range.is_some());
 
         // Non-exported const also detected
-        let defs = find_defs_treesitter(
+        let defs = ts_defs(
             std::path::Path::new("test.ts"),
             "unexported",
             &ts_lang,
@@ -966,7 +1156,7 @@ const unexported = "hello";
         let ts_lang =
             tilth_core::lang::outline::outline_language(tilth_core::types::Lang::Elixir).unwrap();
         let lines = code.lines().count() as u32;
-        find_defs_treesitter(
+        ts_defs(
             std::path::Path::new("test.ex"),
             name,
             &ts_lang,
@@ -1371,6 +1561,99 @@ Body to end.
         );
     }
 
+    /// The old walkers quit on a shared counter (50 definitions, 30 usages),
+    /// so the total was however far the threads got: "10 of 48" for a symbol
+    /// with 685 hits, and a different number on each run. 80 files with one
+    /// definition and two usages each are well past both thresholds.
+    #[test]
+    fn symbol_totals_are_exact_and_identical_across_runs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for i in 0..80 {
+            std::fs::write(
+                dir.path().join(format!("f{i:02}.rs")),
+                format!("pub fn exact_needle_{i}() {{}}\nfn exact_needle() {{}}\nfn user_{i}() {{ exact_needle(); exact_needle(); }}\n"),
+            )
+            .expect("write");
+        }
+        let first = search("exact_needle", dir.path(), None, None, false).expect("search");
+        assert_eq!(first.definitions, 80, "every definition is counted");
+        assert_eq!(first.usages, 80, "every usage line is counted");
+        assert_eq!(first.total_found, 160);
+        assert_eq!(
+            first.facet_totals.definitions
+                + first.facet_totals.usages_local
+                + first.facet_totals.usages_cross
+                + first.facet_totals.tests
+                + first.facet_totals.implementations,
+            160,
+            "facet totals add up to the exact total"
+        );
+        let shown = |r: &SearchResult| -> Vec<(PathBuf, u32)> {
+            r.matches.iter().map(|m| (m.path.clone(), m.line)).collect()
+        };
+        for _ in 0..4 {
+            let again = search("exact_needle", dir.path(), None, None, false).expect("search");
+            assert_eq!(again.total_found, first.total_found);
+            assert_eq!(shown(&again), shown(&first), "same matches every run");
+        }
+    }
+
+    /// The collection bound must be invisible in the result: at the
+    /// production bound and with no bound, the totals, the facet totals and
+    /// the matches shown are the same. A bound of one shows it is live.
+    #[test]
+    fn collection_bound_does_not_change_the_result() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for f in 0..6 {
+            // Comment mentions rank below a call, and the call is the last
+            // line, so keeping a file's first matches instead of its best
+            // would drop it.
+            let mut body = String::new();
+            if f % 2 == 0 {
+                body.push_str("pub fn bound_probe() {}\n");
+            }
+            for i in 0..13 {
+                let _ = writeln!(body, "// bound_probe note {i}");
+            }
+            body.push_str("fn user() { bound_probe(); }\n");
+            let sub = dir.path().join(format!("pkg{f}"));
+            std::fs::create_dir(&sub).expect("mkdir");
+            std::fs::write(sub.join("lib.rs"), body).expect("write");
+        }
+        let key = |r: &SearchResult| -> Vec<(PathBuf, u32, bool)> {
+            r.matches
+                .iter()
+                .map(|m| (m.path.clone(), m.line, m.is_definition))
+                .collect()
+        };
+        let run = |cap| search_capped("bound_probe", dir.path(), None, None, 10, cap).unwrap();
+        let bounded = run(10);
+        let unbounded = run(usize::MAX);
+        assert_eq!(bounded.total_found, 87);
+        assert!(
+            bounded
+                .matches
+                .iter()
+                .any(|m| m.text.starts_with("fn user()")),
+            "a file's best usage is its last line"
+        );
+        assert_eq!(bounded.total_found, unbounded.total_found);
+        assert_eq!(bounded.definitions, 3);
+        assert_eq!(key(&bounded), key(&unbounded));
+        assert_eq!(
+            format!("{:?}", bounded.facet_totals),
+            format!("{:?}", unbounded.facet_totals)
+        );
+        let one = run(1);
+        assert_eq!(one.matches.len(), 1, "one match is kept");
+        assert_eq!(
+            (&one.matches[0].path, one.matches[0].line),
+            (&bounded.matches[0].path, bounded.matches[0].line),
+            "the best one"
+        );
+        assert_eq!(one.total_found, 87, "and the count stays exact");
+    }
+
     #[test]
     fn full_flag_raises_match_cap() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1447,7 +1730,7 @@ Body to end.
     fn go_find(code: &str, name: &str) -> Vec<Match> {
         let ts_lang =
             tilth_core::lang::outline::outline_language(tilth_core::types::Lang::Go).unwrap();
-        find_defs_treesitter(
+        ts_defs(
             std::path::Path::new("main.go"),
             name,
             &ts_lang,
@@ -1644,7 +1927,7 @@ func run() {
         let ts_lang =
             tilth_core::lang::outline::outline_language(tilth_core::types::Lang::Cpp).unwrap();
         for (name, line) in [("~Shape", 5), ("operator==", 7)] {
-            let defs = find_defs_treesitter(
+            let defs = ts_defs(
                 std::path::Path::new("shapes.cpp"),
                 name,
                 &ts_lang,
@@ -1665,5 +1948,791 @@ func run() {
         let code = "namespace App {\n  public class Svc {\n    public void Run() {}\n  }\n}\n";
         assert_eq!(definition_lines("Svc.cs", code, "Svc"), vec![2]);
         assert_eq!(definition_lines("Svc.cs", code, "Run"), vec![3]);
+    }
+
+    /// Assert that each `(query, lines)` pair finds definitions on exactly
+    /// those lines of `fixture`, written to `file`. An empty list means the
+    /// query has usages only.
+    fn assert_definitions(file: &str, fixture: &str, cases: &[(&str, &[u32])]) {
+        for (query, expected) in cases {
+            assert_eq!(
+                definition_lines(file, fixture, query),
+                expected.to_vec(),
+                "{file}: definition lines of {query}"
+            );
+        }
+    }
+
+    /// Search `fixture`, written to `file`, and return the range of the one
+    /// definition of `query`.
+    fn definition_range(file: &str, fixture: &str, query: &str) -> Option<(u32, u32)> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join(file), fixture).expect("write fixture");
+        let result = search(query, dir.path(), None, None, false).expect("search");
+        let defs: Vec<&Match> = result.matches.iter().filter(|m| m.is_definition).collect();
+        assert_eq!(
+            defs.len(),
+            1,
+            "{query}: expected one definition, got {defs:?}"
+        );
+        defs[0].def_range
+    }
+
+    #[test]
+    fn ruby_classes_modules_and_methods_are_definitions() {
+        // Instance methods, `def self.` methods, and the classes and modules
+        // that hold them, whether a class sits in a module or not.
+        let code = "module Shop
+  class Store
+    def save
+      1
+    end
+
+    def self.build
+      new
+    end
+  end
+end
+
+module Util
+  def self.slugify(s)
+    s
+  end
+end
+
+class Plain
+  def run
+  end
+end
+";
+        assert_definitions(
+            "shop.rb",
+            code,
+            &[
+                ("Shop", &[1]),
+                ("Store", &[2]),
+                ("save", &[3]),
+                ("build", &[7]),
+                ("Util", &[13]),
+                ("slugify", &[14]),
+                ("Plain", &[19]),
+                ("run", &[20]),
+            ],
+        );
+    }
+
+    #[test]
+    fn members_of_wrapped_and_namespaced_types_are_definitions() {
+        // `export`, `export default`, decorators and `namespace` wrap a
+        // declaration without nesting it, so the members inside are found
+        // like the members of a bare top-level class.
+        let ts = "export class Exported {
+  method() {}
+  static make() {}
+}
+export default class Fallback {
+  render() {}
+}
+namespace Space {
+  export function inSpace() {}
+}
+@Component({})
+export class Widget {
+  @Input() decorated() {}
+}
+";
+        assert_definitions(
+            "app.ts",
+            ts,
+            &[
+                ("Exported", &[1]),
+                ("method", &[2]),
+                ("make", &[3]),
+                ("Fallback", &[5]),
+                ("render", &[6]),
+                ("Space", &[8]),
+                ("inSpace", &[9]),
+                ("Widget", &[12]),
+                ("decorated", &[13]),
+            ],
+        );
+
+        let py = "@decorator
+def top():
+    pass
+
+class Service:
+    @property
+    def prop(self):
+        pass
+
+    @classmethod
+    def build(cls):
+        pass
+";
+        assert_definitions(
+            "svc.py",
+            py,
+            &[("top", &[2]), ("prop", &[7]), ("build", &[11])],
+        );
+
+        let rs = "mod a {
+    mod b {
+        mod c {
+            pub fn deep() {}
+        }
+    }
+}
+";
+        assert_definitions("lib.rs", rs, &[("deep", &[4])]);
+    }
+
+    #[test]
+    fn members_of_nested_types_are_definitions() {
+        // A type's body adds no nesting of its own, so a method of a nested
+        // class is found like a method of a top-level one.
+        let java = "class Outer {
+  static class Inner {
+    void innerMethod() {}
+  }
+}
+";
+        assert_definitions(
+            "Outer.java",
+            java,
+            &[("Inner", &[2]), ("innerMethod", &[3])],
+        );
+
+        let py = "class Model:
+    class Meta:
+        def options(self):
+            pass
+";
+        assert_definitions("model.py", py, &[("Meta", &[2]), ("options", &[3])]);
+
+        let kt = "class Outer {
+  companion object {
+    fun create() {}
+  }
+}
+";
+        assert_definitions("Outer.kt", kt, &[("create", &[3])]);
+
+        let ex = "defmodule Outer do
+  defmodule Inner do
+    def nested_func, do: :ok
+  end
+end
+";
+        assert_definitions("outer.ex", ex, &[("Inner", &[2]), ("nested_func", &[3])]);
+    }
+
+    #[test]
+    fn a_wrapped_declaration_is_one_definition() {
+        // The wrapper (`export`, a decorator) is not a second definition of
+        // the name it wraps. The range covers an `export` and the decorators
+        // before it, in TypeScript and Python alike.
+        let ts = "export function once() {}\n@Component({})\nexport class Widget {\n}\n";
+        assert_definitions("app.ts", ts, &[("once", &[1]), ("Widget", &[3])]);
+        assert_eq!(definition_range("app.ts", ts, "Widget"), Some((2, 4)));
+
+        let py = "@decorator\n@other\ndef top():\n    pass\n";
+        assert_definitions("svc.py", py, &[("top", &[3])]);
+        assert_eq!(definition_range("svc.py", py, "top"), Some((1, 4)));
+    }
+
+    #[test]
+    fn function_locals_are_not_definitions() {
+        // A variable declared in a function body is local to it, however the
+        // function is wrapped. The same declaration at file or type scope is
+        // a definition.
+        let ts = "export function exported() {
+  const local = 1;
+}
+function plain() {
+  let other = 2;
+}
+export const top = () => {
+  const inArrow = 3;
+};
+class K {
+  method() {
+    const inMethod = 4;
+  }
+}
+";
+        assert_definitions(
+            "app.ts",
+            ts,
+            &[
+                ("exported", &[1]),
+                ("local", &[]),
+                ("plain", &[4]),
+                ("other", &[]),
+                ("top", &[7]),
+                ("inArrow", &[]),
+                ("inMethod", &[]),
+            ],
+        );
+
+        let sh = "setup() {\n  local local_var=1\n}\nGLOBAL=2\n";
+        assert_definitions("run.sh", sh, &[("local_var", &[]), ("GLOBAL", &[4])]);
+
+        let kt = "val topLevel = 1\nfun f() {\n  val localVal = 2\n}\n";
+        assert_definitions("A.kt", kt, &[("topLevel", &[1]), ("localVal", &[])]);
+
+        let rs = "const TOP: i32 = 1;
+fn f() {
+    const LOCAL: i32 = 2;
+}
+struct S;
+impl S {
+    const ASSOC: i32 = 3;
+}
+";
+        assert_definitions(
+            "lib.rs",
+            rs,
+            &[("TOP", &[1]), ("LOCAL", &[]), ("ASSOC", &[7])],
+        );
+    }
+
+    #[test]
+    fn abstract_classes_and_their_members_are_definitions() {
+        let code = "abstract class Shape {
+  abstract area(): number;
+  describe() {}
+}
+export abstract class Base {}
+export default abstract class Fallback {}
+";
+        for file in ["shape.ts", "shape.tsx"] {
+            assert_definitions(
+                file,
+                code,
+                &[
+                    ("Shape", &[1]),
+                    ("area", &[2]),
+                    ("describe", &[3]),
+                    ("Base", &[5]),
+                    ("Fallback", &[6]),
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn declarations_of_every_language_are_definitions() {
+        // One line per declaration kind the 17-language probe found reported
+        // as a usage. A member declared without a body (a trait or
+        // interface method) is a definition, as Java's and C#'s already are;
+        // only C and C++ prototypes, which repeat a definition found
+        // elsewhere, are not.
+        let rs = "macro_rules! shout { () => {} }
+pub union Bits { a: u32 }
+pub trait Speak {
+    fn required(&self);
+}
+";
+        assert_definitions(
+            "lib.rs",
+            rs,
+            &[("shout", &[1]), ("Bits", &[2]), ("required", &[4])],
+        );
+
+        let ts = "interface Api {\n  call(): void;\n}\ndeclare function ambient(): void;\n";
+        assert_definitions("api.ts", ts, &[("call", &[2]), ("ambient", &[4])]);
+
+        let go = "package p\n\ntype Reader interface {\n\tRead() error\n}\n";
+        assert_definitions("r.go", go, &[("Reader", &[3]), ("Read", &[4])]);
+
+        let java = "record Point(int x) {}\n@interface Marker {}\n";
+        assert_definitions("P.java", java, &[("Point", &[1]), ("Marker", &[2])]);
+
+        let scala = "object Registry {\n  val limit = 1\n}\ntrait Plugin {\n  def run(): Unit\n}\n";
+        assert_definitions(
+            "a.scala",
+            scala,
+            &[
+                ("Registry", &[1]),
+                ("limit", &[2]),
+                ("Plugin", &[4]),
+                ("run", &[5]),
+            ],
+        );
+
+        let c = "#define LIMIT 10\n#define MAX(a, b) ((a) > (b) ? (a) : (b))\n";
+        assert_definitions("m.c", c, &[("LIMIT", &[1]), ("MAX", &[2])]);
+
+        let cs = "namespace Shop {\n  public struct Price {}\n  public record Order(int Id);\n}\n";
+        assert_definitions(
+            "Shop.cs",
+            cs,
+            &[("Shop", &[1]), ("Price", &[2]), ("Order", &[3])],
+        );
+
+        let swift = "protocol Drawable {\n  func draw()\n}\n";
+        assert_definitions("d.swift", swift, &[("Drawable", &[1]), ("draw", &[2])]);
+
+        let kt = "class Account {\n  val balance = 0\n}\n";
+        assert_definitions("A.kt", kt, &[("balance", &[2])]);
+
+        let php = "<?php\nclass Config {\n  const VERSION = 1;\n}\n";
+        assert_definitions("c.php", php, &[("VERSION", &[3])]);
+    }
+
+    /// Search `fixture`, written to `file`, for `query` and return the line
+    /// of every definition found, sorted, with the result. Every definition
+    /// must carry the bare name, whatever qualifies the query.
+    fn qualified_search(file: &str, fixture: &str, query: &str) -> (Vec<u32>, SearchResult) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join(file), fixture).expect("write fixture");
+        let result = search(query, dir.path(), None, None, false).expect("search");
+        let bare = tilth_core::search::scope::split_qualified(query).1;
+        let mut lines: Vec<u32> = result
+            .matches
+            .iter()
+            .filter(|m| m.is_definition)
+            .inspect(|m| assert_eq!(m.def_name.as_deref(), Some(bare), "{query} def_name"))
+            .map(|m| m.line)
+            .collect();
+        lines.sort_unstable();
+        (lines, result)
+    }
+
+    const RUST_TWO_RUNS: &str = "pub struct A;
+pub struct B;
+
+impl A {
+    pub fn run(&self) -> u8 {
+        1
+    }
+}
+
+impl B {
+    pub fn run(&self) -> u8 {
+        2
+    }
+}
+
+pub fn use_them(a: &A, b: &B) -> u8 {
+    a.run() + B::run(b)
+}
+";
+
+    #[test]
+    fn a_qualified_name_finds_the_definition_its_owner_holds() {
+        let cases: &[(&str, &str, &str, &[u32])] = &[
+            ("m.rs", RUST_TWO_RUNS, "B::run", &[11]),
+            ("m.rs", RUST_TWO_RUNS, "B.run", &[11]),
+            ("m.rs", RUST_TWO_RUNS, "crate::m::A::run", &[5]),
+            (
+                "q.ts",
+                "class Target { foo() { return 1; } }\nclass Other { foo() { return 2; } }\n",
+                "Other.foo",
+                &[2],
+            ),
+            (
+                "ctx.go",
+                "package gin\n\ntype Context struct{}\n\nfunc (c *Context) reset() {}\n\n\
+                 func (r JSON) Render() error { return nil }\n\nfunc (r XML) Render() error { return nil }\n",
+                "XML.Render",
+                &[9],
+            ),
+            (
+                "ctx.go",
+                "package gin\n\ntype Context struct{}\n\nfunc (c *Context) reset() {}\n",
+                "Context.reset",
+                &[5],
+            ),
+            (
+                "store.py",
+                "class Store:\n    def get(self, key):\n        return key\n\n\
+                 class Cache:\n    @property\n    def get(self):\n        return 1\n",
+                "Cache.get",
+                &[7],
+            ),
+            (
+                "a.cpp",
+                "struct A { int run(); };\nstruct B { int run(); };\n\
+                 int A::run() { return 1; }\nint B::run() { return 2; }\n",
+                "B::run",
+                &[4],
+            ),
+            (
+                "shop.ex",
+                "defmodule Shop do\n  def run, do: 1\nend\ndefmodule Cart do\n  def run, do: 2\nend\n",
+                "Cart.run",
+                &[5],
+            ),
+        ];
+        for (file, fixture, query, expected) in cases {
+            let (lines, result) = qualified_search(file, fixture, query);
+            assert_eq!(lines, expected.to_vec(), "{file}: definitions of {query}");
+            assert!(result.other_owners.is_empty(), "{query}: {result:?}");
+        }
+    }
+
+    /// The literal text of a qualified name is still a usage of it.
+    #[test]
+    fn a_qualified_name_keeps_its_literal_usages() {
+        let (lines, result) = qualified_search("m.rs", RUST_TWO_RUNS, "B::run");
+        assert_eq!(lines, [11]);
+        let usages: Vec<u32> = result
+            .matches
+            .iter()
+            .filter(|m| !m.is_definition)
+            .map(|m| m.line)
+            .collect();
+        assert_eq!(usages, [17]);
+    }
+
+    /// When no definition of the name has the owner asked for, the result
+    /// says where the name is defined, so the next query can name one.
+    #[test]
+    fn a_qualified_name_with_no_such_owner_lists_the_owners_found() {
+        let (lines, result) = qualified_search("m.rs", RUST_TWO_RUNS, "Gamma::run");
+        assert_eq!(lines, Vec::<u32>::new());
+        let found: Vec<(Option<&str>, u32)> = result
+            .other_owners
+            .iter()
+            .map(|o| (o.owner.as_deref(), o.line))
+            .collect();
+        assert_eq!(found, [(Some("A"), 5), (Some("B"), 11)]);
+
+        // Dotted text that names no definition stays a literal search.
+        let py = "import os\n\ndef cache(key):\n    return os.path.join(\"c\", key)\n";
+        let (lines, result) = qualified_search("c.py", py, "os.path.join");
+        assert_eq!(lines, Vec::<u32>::new());
+        assert_eq!(result.other_owners, Vec::new());
+        assert_eq!(result.total_found, 1);
+    }
+
+    /// A decorated definition is one match, on the line that names it: the
+    /// decorators above it are part of its range, and its name line is not
+    /// a second, usage match.
+    #[test]
+    fn a_decorated_definition_is_found_on_its_name_line() {
+        let ts =
+            "@Injectable()\nclass Service {\n  @First()\n  method() {\n    return 1;\n  }\n}\n";
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("service.ts"), ts).expect("write");
+        let result = search("Service", dir.path(), None, None, false).expect("search");
+        assert_eq!(result.matches.len(), 1, "{result:?}");
+        let m = &result.matches[0];
+        assert_eq!(
+            (m.line, m.is_definition, m.def_range),
+            (2, true, Some((1, 7)))
+        );
+
+        let java = "class S {\n  @Override\n  public void run() {}\n}\n";
+        assert_definitions("S.java", java, &[("run", &[3])]);
+    }
+
+    #[test]
+    fn a_generator_function_is_a_definition() {
+        let js = "function* generate() {\n  yield 1;\n}\n";
+        assert_definitions("g.js", js, &[("generate", &[1])]);
+    }
+
+    #[test]
+    fn a_header_holding_cpp_is_searched_as_cpp() {
+        // `.h` is shared by C and C++. A header with C++ syntax keeps its
+        // class templates and in-class methods; a C header keeps its C
+        // definitions.
+        let cpp = "#pragma once
+template <typename T> class Box {
+ public:
+  T get() { return T(); }
+};
+namespace geo {
+int area() { return 1; }
+}
+";
+        assert_definitions(
+            "box.h",
+            cpp,
+            &[("Box", &[2]), ("get", &[4]), ("geo", &[6]), ("area", &[7])],
+        );
+
+        let c = tilth_core::lang::c::C_DEFINITIONS_FIXTURE;
+        assert_definitions(
+            "shapes.h",
+            c,
+            &[("add", &[11]), ("point", &[4]), ("compare_fn", &[8])],
+        );
+    }
+
+    const RUST_RUNNER: &str = "pub struct Runner;
+
+impl Runner {
+    pub fn new() -> Self {
+        Self::helper();
+        Runner
+    }
+
+    fn helper() {}
+
+    pub fn run(&self) {
+        self.run();
+    }
+}
+";
+
+    /// A qualifier that names a module or package, or the type the code is
+    /// written in, finds the definition by its name (#296 dropped grok's
+    /// bare-name retry, and these came back "not found").
+    #[test]
+    fn a_qualifier_naming_a_module_or_self_finds_the_definition() {
+        let cases: &[(&str, &str, &str, &[u32])] = &[
+            (
+                "gin.go",
+                "package gin\n\nfunc New() int { return 1 }\n",
+                "gin.New",
+                &[3],
+            ),
+            // The package clause names it, whatever the file is called.
+            (
+                "recovery.go",
+                "package gin\n\nfunc Recovery() {}\n",
+                "gin.Recovery",
+                &[3],
+            ),
+            (
+                "symbol.rs",
+                "pub fn search() {}\n",
+                "crate::search::symbol::search",
+                &[1],
+            ),
+            (
+                "path.py",
+                "def join(a, b):\n    return a\n",
+                "os.path.join",
+                &[1],
+            ),
+            ("m.rs", RUST_RUNNER, "Self::new", &[4]),
+            ("m.rs", RUST_RUNNER, "self.run", &[11]),
+            ("s.ts", "class S {\n  handle() {}\n}\n", "this.handle", &[2]),
+            // A free function in a file the qualifier does not name is not
+            // the qualified name's definition.
+            ("m.rs", "pub fn run() {}\n", "B::run", &[]),
+        ];
+        for (file, fixture, query, expected) in cases {
+            let (lines, _) = qualified_search(file, fixture, query);
+            assert_eq!(lines, expected.to_vec(), "{file}: definitions of {query}");
+        }
+
+        // A package directory names the modules in it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(dir.path().join("utils")).expect("mkdir");
+        std::fs::write(
+            dir.path().join("utils/__init__.py"),
+            "def slug(s):\n    return s\n",
+        )
+        .expect("write");
+        let result = search("utils.slug", dir.path(), None, None, false).expect("search");
+        assert_eq!(result.definitions, 1, "{result:?}");
+    }
+
+    /// `Self`, `self`, `this` and `cls` stand for the type the call is
+    /// written in, so they never name a function no type holds.
+    #[test]
+    fn a_self_qualifier_skips_free_functions() {
+        let cases: &[(&str, &str, &str, &str, &str)] = &[
+            (
+                "util.py",
+                "def run():\n    return 1\n",
+                "job.py",
+                "class Job:\n    def run(self):\n        return 2\n",
+                "self.run",
+            ),
+            (
+                "util.rs",
+                "pub fn new() -> u8 {\n    1\n}\n",
+                "job.rs",
+                "pub struct Job;\n\nimpl Job {\n    pub fn new() -> Self {\n        Job\n    }\n}\n",
+                "Self::new",
+            ),
+        ];
+        for (free_file, free, owned_file, owned, query) in cases {
+            let dir = tempfile::tempdir().expect("tempdir");
+            std::fs::write(dir.path().join(free_file), free).expect("write");
+            std::fs::write(dir.path().join(owned_file), owned).expect("write");
+            let result = search(query, dir.path(), None, None, false).expect("search");
+            let defs: Vec<&Path> = result
+                .matches
+                .iter()
+                .filter(|m| m.is_definition)
+                .map(|m| m.path.strip_prefix(dir.path()).expect("in dir"))
+                .collect();
+            assert_eq!(defs, [Path::new(owned_file)], "{query}: {result:?}");
+        }
+    }
+
+    /// A definition whose own name is qualified (an Elixir dotted module, a
+    /// Ruby `class Admin::User`, a nested TS or C++ namespace) is found by its
+    /// full name, its last segment, and as the owner of its members.
+    #[test]
+    fn a_definition_with_a_qualified_name_is_found_by_it() {
+        let ex = "defmodule MyApp.Accounts do\n  def get_user(id), do: id\nend\n";
+        let rb = "module Admin\nend\n\nclass Admin::User\n  def save!\n    true\n  end\nend\n";
+        let ts = "namespace A.B {\n  export function f() { return 1; }\n}\n";
+        let cpp = "namespace a::b {\nint g() { return 1; }\n}\n";
+        let cases: &[(&str, &str, &str, &[u32])] = &[
+            ("accounts.ex", ex, "MyApp.Accounts", &[1]),
+            ("accounts.ex", ex, "MyApp.Accounts.get_user", &[2]),
+            ("accounts.ex", ex, "Accounts.get_user", &[2]),
+            ("user.rb", rb, "Admin::User", &[4]),
+            ("user.rb", rb, "User", &[4]),
+            ("user.rb", rb, "User.save!", &[5]),
+            ("ns.ts", ts, "A.B", &[1]),
+            ("ns.ts", ts, "B.f", &[2]),
+            ("ns.cpp", cpp, "a::b", &[1]),
+            ("ns.cpp", cpp, "b::g", &[2]),
+        ];
+        for (file, fixture, query, expected) in cases {
+            let (lines, result) = qualified_search(file, fixture, query);
+            assert_eq!(lines, expected.to_vec(), "{file}: definitions of {query}");
+            assert!(result.other_owners.is_empty(), "{query}: {result:?}");
+        }
+    }
+
+    /// A name ending in `!` or `?` is matched as a whole word where it is
+    /// used: `\b` cannot follow a `!`.
+    #[test]
+    fn a_ruby_bang_method_has_usages() {
+        let rb = "class User\n  def save!\n    true\n  end\nend\n\nUser.new.save!\n";
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("u.rb"), rb).expect("write");
+        let result = search("save!", dir.path(), None, None, false).expect("search");
+        assert_eq!((result.definitions, result.usages), (1, 1), "{result:?}");
+    }
+
+    /// The decorators or attributes beside a definition are part of its
+    /// range, so an expanded result shows them (a `FastAPI` route's path is in
+    /// its decorator). The match stays on the line that names it.
+    #[test]
+    fn decorators_beside_a_definition_are_in_its_range() {
+        let py =
+            "app = object()\n\n\n@app.get(\"/items\")\n@auth\ndef read_items():\n    return 1\n";
+        let ts = "class Service {\n  @Get()\n  // route\n  @Auth()\n  handle() {\n    return 1;\n  }\n}\n";
+        let rs = "#[test]\n#[ignore]\nfn slow() {}\n";
+        for (file, fixture, query, line, range) in [
+            ("app.py", py, "read_items", 6, (4, 7)),
+            ("svc.ts", ts, "handle", 5, (2, 7)),
+            ("t.rs", rs, "slow", 3, (1, 3)),
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            std::fs::write(dir.path().join(file), fixture).expect("write");
+            let result = search(query, dir.path(), None, None, false).expect("search");
+            let def = result
+                .matches
+                .iter()
+                .find(|m| m.is_definition)
+                .expect("definition");
+            assert_eq!((def.line, def.def_range), (line, Some(range)), "{file}");
+        }
+    }
+
+    /// Python's file root is a `module`, which is also a type kind. The root
+    /// is not a type: a function inside a method is a local, as it is in
+    /// TypeScript, and a function inside a top-level function is found.
+    #[test]
+    fn python_nesting_counts_from_the_file_root() {
+        let py = "def outer():\n    def inner():\n        return 1\n    return inner()\n\n\n\
+                  class K:\n    def m(self):\n        def deep():\n            return 2\n        return deep()\n";
+        let ts =
+            "class K {\n  m() {\n    function deep() { return 2; }\n    return deep();\n  }\n}\n";
+        assert_definitions(
+            "nest.py",
+            py,
+            &[("inner", &[2]), ("m", &[8]), ("deep", &[])],
+        );
+        assert_definitions("nest.ts", ts, &[("m", &[2]), ("deep", &[])]);
+    }
+
+    /// An `if`, `try` or `with` at the top of a file opens no scope: a class
+    /// in its body keeps its methods, as a top-level class does.
+    #[test]
+    fn a_class_under_top_level_control_flow_keeps_its_methods() {
+        for (file, fixture, class_line) in [
+            (
+                "compat.py",
+                "import sys\nif sys.version_info >= (3, 8):\n    class Compat:\n        def run(self):\n            return 1\n",
+                3,
+            ),
+            (
+                "compat.py",
+                "try:\n    class Compat:\n        def run(self):\n            return 1\nexcept ImportError:\n    pass\n",
+                2,
+            ),
+            (
+                "compat.py",
+                "with open(\"x\"):\n    class Compat:\n        def run(self):\n            return 1\n",
+                2,
+            ),
+            (
+                "compat.ts",
+                "if (ready) {\n  class Compat {\n    run() {\n      return 1;\n    }\n  }\n}\n",
+                2,
+            ),
+        ] {
+            assert_definitions(
+                file,
+                fixture,
+                &[("Compat", &[class_line]), ("run", &[class_line + 1])],
+            );
+        }
+    }
+
+    /// Every name of a declaration that binds several is a definition.
+    #[test]
+    fn each_name_of_a_multi_name_declaration_is_a_definition() {
+        let php = "<?php\nconst X = 1, Y = 2;\nclass C {\n  const A = 1, B = 2;\n}\n";
+        assert_definitions(
+            "c.php",
+            php,
+            &[("X", &[2]), ("Y", &[2]), ("A", &[4]), ("B", &[4])],
+        );
+        let js = "const a = 1, b = 2;\nexport let c = 3, d = 4;\n";
+        assert_definitions(
+            "m.js",
+            js,
+            &[("a", &[1]), ("b", &[1]), ("c", &[2]), ("d", &[2])],
+        );
+    }
+
+    /// Only `local` (or `declare` without `-g`) makes a Bash variable local
+    /// to its function. A plain assignment in a function sets a global.
+    #[test]
+    fn a_bash_assignment_in_a_function_is_a_global_definition() {
+        let sh = "setup() {\n  CONFIG=1\n  local tmp=2\n  declare scratch=3\n  declare -g LEVEL=4\n  export MODE=5\n}\n";
+        assert_definitions(
+            "s.sh",
+            sh,
+            &[
+                ("CONFIG", &[2]),
+                ("tmp", &[]),
+                ("scratch", &[]),
+                ("LEVEL", &[5]),
+                ("MODE", &[6]),
+            ],
+        );
+
+        // `-g` combines with other flags in one word. Flags without it keep
+        // the variable local.
+        let sh = "setup() {\n  declare -gA MAP=()\n  declare -gx EXPORTED=1\n  typeset -ga LIST=()\n  declare -rg FIXED=1\n  declare -A table=()\n  local -r frozen=1\n}\n";
+        assert_definitions(
+            "s.sh",
+            sh,
+            &[
+                ("MAP", &[2]),
+                ("EXPORTED", &[3]),
+                ("LIST", &[4]),
+                ("FIXED", &[5]),
+                ("table", &[]),
+                ("frozen", &[]),
+            ],
+        );
     }
 }

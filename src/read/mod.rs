@@ -1,26 +1,34 @@
+pub(crate) mod ends;
 pub mod outline;
 
 use std::fmt::Write;
 use std::fs;
+use std::io::{self, Read};
+use std::ops::ControlFlow;
 use std::path::Path;
-
-use memmap2::Mmap;
 
 use crate::format;
 use crate::types::{estimate_tokens, ViewMode};
+use ends::EndsCollector;
+use outline::View;
 use tilth_core::cache::OutlineCache;
 use tilth_core::error::TilthError;
-use tilth_core::lang::detect_file_type;
+use tilth_core::lang::detection;
 use tilth_core::lang::outline::{heading_level, heading_text, parse_markdown};
+use tilth_core::lang::{detect_file_type, detect_file_type_with_content};
+use tilth_core::source::{read_chunks, OpenFile, STREAM_CHUNK};
+use tilth_core::source::{strip_bom, strip_bom_bytes};
 use tilth_core::types::FileType;
 
 pub(crate) const TOKEN_THRESHOLD: u64 = 6_000;
+/// How many of a file's local imports the "Related:" hint under an outlined
+/// read names, in import order.
+pub(crate) const RELATED_HINT_LIMIT: usize = 8;
 /// Minimum compression ratio required to prefer the outline over full content.
 /// If `outline_tokens >= full_tokens * OUTLINE_MIN_COMPRESSION / 100`, the
 /// outline saves too few tokens to be worth the information loss, so the full
 /// file is returned instead. Integer arithmetic: 80 means 80%.
 const OUTLINE_MIN_COMPRESSION: u64 = 80;
-const FILE_SIZE_CAP: u64 = 500_000; // 500KB
 
 /// Max file size for `full=true` reads. Files above this threshold get a
 /// warning header + outline instead of raw content, preventing multi-megabyte
@@ -34,45 +42,245 @@ pub(crate) fn full_read_size_cap() -> u64 {
         .unwrap_or(2_000_000)
 }
 
+/// Lines in `buf`, counted the way `wc -l` does, plus a final line that has
+/// no newline. A newline ends a line, so a newline-terminated file has as
+/// many lines as newlines. Counting newlines + 1 made every such file one
+/// line longer than it is, and let a section past the last line succeed
+/// with an empty body.
+pub(crate) fn count_lines(buf: &[u8]) -> u32 {
+    let mut counter = LineCounter::default();
+    counter.feed(buf);
+    counter.lines()
+}
+
+/// [`count_lines`] over input that arrives in pieces: feed it the bytes in
+/// order, then ask for [`lines`](Self::lines). One home for the rule, whether
+/// the file is in memory or streamed.
+#[derive(Default)]
+pub(crate) struct LineCounter {
+    newlines: usize,
+    last: Option<u8>,
+}
+
+impl LineCounter {
+    pub(crate) fn feed(&mut self, chunk: &[u8]) {
+        self.feed_counted(chunk, memchr::memchr_iter(b'\n', chunk).count());
+    }
+
+    /// [`feed`](Self::feed) for a caller that has already counted the
+    /// `newlines` in `piece`, so the piece is not scanned again.
+    fn feed_counted(&mut self, piece: &[u8], newlines: usize) {
+        self.newlines += newlines;
+        if let Some(&last) = piece.last() {
+            self.last = Some(last);
+        }
+    }
+
+    /// The line breaks fed so far.
+    fn newlines(&self) -> usize {
+        self.newlines
+    }
+
+    pub(crate) fn lines(&self) -> u32 {
+        let unterminated = usize::from(self.last.is_some_and(|b| b != b'\n'));
+        u32::try_from(self.newlines + unterminated).unwrap_or(u32::MAX)
+    }
+}
+
+/// Whether bytes fed in order, in pieces of any size, are UTF-8. A
+/// character split between two pieces waits for the next one.
+#[derive(Default)]
+struct Utf8Check {
+    /// The start of a character the last piece cut off: at most 3 bytes.
+    pending: Vec<u8>,
+    invalid: bool,
+}
+
+impl Utf8Check {
+    /// Take the next piece. Breaks at the first byte that is not UTF-8.
+    fn feed(&mut self, piece: &[u8]) -> ControlFlow<()> {
+        let joined;
+        let bytes = if self.pending.is_empty() {
+            piece
+        } else {
+            self.pending.extend_from_slice(piece);
+            joined = std::mem::take(&mut self.pending);
+            &joined[..]
+        };
+        match std::str::from_utf8(bytes) {
+            Ok(_) => ControlFlow::Continue(()),
+            // The piece ends inside a character.
+            Err(e) if e.error_len().is_none() => {
+                self.pending.extend_from_slice(&bytes[e.valid_up_to()..]);
+                ControlFlow::Continue(())
+            }
+            Err(_) => {
+                self.invalid = true;
+                ControlFlow::Break(())
+            }
+        }
+    }
+
+    /// Whether everything fed was UTF-8, the last character whole.
+    fn is_valid(&self) -> bool {
+        !self.invalid && self.pending.is_empty()
+    }
+}
+
+/// Hand `head`, then the bytes `rest` yields, to `each` in order, until the
+/// input ends or `each` breaks. This is the one streamed pass of the read
+/// paths: `head` is what a caller already holds of the file, and the rest
+/// streams through one buffer, so a pass that keeps only what it needs
+/// never holds the file in memory.
+fn stream(
+    head: &[u8],
+    rest: impl Read,
+    mut each: impl FnMut(&[u8]) -> ControlFlow<()>,
+) -> io::Result<()> {
+    if each(head).is_break() {
+        return Ok(());
+    }
+    let mut buf = vec![0u8; STREAM_CHUNK];
+    read_chunks(rest, &mut buf, each)
+}
+
+/// The error a read reports for an I/O failure on `path`, so a read fails
+/// the same way whichever step hit the error. A missing path names a
+/// similar one.
+fn path_error(path: &Path, source: io::Error) -> TilthError {
+    TilthError::from_io(path, source, || suggest_similar(path))
+}
+
+/// Open `path` through [`OpenFile`], the one open path of every read, with
+/// its errors mapped through [`path_error`]. `None` for a pipe, socket or
+/// device, which has no fixed contents and shows as empty.
+fn open_file(path: &Path) -> Result<Option<OpenFile>, TilthError> {
+    OpenFile::open(path).map_err(|e| path_error(path, e))
+}
+
+/// The view of an empty file, and of a pipe, socket or device: the header
+/// alone.
+pub(crate) fn empty_view(path: &Path) -> String {
+    format::file_header(path, 0, 0, ViewMode::Empty)
+}
+
+/// The whole text of `path` and its length, for a view that reshapes the
+/// whole file, or `None` for a file with no fixed contents. It opens and
+/// fails the way `read_file` does.
+pub(crate) fn read_text(path: &Path) -> Result<Option<(String, u64)>, TilthError> {
+    let Some(mut file) = open_file(path)? else {
+        return Ok(None);
+    };
+    let text = file.read_to_string().map_err(|e| path_error(path, e))?;
+    Ok(Some((text, file.len())))
+}
+
+/// The default view of a file that is not code, for the signature and
+/// stripped views, which reshape only code. Both have always read the file
+/// as UTF-8 text first, so a file that is not UTF-8 fails here as it always
+/// has, with the error that read gave. It is checked one chunk at a time,
+/// never held whole, and the default view then streams as it does in any
+/// read.
+pub(crate) fn non_code_view(path: &Path, cache: &OutlineCache) -> Result<String, TilthError> {
+    let Some(mut file) = open_file(path)? else {
+        return Ok(empty_view(path));
+    };
+    let mut utf8 = Utf8Check::default();
+    file.reader()
+        .and_then(|reader| stream(&[], reader, |chunk| utf8.feed(chunk)))
+        .map_err(|e| path_error(path, e))?;
+    if !utf8.is_valid() {
+        let source = io::Error::new(
+            io::ErrorKind::InvalidData,
+            "stream did not contain valid UTF-8",
+        );
+        return Err(path_error(path, source));
+    }
+    read_file(path, None, false, cache, false, None)
+}
+
+/// The view of a file that `full` asked for in full but that is over `cap`:
+/// its outline, under a banner that says how to lift the cap.
+fn full_skipped_view(
+    path: &Path,
+    byte_len: u64,
+    line_count: u32,
+    cap: u64,
+    outline: &str,
+) -> String {
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "by design: display only; file sizes fit the f64 mantissa"
+    )]
+    let cap_mb = cap as f64 / 1_000_000.0;
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "by design: display only; file sizes fit the f64 mantissa"
+    )]
+    let file_mb = byte_len as f64 / 1_000_000.0;
+    let header = format::file_header(path, byte_len, line_count, ViewMode::Outline);
+    format!(
+        "{header}\n\n> **full=true skipped**: file is {file_mb:.1}MB (cap: {cap_mb:.1}MB). \
+         Use `section` to read specific ranges, or set TILTH_FULL_SIZE_CAP={byte_len} to override.\n\n{outline}"
+    )
+}
+
+/// OGATE: whether `outline` is meaningfully smaller than the `tokens` of the
+/// full file. If not, the full file is the better view: the same token cost
+/// with less information is strictly worse and forces a second read.
+fn outline_saves_enough(outline: &str, tokens: u64) -> bool {
+    estimate_tokens(outline.len() as u64) < tokens * OUTLINE_MIN_COMPRESSION / 100
+}
+
+/// `outline` under `header`, cut to fit `budget` when it does not, falling
+/// back first to `names`, the same outline with names alone.
+fn outline_view(
+    header: &str,
+    outline: &str,
+    names: impl FnOnce() -> Option<String>,
+    budget: Option<u64>,
+) -> String {
+    let view = format!("{header}\n\n{outline}");
+    match budget {
+        Some(b) if estimate_tokens(view.len() as u64) > b => {
+            let room = b.saturating_sub(estimate_tokens(header.len() as u64 + 2));
+            format!("{header}\n\n{}", outline::fit(outline, names(), room))
+        }
+        _ => view,
+    }
+}
+
 /// Main entry point for read mode. Routes through the decision tree.
+///
+/// `budget` is the caller's token budget for the whole response. A file
+/// whose full view does not fit it gets its outline instead, and an
+/// outline that does not fit is cut to fit, saying what it left out. With
+/// `full` or a `section`, the content is what was asked for, and the
+/// caller's budget cut applies to it as before.
+#[expect(
+    clippy::too_many_lines,
+    reason = "reading goes through one Source in #308"
+)]
 pub fn read_file(
     path: &Path,
     section: Option<&str>,
     full: bool,
     cache: &OutlineCache,
     edit_mode: bool,
+    budget: Option<u64>,
 ) -> Result<String, TilthError> {
-    let meta = match fs::metadata(path) {
-        Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(TilthError::NotFound {
-                path: path.to_path_buf(),
-                suggestion: suggest_similar(path),
-            });
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            return Err(TilthError::PermissionDenied {
-                path: path.to_path_buf(),
-            });
-        }
-        Err(e) => {
-            return Err(TilthError::IoError {
-                path: path.to_path_buf(),
-                source: e,
-            });
-        }
-    };
+    let meta = fs::metadata(path).map_err(|e| path_error(path, e))?;
 
     // Directory → list contents
     if meta.is_dir() {
         return list_directory(path);
     }
 
-    let byte_len = meta.len();
-
-    // Empty check before mmap — mmap on 0-byte file may fail on some platforms
-    if byte_len == 0 {
-        return Ok(format::file_header(path, 0, 0, ViewMode::Empty));
+    // An empty file prints its header only, before its section or its
+    // permissions are looked at. So does a pipe, socket or device, which
+    // has no fixed contents.
+    if !meta.is_file() || meta.len() == 0 {
+        return Ok(empty_view(path));
     }
 
     // Section param → return those lines verbatim, any size
@@ -80,75 +288,127 @@ pub fn read_file(
         return read_ranges(path, &[range], edit_mode);
     }
 
-    // Binary detection
-    let file = fs::File::open(path).map_err(|e| TilthError::IoError {
-        path: path.to_path_buf(),
-        source: e,
-    })?;
-    let mmap = unsafe { Mmap::map(&file) }.map_err(|e| TilthError::IoError {
-        path: path.to_path_buf(),
-        source: e,
-    })?;
-    let buf = &mmap[..];
+    // From here on, everything describes the file this handle reads: its
+    // size, its emptiness and the mtime its outline is cached under, even if
+    // a rename replaced the path after the metadata call above.
+    let Some(mut file) = open_file(path)?.filter(|file| !file.is_empty()) else {
+        return Ok(empty_view(path));
+    };
+    let byte_len = file.len();
+    let mtime = file
+        .metadata()
+        .modified()
+        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+    let cap = full_read_size_cap();
 
-    if tilth_core::lang::detection::is_binary(buf) {
+    // The binary, generated and minified checks look only at the head. A
+    // file they settle costs that small read plus a streamed line count, so
+    // a multi-gigabyte binary or bundle is never held in memory.
+    let mut reader = file.reader().map_err(|e| path_error(path, e))?;
+    let head = detection::read_head(&mut reader).map_err(|e| path_error(path, e))?;
+    if detection::is_binary(&head) {
         let mime = mime_from_ext(path);
         return Ok(format::binary_header(path, byte_len, mime));
     }
 
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-
-    // Generated
-    if tilth_core::lang::detection::is_generated_by_name(name)
-        || tilth_core::lang::detection::is_generated_by_content(buf)
-    {
-        let line_count = memchr::memchr_iter(b'\n', buf).count() as u32 + 1;
-        return Ok(format::file_header(
-            path,
-            byte_len,
-            line_count,
-            ViewMode::Generated,
-        ));
+    // Minified: the filename convention or, for big files, the newline
+    // density of the head.
+    let header_only =
+        if detection::is_generated_by_name(name) || detection::is_generated_by_content(&head) {
+            Some(ViewMode::Generated)
+        } else if detection::is_minified_by_name(name)
+            || (byte_len >= detection::MINIFIED_CHECK_THRESHOLD
+                && detection::is_minified_by_content(&head))
+        {
+            Some(ViewMode::Minified)
+        } else {
+            None
+        };
+    if let Some(mode) = header_only {
+        let mut counter = LineCounter::default();
+        stream(&head, &mut reader, |chunk| {
+            counter.feed(chunk);
+            ControlFlow::Continue(())
+        })
+        .map_err(|e| path_error(path, e))?;
+        return Ok(format::file_header(path, byte_len, counter.lines(), mode));
     }
 
-    // Minified — filename convention or, for big files, newline-density heuristic.
-    if tilth_core::lang::detection::is_minified_by_name(name)
-        || (byte_len >= tilth_core::lang::detection::MINIFIED_CHECK_THRESHOLD
-            && tilth_core::lang::detection::is_minified_by_content(buf))
-    {
-        let line_count = memchr::memchr_iter(b'\n', buf).count() as u32 + 1;
-        return Ok(format::file_header(
-            path,
-            byte_len,
-            line_count,
-            ViewMode::Minified,
-        ));
+    // A log, CSV or unknown-type file that gets its outline shows only its
+    // first and last lines and its line count. It streams into them, so
+    // however large it is, only the lines shown are held.
+    let outlined = if full {
+        byte_len > cap
+    } else {
+        estimate_tokens(byte_len) > TOKEN_THRESHOLD
+    };
+    let ends_view = match View::of(detect_file_type(path)) {
+        View::Ends(view) if outlined => Some(view),
+        _ => None,
+    };
+    // The whole file, when a streamed pass has found it holds no more lines
+    // than its view shows: that pass then holds all of it already.
+    let mut whole = None;
+    if let Some(view) = ends_view {
+        // The views see the text without its byte-order mark.
+        let (mark, unmarked) = head.split_at(head.len() - strip_bom_bytes(&head).len());
+        let mut collector = EndsCollector::new(view.shape());
+        stream(unmarked, &mut reader, |chunk| {
+            collector.feed(chunk);
+            ControlFlow::Continue(())
+        })
+        .map_err(|e| path_error(path, e))?;
+        match collector.finish().into_whole() {
+            Ok(mut text) => {
+                text.splice(..0, mark.iter().copied());
+                whole = Some(text);
+            }
+            Err(ends) => {
+                // The mark holds no line break, and this file has more lines
+                // than the view shows, so the count without it is the file's.
+                let line_count = u32::try_from(ends.total()).unwrap_or(u32::MAX);
+                let capped = full || byte_len > tilth_core::source::MAX_FILE_SIZE;
+                let outline = cache.get_or_compute(path, mtime, || view.generate(&ends, capped));
+                if full {
+                    return Ok(full_skipped_view(path, byte_len, line_count, cap, &outline));
+                }
+                if outline_saves_enough(&outline, estimate_tokens(byte_len)) {
+                    let header = format::file_header(path, byte_len, line_count, ViewMode::Outline);
+                    return Ok(outline_view(&header, &outline, || None, budget));
+                }
+                // OGATE prefers the full view, which needs the lines these
+                // ends left out: the file is read whole below, and the
+                // outline comes from the cache.
+            }
+        }
     }
+
+    let bytes = match whole {
+        Some(bytes) => bytes,
+        None => file.read_all().map_err(|e| path_error(path, e))?,
+    };
+    let byte_len = bytes.len() as u64;
+    let buf = &bytes[..];
 
     let tokens = estimate_tokens(byte_len);
     let content = String::from_utf8_lossy(buf);
-    let line_count = memchr::memchr_iter(b'\n', buf).count() as u32 + 1;
+    let line_count = count_lines(buf);
 
     // Guard: full=true on very large files. Return outline + warning instead of
     // dumping megabytes that would blow up the MCP client's timeout/memory.
-    let cap = full_read_size_cap();
     if full && byte_len > cap {
-        let file_type = detect_file_type(path);
-        let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        #[allow(clippy::cast_precision_loss)] // cap and file sizes fit in f64 mantissa for display
-        let cap_mb = cap as f64 / 1_000_000.0;
-        #[allow(clippy::cast_precision_loss)]
-        let file_mb = byte_len as f64 / 1_000_000.0;
-
+        let file_type = detect_file_type_with_content(path, &content);
         let outline = cache.get_or_compute(path, mtime, || {
-            outline::generate(path, file_type, &content, buf, true)
+            outline::generate(
+                path,
+                file_type,
+                strip_bom(&content),
+                strip_bom_bytes(buf),
+                true,
+            )
         });
-
-        let header = format::file_header(path, byte_len, line_count, ViewMode::Outline);
-        return Ok(format!(
-            "{header}\n\n> **full=true skipped**: file is {file_mb:.1}MB (cap: {cap_mb:.1}MB). \
-             Use `section` to read specific ranges, or set TILTH_FULL_SIZE_CAP={byte_len} to override.\n\n{outline}"
-        ));
+        return Ok(full_skipped_view(path, byte_len, line_count, cap, &outline));
     }
 
     // Canonical full-content view — shared by the small-file gate and OGATE below.
@@ -162,27 +422,45 @@ pub fn read_file(
         }
     };
 
-    // Full mode or small file → return full content (skip smart view)
+    // Full mode or small file → return full content (skip smart view),
+    // unless the full view overflows the budget: cut there, it showed the
+    // first functions and hid the rest.
+    let fits = |view: &str| budget.is_none_or(|b| estimate_tokens(view.len() as u64) <= b);
     if full || tokens <= TOKEN_THRESHOLD {
-        return Ok(full_view());
+        let view = full_view();
+        if full || fits(&view) {
+            return Ok(view);
+        }
     }
 
     // Large file → smart view by file type
-    let file_type = detect_file_type(path);
-    let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+    let file_type = detect_file_type_with_content(path, &content);
 
-    let capped = byte_len > FILE_SIZE_CAP;
+    // Over the size limit search and the parse cache skip, the outline
+    // lists at most `outline::OUTLINE_CAP` entries.
+    let capped = byte_len > tilth_core::source::MAX_FILE_SIZE;
 
+    // The outline parses the file without its byte-order mark, as search
+    // does; the full view above prints the bytes as they are, because its
+    // hash anchors must match what `tilth_write` reads from disk.
     let outline = cache.get_or_compute(path, mtime, || {
-        outline::generate(path, file_type, &content, buf, capped)
+        outline::generate(
+            path,
+            file_type,
+            strip_bom(&content),
+            strip_bom_bytes(buf),
+            capped,
+        )
     });
 
-    // OGATE: if the outline is not meaningfully smaller than the full file,
-    // return the full file — same token cost with less information is strictly
-    // worse and forces the caller to do a second read.
-    let outline_tokens = estimate_tokens(outline.len() as u64);
-    if outline_tokens >= tokens * OUTLINE_MIN_COMPRESSION / 100 {
-        return Ok(full_view());
+    // OGATE, only when the full view fits the budget, though: cut to fit, it
+    // would show the first lines and hide everything after them, where the
+    // outline below names them all.
+    if !outline_saves_enough(&outline, tokens) {
+        let view = full_view();
+        if fits(&view) {
+            return Ok(view);
+        }
     }
 
     let mode = match file_type {
@@ -190,7 +468,8 @@ pub fn read_file(
         _ => ViewMode::Outline,
     };
     let header = format::file_header(path, byte_len, line_count, mode);
-    Ok(format!("{header}\n\n{outline}"))
+    let names = || outline::names_only(path, file_type, strip_bom(&content), capped);
+    Ok(outline_view(&header, &outline, names, budget))
 }
 
 /// Would this file produce an outline (rather than full content) in default read mode?
@@ -232,7 +511,6 @@ fn resolve_heading(buf: &[u8], heading: &str) -> Option<(usize, usize)> {
     let tree = parse_markdown(content)?;
     let lines: Vec<&str> = content.lines().collect();
 
-    #[allow(clippy::cast_possible_truncation)]
     let level = query_level as u8;
     find_section(tree.root_node(), &lines, level, query_text)
 }
@@ -390,11 +668,18 @@ fn resolve_range(buf: &[u8], range: &str) -> Result<(usize, usize), TilthError> 
             }
         })
     } else {
-        parse_range(range).ok_or_else(|| TilthError::InvalidQuery {
-            query: range.to_string(),
-            reason: "expected format: \"start-end\" (e.g. \"45-89\") or heading (e.g. \"## Architecture\")".into(),
-        })
+        line_range(range)
     }
+}
+
+/// A `"start-end"` range, or the error that names the accepted forms.
+fn line_range(range: &str) -> Result<(usize, usize), TilthError> {
+    parse_range(range).ok_or_else(|| TilthError::InvalidQuery {
+        query: range.to_string(),
+        reason:
+            "expected format: \"start-end\" (e.g. \"45-89\") or heading (e.g. \"## Architecture\")"
+                .into(),
+    })
 }
 
 /// One resolved range, ready to format.
@@ -406,7 +691,7 @@ struct Block {
 
 /// Read one or more line ranges from a file. Each range is "start-end"
 /// (e.g. "45-89") or a heading anchor (e.g. "## Architecture") for
-/// markdown files. Mmaps the file once and emits a single `[section]`
+/// markdown files. Reads the file once and emits a single `[section]`
 /// header followed by the formatted blocks; when more than one range is
 /// requested, each block is preceded by a `─── lines X-Y ───` delimiter.
 ///
@@ -414,7 +699,9 @@ struct Block {
 /// ranges are honored verbatim, not coalesced or sorted. Any invalid
 /// range fails the whole call.
 pub fn read_ranges(path: &Path, ranges: &[&str], edit_mode: bool) -> Result<String, TilthError> {
-    let (blocks, total_bytes, total_lines) = collect_blocks(path, ranges, edit_mode)?;
+    let Some((blocks, total_bytes, total_lines)) = collect_blocks(path, ranges, edit_mode)? else {
+        return Ok(empty_view(path));
+    };
     let header = format::file_header(path, total_bytes, total_lines, ViewMode::Section);
 
     if blocks.len() == 1 {
@@ -444,7 +731,9 @@ pub fn read_ranges_with_budget(
     edit_mode: bool,
     budget: u64,
 ) -> Result<String, TilthError> {
-    let (blocks, total_bytes, total_lines) = collect_blocks(path, ranges, edit_mode)?;
+    let Some((blocks, total_bytes, total_lines)) = collect_blocks(path, ranges, edit_mode)? else {
+        return Ok(empty_view(path));
+    };
     let header = format::file_header(path, total_bytes, total_lines, ViewMode::Section);
 
     if blocks.len() == 1 {
@@ -482,70 +771,188 @@ pub fn read_ranges_with_budget(
     Ok(out)
 }
 
+/// The formatted blocks of a section read, with the bytes and lines they
+/// hold, or `None` for an empty file and for a pipe, socket or device,
+/// which has no fixed contents: both show as empty, whatever their
+/// well-formed ranges.
 fn collect_blocks(
     path: &Path,
     ranges: &[&str],
     edit_mode: bool,
-) -> Result<(Vec<Block>, u64, u32), TilthError> {
+) -> Result<Option<(Vec<Block>, u64, u32)>, TilthError> {
     if ranges.is_empty() {
         return Err(TilthError::InvalidQuery {
             query: String::new(),
             reason: "at least one range is required".into(),
         });
     }
+    let Some(mut file) = open_file(path)?.filter(|file| !file.is_empty()) else {
+        // Nothing to select from, so every range shows as empty, but a
+        // malformed one fails here as it does on any file.
+        for range in ranges.iter().filter(|range| !range.starts_with('#')) {
+            line_range(range)?;
+        }
+        return Ok(None);
+    };
 
-    let file = fs::File::open(path).map_err(|e| TilthError::IoError {
-        path: path.to_path_buf(),
-        source: e,
-    })?;
-    let mmap = unsafe { Mmap::map(&file) }.map_err(|e| TilthError::IoError {
-        path: path.to_path_buf(),
-        source: e,
-    })?;
-    let buf = &mmap[..];
+    // A heading anchor needs the text to find its lines. Line ranges do not,
+    // so without one the file streams and is never held in memory.
+    let text = if ranges.iter().any(|range| range.starts_with('#')) {
+        Some(file.read_all().map_err(|e| path_error(path, e))?)
+    } else {
+        None
+    };
+    let resolved: Vec<Result<(usize, usize), TilthError>> = ranges
+        .iter()
+        .map(|range| {
+            text.as_ref()
+                .map_or_else(|| line_range(range), |text| resolve_range(text, range))
+        })
+        .collect();
 
-    let mut line_offsets: Vec<usize> = vec![0];
-    for pos in memchr::memchr_iter(b'\n', buf) {
-        line_offsets.push(pos + 1);
+    let mut selector = LineSelector::new(&resolved);
+    match &text {
+        Some(text) => stream(text, io::empty(), |chunk| selector.feed(chunk)),
+        None => file
+            .reader()
+            .and_then(|reader| stream(&[], reader, |chunk| selector.feed(chunk))),
     }
-    let total = line_offsets.len();
+    .map_err(|e| path_error(path, e))?;
+    let (selected, total) = selector.finish();
 
     let mut blocks: Vec<Block> = Vec::with_capacity(ranges.len());
     let mut total_bytes: u64 = 0;
     let mut total_lines: u32 = 0;
-
-    for range in ranges {
-        let (start, end) = resolve_range(buf, range)?;
-        let s = start.saturating_sub(1).min(total);
-        let e = end.min(total);
-        if s >= e {
+    for ((range, resolved), selected) in ranges.iter().zip(resolved).zip(selected) {
+        let (start, end) = resolved?;
+        if start > total {
             return Err(TilthError::InvalidQuery {
                 query: (*range).to_string(),
-                reason: format!("range out of bounds (file has {total} lines)"),
+                reason: format!("starts past the end of the file, which has {total} lines"),
             });
         }
-        let start_byte = line_offsets[s];
-        let end_byte = if e < line_offsets.len() {
-            line_offsets[e]
-        } else {
-            buf.len()
-        };
-        let selected = String::from_utf8_lossy(&buf[start_byte..end_byte]);
-        total_bytes += selected.len() as u64;
-        total_lines += (e - s) as u32;
+        // An end past the last line clamps to it.
+        let end = end.min(total);
+        let text = String::from_utf8_lossy(&selected);
+        total_bytes += text.len() as u64;
+        total_lines += (end - (start - 1)) as u32;
         let formatted = if edit_mode {
-            format::hashlines(&selected, start as u32)
+            format::hashlines(&text, start as u32)
         } else {
-            format::number_lines(&selected, start as u32)
+            format::number_lines(&text, start as u32)
         };
         blocks.push(Block {
             start,
-            end: e,
+            end,
             text: formatted,
         });
     }
+    Ok(Some((blocks, total_bytes, total_lines)))
+}
 
-    Ok((blocks, total_bytes, total_lines))
+/// Slices the requested line ranges out of a file fed to it in order, in
+/// pieces of any size: the whole text at once, or streamed chunks. Line
+/// breaks are found with `memchr`, once each, and the ranges are looked at
+/// only where one starts or ends: a stretch of lines between two such
+/// points is copied at once to the ranges open over it, or, when none is,
+/// only counted. Feeding stops once the last requested line is in. Each
+/// range is a valid `(start, end)` or the error that rejected it; only
+/// valid ranges select.
+struct LineSelector {
+    /// The valid ranges no line has reached yet, as `(start, end, index)`,
+    /// latest start first, so the next to open is the last.
+    waiting: Vec<(usize, usize, usize)>,
+    /// The ranges the current line is in, as `(end, index)`.
+    open: Vec<(usize, usize)>,
+    /// The last line any valid range asks for; 0 when none is valid.
+    last: usize,
+    /// The selected bytes, in the caller's range order.
+    selected: Vec<Vec<u8>>,
+    /// Counts the bytes taken so far, by the one line-count rule. The line
+    /// the next byte belongs to is one past the breaks it has seen.
+    counter: LineCounter,
+    stopped: bool,
+}
+
+impl LineSelector {
+    fn new(ranges: &[Result<(usize, usize), TilthError>]) -> Self {
+        let mut waiting: Vec<(usize, usize, usize)> = ranges
+            .iter()
+            .enumerate()
+            .filter_map(|(index, range)| range.as_ref().ok().map(|&(s, e)| (s, e, index)))
+            .collect();
+        waiting.sort_unstable_by_key(|&(start, ..)| std::cmp::Reverse(start));
+        let last = waiting.iter().map(|&(_, end, _)| end).max().unwrap_or(0);
+        Self {
+            waiting,
+            open: Vec::new(),
+            last,
+            selected: vec![Vec::new(); ranges.len()],
+            counter: LineCounter::default(),
+            stopped: last == 0,
+        }
+    }
+
+    /// Take the next piece of the file. Breaks once the last requested line
+    /// is in, or at once when no range is valid.
+    fn feed(&mut self, chunk: &[u8]) -> ControlFlow<()> {
+        if self.stopped {
+            return ControlFlow::Break(());
+        }
+        let mut breaks = memchr::memchr_iter(b'\n', chunk);
+        let mut from = 0;
+        loop {
+            let line = self.counter.newlines() + 1;
+            self.open.retain(|&(end, _)| end >= line);
+            while let Some(&(start, end, index)) = self.waiting.last() {
+                if start > line {
+                    break;
+                }
+                self.open.push((end, index));
+                self.waiting.pop();
+            }
+            if line > self.last {
+                self.stopped = true;
+                return ControlFlow::Break(());
+            }
+            // The next line at which a range opens or closes. A range may
+            // end at `usize::MAX`, and no line reaches that.
+            let next = self
+                .open
+                .iter()
+                .map(|&(end, _)| end.saturating_add(1))
+                .chain(self.waiting.last().map(|&(start, ..)| start))
+                .min()
+                .unwrap_or_else(|| self.last.saturating_add(1));
+            let mut crossed = 0;
+            let mut to = None;
+            for at in breaks.by_ref() {
+                crossed += 1;
+                if line + crossed == next {
+                    to = Some(at + 1);
+                    break;
+                }
+            }
+            let stretch = &chunk[from..to.unwrap_or(chunk.len())];
+            for &(_, index) in &self.open {
+                self.selected[index].extend_from_slice(stretch);
+            }
+            self.counter.feed_counted(stretch, crossed);
+            match to {
+                Some(to) => from = to,
+                None => return ControlFlow::Continue(()),
+            }
+        }
+    }
+
+    /// The selected bytes per range, and the line count of what was taken.
+    /// That is the file's own count when the whole file was fed. When
+    /// feeding stopped early it is the last requested line, which is all
+    /// any range can need, since every valid range starts and ends at or
+    /// before it.
+    fn finish(self) -> (Vec<Vec<u8>>, usize) {
+        (self.selected, self.counter.lines() as usize)
+    }
 }
 
 /// Parse "45-89" into (45, 89). 1-indexed.
@@ -579,13 +986,9 @@ fn list_directory(path: &Path) -> Result<String, TilthError> {
         let suffix = match ft {
             Some(t) if t.is_dir() => "/".to_string(),
             Some(t) if t.is_symlink() => " →".to_string(),
-            _ => match meta {
-                Some(m) => {
-                    let tokens = estimate_tokens(m.len());
-                    format!("  ({tokens} tokens)")
-                }
-                None => String::new(),
-            },
+            _ => meta.map_or_else(String::new, |m| {
+                format!("  ({} tokens)", estimate_tokens(m.len()))
+            }),
         };
         entries.push(format!("  {name}{suffix}"));
     }
@@ -723,37 +1126,33 @@ mod tests {
         assert_eq!(resolve_heading(input, "hello"), None);
     }
 
+    /// Over the default cap, `full=true` gives the outline and a warning.
+    /// The test used to lower the cap through `TILTH_FULL_SIZE_CAP`, which
+    /// is process-wide, so grok tests running alongside it saw a 100-byte
+    /// cap and failed. It writes a file over the default cap instead, as
+    /// plain text, whose head-and-tail view is quick to build.
     #[test]
     fn full_true_size_cap_returns_outline() {
-        use std::io::Write;
-
-        // Create a temp file larger than our small cap (100 bytes)
-        let path = std::env::temp_dir().join("tilth_test_large.rs");
-        let mut f = std::fs::File::create(&path).unwrap();
-        // Write enough to exceed the cap — 200 bytes of Rust code
-        for i in 0..20 {
-            writeln!(f, "pub fn func_{i}() {{ println!(\"hello\"); }}").unwrap();
-        }
-        drop(f);
-
-        // Set a tiny cap so the guard triggers
-        std::env::set_var("TILTH_FULL_SIZE_CAP", "100");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.txt");
+        let cap = usize::try_from(full_read_size_cap()).unwrap();
+        let filler = "// filler line that pushes the file over the full-read cap\n";
+        let mut src = String::from("pub fn func_0() { println!(\"hello\"); }\n");
+        src.push_str(&filler.repeat(cap / filler.len() + 1));
+        std::fs::write(&path, src).unwrap();
 
         let cache = OutlineCache::new();
-        let result = read_file(&path, None, true, &cache, false).unwrap();
+        let result = read_file(&path, None, true, &cache, false, None).unwrap();
 
-        // Should contain the warning, not the full file content
         assert!(
             result.contains("full=true skipped"),
-            "expected size cap warning, got: {result}"
+            "expected size cap warning, got: {}",
+            &result[..result.len().min(400)]
         );
         assert!(
             result.contains("func_0"),
             "expected outline content in output"
         );
-
-        std::env::remove_var("TILTH_FULL_SIZE_CAP");
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -1118,6 +1517,44 @@ mod tests {
     // OGATE: "never-worse outline gate" — if the outline barely compresses
     // (outline_tokens >= 80% of full-file tokens), return full content instead.
     #[test]
+    fn ogate_flat_file_over_the_budget_gets_its_outline_cut_to_fit() {
+        use std::fmt::Write as _;
+        // The same flat file as the OGATE test below, read under a budget its
+        // full view cannot fit. Falling back to the full view and cutting it
+        // there showed the first few functions and hid the rest. The outline
+        // path keeps every name it can and says what it left out.
+        let mut src = String::new();
+        for i in 0..2000 {
+            writeln!(src, "pub fn flat_{i}() {{}}").unwrap();
+        }
+        let path = write_temp("tilth_ogate_flat_budget.rs", &src);
+
+        let cache = OutlineCache::new();
+        let budget = 3_000;
+        let result = read_file(&path, None, false, &cache, false, Some(budget)).unwrap();
+
+        assert!(
+            !result.contains("[full]"),
+            "an over-budget flat file must not fall back to a cut full view: {}",
+            result.lines().next().unwrap_or("")
+        );
+        assert!(
+            result.contains("[outline]") && result.contains("of 2000 entries shown"),
+            "the outline must say how many of the functions it names: {result}"
+        );
+        assert!(
+            result.contains("fn flat_100"),
+            "the outline must name far more than the first few functions"
+        );
+        assert!(
+            estimate_tokens(result.len() as u64) <= budget,
+            "output must fit the budget"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn ogate_flat_file_returns_full_when_outline_barely_compresses() {
         use std::fmt::Write as _;
         // A file of empty-body one-liner fns. The signature IS essentially the
@@ -1141,7 +1578,7 @@ mod tests {
         let path = write_temp("tilth_ogate_flat.rs", &src);
 
         let cache = OutlineCache::new();
-        let result = read_file(&path, None, false, &cache, false).unwrap();
+        let result = read_file(&path, None, false, &cache, false, None).unwrap();
 
         // Gate fired → full view. The header tag records the decision directly
         // (an outline would read `[outline]`), and the trailing fn's body braces
@@ -1185,7 +1622,7 @@ mod tests {
         let path = write_temp("tilth_ogate_heavy.rs", &src);
 
         let cache = OutlineCache::new();
-        let result = read_file(&path, None, false, &cache, false).unwrap();
+        let result = read_file(&path, None, false, &cache, false, None).unwrap();
 
         // Gate must NOT have fired: the output should be an outline, not full content.
         // An outline shows signatures but omits the body.
@@ -1201,5 +1638,599 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A newline ends a line; it does not start one. `gin/errors.go` has 175
+    /// lines by `wc -l` and the header said 176. Full, outline, generated and
+    /// section headers all count the same way.
+    #[test]
+    fn header_counts_lines_like_wc() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = OutlineCache::new();
+        for (content, lines) in [
+            ("one\n", 1),
+            ("one\ntwo\n", 2),
+            ("one\ntwo", 2),
+            ("one\n\n", 2),
+            ("\n", 1),
+        ] {
+            let path = dir.path().join("f.txt");
+            std::fs::write(&path, content).unwrap();
+            let full = read_file(&path, None, true, &cache, false, None).unwrap();
+            assert!(
+                full.contains(&format!("({lines} lines")),
+                "{content:?} should read as {lines} lines: {full}"
+            );
+            let all = read_ranges(&path, &["1-1000"], false).unwrap();
+            assert!(
+                all.contains(&format!("({lines} lines")),
+                "{content:?} section should cover {lines} lines: {all}"
+            );
+        }
+    }
+
+    /// Run a [`LineSelector`] over `reader` the way `collect_blocks` streams.
+    fn select(
+        reader: impl Read,
+        ranges: &[Result<(usize, usize), TilthError>],
+    ) -> (Vec<Vec<u8>>, usize) {
+        let mut selector = LineSelector::new(ranges);
+        let mut buf = vec![0u8; STREAM_CHUNK];
+        read_chunks(reader, &mut buf, |chunk| selector.feed(chunk)).unwrap();
+        selector.finish()
+    }
+
+    /// The range read stops once its last requested line is in. The reader
+    /// fails if it is read again after its one chunk, so a result at all
+    /// proves the rest of the file was never read.
+    #[test]
+    fn a_range_read_stops_after_the_last_requested_line() {
+        use tilth_core::test_readers::ThenFail;
+        let (selected, total) = select(ThenFail::new(b"a\nb\nc\nd\n"), &[Ok((2, 3))]);
+        assert_eq!(selected[0], b"b\nc\n");
+        assert_eq!(total, 3);
+    }
+
+    /// Lines that arrive split across reads are sliced the same as from one
+    /// buffer, and the count matches `count_lines`, a final line with no
+    /// newline included.
+    #[test]
+    fn a_range_read_is_the_same_one_byte_at_a_time() {
+        use tilth_core::test_readers::OneByte;
+        let text = b"one\ntwo\n\nfour\nfive";
+        let ranges = [Ok((2, 4)), Ok((5, 9)), Ok((1, 1))];
+        let mut whole = LineSelector::new(&ranges);
+        let _ = whole.feed(text);
+        let (whole, whole_total) = whole.finish();
+        let (split, split_total) = select(OneByte(text), &ranges);
+        assert_eq!(whole, split);
+        assert_eq!(whole_total, split_total);
+        assert_eq!(split_total, count_lines(text) as usize);
+        assert_eq!(split[0], b"two\n\nfour\n");
+        assert_eq!(split[1], b"five");
+        assert_eq!(split[2], b"one\n");
+    }
+
+    /// The spec for [`LineSelector`]: lines `start..=end` of `text`, sliced
+    /// by line offsets the way the mapped read did.
+    fn sliced(text: &[u8], start: usize, end: usize) -> Vec<u8> {
+        let mut offsets = vec![0];
+        offsets.extend(memchr::memchr_iter(b'\n', text).map(|at| at + 1));
+        let total = count_lines(text) as usize;
+        let end = end.min(total);
+        let to = offsets.get(end).copied().unwrap_or(text.len());
+        text[offsets[start - 1]..to].to_vec()
+    }
+
+    /// Ranges in any order, overlapping, repeated, one line long, running
+    /// past the end, select what slicing by line offsets selects, in the
+    /// caller's order, whatever the size of the pieces the file arrives in.
+    #[test]
+    fn many_ranges_select_what_slicing_selects() {
+        let text = b"one\ntwo\r\n\nfour\nfive\nsix\nseven\neight\nnine\nten";
+        let total = count_lines(text) as usize;
+        let ranges = [
+            (7, 9),
+            (1, 3),
+            (2, 2),
+            (1, 3),
+            (9, 40),
+            (4, 7),
+            (10, 10),
+            (3, 8),
+        ];
+        let wrapped: Vec<Result<(usize, usize), TilthError>> =
+            ranges.iter().map(|&range| Ok(range)).collect();
+        for piece in [1, 2, 3, 7, text.len()] {
+            let mut selector = LineSelector::new(&wrapped);
+            for chunk in text.chunks(piece) {
+                if selector.feed(chunk).is_break() {
+                    break;
+                }
+            }
+            let (selected, count) = selector.finish();
+            assert_eq!(count, total, "piece {piece}");
+            for (&(start, end), got) in ranges.iter().zip(&selected) {
+                assert_eq!(
+                    got,
+                    &sliced(text, start, end),
+                    "{start}-{end}, piece {piece}"
+                );
+            }
+        }
+    }
+
+    /// The streamed UTF-8 check agrees with checking the whole text, for
+    /// characters split across pieces in every way.
+    #[test]
+    fn a_streamed_utf8_check_agrees_with_checking_the_whole() {
+        let texts: [&[u8]; 11] = [
+            b"",
+            b"plain",
+            "\u{feff}é漢🦀\n".as_bytes(),
+            b"\xff",
+            b"ok \xe2\x82",
+            b"\xe2\x82\xac euro",
+            b"cut \xc3",
+            b"\xc3( bad",
+            b"\xed\xa0\x80 surrogate",
+            b"\xf4\x90\x80\x80 too large",
+            b"\xf0\x9f\xa6\x80\xf0\x9f",
+        ];
+        for text in texts {
+            for piece in [1, 2, 3, 5, text.len().max(1)] {
+                let mut check = Utf8Check::default();
+                for chunk in text.chunks(piece) {
+                    if check.feed(chunk).is_break() {
+                        break;
+                    }
+                }
+                assert_eq!(
+                    check.is_valid(),
+                    std::str::from_utf8(text).is_ok(),
+                    "{text:?}, piece {piece}"
+                );
+            }
+        }
+    }
+
+    /// A range may end at the largest number there is. Its end clamps to
+    /// the last line, as any end past it does, and the next range still
+    /// selects its own lines.
+    #[test]
+    fn a_range_ending_at_the_largest_number_clamps_to_the_last_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("twenty.txt");
+        let mut text = String::new();
+        for i in 1..=20 {
+            writeln!(text, "line {i}").unwrap();
+        }
+        std::fs::write(&path, &text).unwrap();
+        let out = read_ranges(&path, &["1-18446744073709551615", "5-6"], false).unwrap();
+        let header = format::file_header(&path, (text.len() + 14) as u64, 22, ViewMode::Section);
+        let expected = format!(
+            "{header}\n\n─── lines 1-20 ───\n{}\n\n─── lines 5-6 ───\n{}",
+            format::number_lines(&text, 1),
+            format::number_lines("line 5\nline 6\n", 5),
+        );
+        assert_eq!(out, expected);
+    }
+
+    /// A section read of an empty file shows it as empty, whatever its
+    /// well-formed ranges, as a single `section` of it always did.
+    #[test]
+    fn a_section_read_of_an_empty_file_shows_it_as_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.md");
+        std::fs::write(&path, "").unwrap();
+        let shapes: [&[&str]; 4] = [
+            &["1-2"],
+            &["1-2", "4-5"],
+            &["## Heading"],
+            &["## Heading", "3-4"],
+        ];
+        for ranges in shapes {
+            assert_eq!(
+                read_ranges(&path, ranges, false).unwrap(),
+                empty_view(&path),
+                "{ranges:?}"
+            );
+            assert_eq!(
+                read_ranges_with_budget(&path, ranges, false, 100).unwrap(),
+                empty_view(&path),
+                "{ranges:?}"
+            );
+        }
+        // A single `section` of an empty file shows it as empty before
+        // looking at the range, malformed or not.
+        let cache = OutlineCache::new();
+        for range in ["1-2", "x-y"] {
+            let single = read_file(&path, Some(range), false, &cache, false, None).unwrap();
+            assert_eq!(single, empty_view(&path), "{range}");
+        }
+    }
+
+    /// A malformed line range fails a section read of an empty file, of a
+    /// pipe and of a device, as it fails one of any other file: the first
+    /// malformed range, with the forms the query accepts.
+    #[cfg(unix)]
+    #[test]
+    fn a_malformed_range_fails_even_where_there_is_nothing_to_select() {
+        use tilth_core::test_readers::{make_pipe, unless_blocked_on};
+        let dir = tempfile::tempdir().unwrap();
+        let empty = dir.path().join("empty.md");
+        std::fs::write(&empty, "").unwrap();
+        let pipe = dir.path().join("pipe");
+        make_pipe(&pipe);
+        let expected = "invalid query \"abc\": expected format: \"start-end\" \
+                        (e.g. \"45-89\") or heading (e.g. \"## Architecture\")";
+        let shapes: [&[&str]; 4] = [
+            &["abc"],
+            &["abc", "0-5"],
+            &["1-2", "abc"],
+            &["## Heading", "abc", "5-4"],
+        ];
+        for path in [empty.as_path(), pipe.as_path(), Path::new("/dev/null")] {
+            for ranges in shapes {
+                let errors = unless_blocked_on(&pipe, || {
+                    [
+                        read_ranges(path, ranges, false),
+                        read_ranges_with_budget(path, ranges, false, 100),
+                    ]
+                    .map(|read| read.unwrap_err().to_string())
+                })
+                .expect("a read blocked on the pipe");
+                assert_eq!(errors, [expected, expected], "{path:?} {ranges:?}");
+            }
+        }
+    }
+
+    /// A pipe, socket or device has no fixed contents. It shows as empty, as
+    /// its zero length always made it, and it is never read: a pipe with no
+    /// writer used to block the read forever.
+    #[cfg(unix)]
+    #[test]
+    fn a_pipe_or_device_shows_as_empty() {
+        use tilth_core::test_readers::{make_pipe, unless_blocked_on};
+        let dir = tempfile::tempdir().unwrap();
+        let pipe = dir.path().join("pipe");
+        make_pipe(&pipe);
+        let null = Path::new("/dev/null");
+
+        for path in [pipe.as_path(), null] {
+            let reads = unless_blocked_on(&pipe, || {
+                let cache = OutlineCache::new();
+                [
+                    read_file(path, None, false, &cache, false, None),
+                    read_file(path, Some("1-2"), false, &cache, false, None),
+                    read_ranges(path, &["1-2", "4-5"], false),
+                    read_ranges_with_budget(path, &["1-2", "4-5"], false, 100),
+                ]
+                .map(Result::unwrap)
+            })
+            .expect("a read blocked on the pipe");
+            for out in reads {
+                assert_eq!(out, empty_view(path));
+            }
+        }
+        // The open itself does not block, so nothing can swap a pipe in
+        // between a look at the path and the open.
+        let opened = unless_blocked_on(&pipe, || open_file(&pipe).unwrap().is_none());
+        assert_eq!(opened, Some(true));
+    }
+
+    /// A log, CSV or unknown-type file past the token threshold streams into
+    /// its first and last lines. The view must be the one the whole text
+    /// gives, byte-order mark, `\r\n` and missing final newline included, in
+    /// the default read and in a `full` read over the cap.
+    #[test]
+    fn streamed_views_equal_the_whole_text_view() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut row = 0;
+        let mut text = |lines: usize, eol: &str| {
+            let mut out = String::new();
+            for _ in 0..lines {
+                row += 1;
+                write!(
+                    out,
+                    "{row},2026-11-11T12:00:00,value é {}{eol}",
+                    "x".repeat(row % 50)
+                )
+                .unwrap();
+            }
+            out
+        };
+        let mut cases = Vec::new();
+        for name in ["app.log", "table.csv", "notes.unknownext"] {
+            cases.push((name, text(2_000, "\n"), false));
+            cases.push((name, format!("\u{feff}{}", text(2_000, "\r\n")), false));
+            let mut unterminated = text(2_000, "\n");
+            unterminated.pop();
+            cases.push((name, unterminated, false));
+            cases.push((name, text(40_000, "\n"), true));
+        }
+        for (name, content, full) in cases {
+            let path = dir.path().join(name);
+            std::fs::write(&path, &content).unwrap();
+            assert!(estimate_tokens(content.len() as u64) > TOKEN_THRESHOLD);
+            assert_eq!(full, content.len() as u64 > full_read_size_cap());
+            let cache = OutlineCache::new();
+            let out = read_file(&path, None, full, &cache, false, None).unwrap();
+
+            let file_type = detect_file_type(&path);
+            assert!(matches!(View::of(file_type), View::Ends(_)), "{name}");
+            let capped = full || content.len() as u64 > tilth_core::source::MAX_FILE_SIZE;
+            let text = strip_bom(&content);
+            let outline = outline::generate(&path, file_type, text, text.as_bytes(), capped);
+            let lines = count_lines(content.as_bytes());
+            let len = content.len() as u64;
+            let expected = if full {
+                full_skipped_view(&path, len, lines, full_read_size_cap(), &outline)
+            } else {
+                let header = format::file_header(&path, len, lines, ViewMode::Outline);
+                format!("{header}\n\n{outline}")
+            };
+            assert_eq!(out, expected, "{name}, full {full}");
+        }
+    }
+
+    /// A log with no more lines than its view shows is its own view, and a
+    /// file whose outline saves too little gets the full view. The first is
+    /// built from the lines the streamed pass already holds, the second
+    /// from a second read. Both must be the views of the file's own bytes,
+    /// byte-order mark and invalid UTF-8 included, in the default read, in
+    /// edit mode and under a budget the full view does not fit.
+    #[test]
+    fn a_streamed_view_that_needs_the_whole_text_gets_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let line = |width: usize| format!("{}\n", "y".repeat(width)).into_bytes();
+        let mut marked = b"\xef\xbb\xbf".to_vec();
+        marked.extend(line(3_000).repeat(12));
+        let mut invalid = line(3_000).repeat(11);
+        invalid.extend(b"bad \xff byte, no final newline");
+        // Under the minified check's size, which would skip a file this wide.
+        let cases = [
+            ("few.log", line(3_000).repeat(12)),
+            ("marked.log", marked),
+            ("invalid.log", invalid),
+            ("wide.unknownext", line(900).repeat(70)),
+        ];
+        for (name, bytes) in cases {
+            let path = dir.path().join(name);
+            std::fs::write(&path, &bytes).unwrap();
+            let len = bytes.len() as u64;
+            assert!(estimate_tokens(len) > TOKEN_THRESHOLD);
+            let content = String::from_utf8_lossy(&bytes);
+            let lines = count_lines(&bytes);
+            let full_header = format::file_header(&path, len, lines, ViewMode::Full);
+            let cache = OutlineCache::new();
+
+            let out = read_file(&path, None, false, &cache, false, None).unwrap();
+            assert_eq!(out, format!("{full_header}\n\n{content}"), "{name}");
+
+            let out = read_file(&path, None, false, &cache, true, None).unwrap();
+            let numbered = format::hashlines(&content, 1);
+            assert_eq!(out, format!("{full_header}\n\n{numbered}"), "{name}, edit");
+
+            let budget = 2_000;
+            let out = read_file(&path, None, false, &cache, false, Some(budget)).unwrap();
+            let text = strip_bom(&content);
+            let file_type = detect_file_type(&path);
+            let outline = outline::generate(&path, file_type, text, text.as_bytes(), false);
+            let header = format::file_header(&path, len, lines, ViewMode::Outline);
+            let expected = outline_view(&header, &outline, || None, Some(budget));
+            assert_eq!(out, expected, "{name}, budget");
+        }
+    }
+
+    /// Line ranges are read by streaming the file. The slices must be the
+    /// file's own lines, in the order asked, overlapping ranges included,
+    /// with a final line that has no newline kept as it is.
+    #[test]
+    fn streamed_line_ranges_return_the_files_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("five.txt");
+        std::fs::write(&path, "one\ntwo\nthree\nfour\nfive").unwrap();
+
+        let out = read_ranges(&path, &["4-9", "2-3", "3-4"], false).unwrap();
+        let bodies: Vec<&str> = out.split("─── lines").skip(1).map(str::trim_end).collect();
+        assert_eq!(bodies.len(), 3, "{out}");
+        assert!(
+            bodies[0].contains("4  four") && bodies[0].contains("5  five"),
+            "{out}"
+        );
+        assert!(
+            bodies[1].contains("2  two") && bodies[1].contains("3  three"),
+            "{out}"
+        );
+        assert!(
+            bodies[2].contains("3  three") && bodies[2].contains("4  four"),
+            "{out}"
+        );
+        assert!(
+            !bodies[1].contains("four"),
+            "a range keeps only its own lines: {out}"
+        );
+
+        let err = read_ranges(&path, &["2-3", "x-y"], false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("x-y") && err.contains("start-end"), "{err}");
+        let err = read_ranges(&path, &["6-7", "x-y"], false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("6-7") && err.contains("5 lines"),
+            "the first bad range is named: {err}"
+        );
+    }
+
+    /// A file shown by its header alone (generated or minified) gets its line
+    /// count from a streamed pass, which must agree with `count_lines`.
+    #[test]
+    fn a_header_only_view_counts_lines_like_count_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = OutlineCache::new();
+        let mut minified = "x".repeat(150_000);
+        minified.push_str("\nend");
+        for (name, content) in [
+            ("package-lock.json", "{\n  \"a\": 1\n}\n".to_string()),
+            ("bundle.js", minified),
+        ] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, &content).unwrap();
+            let out = read_file(&path, None, false, &cache, false, None).unwrap();
+            let lines = count_lines(content.as_bytes());
+            assert!(out.contains(&format!("{lines} lines")), "{name}: {out}");
+        }
+    }
+
+    /// A section that starts past the last line used to succeed with an empty
+    /// body. It is an error that names the file's length.
+    #[test]
+    fn section_past_the_end_is_an_error_naming_the_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("two.txt");
+        std::fs::write(&path, "alpha\nbeta\n").unwrap();
+        let err = read_ranges(&path, &["3-100"], false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("3-100") && err.contains("2 lines"),
+            "error must name the range and the length: {err}"
+        );
+        // An end past EOF still clamps to the last line.
+        let out = read_ranges(&path, &["2-100"], false).unwrap();
+        assert!(out.contains("(1 lines") && out.contains("2  beta"), "{out}");
+    }
+
+    /// The CSV outline counted the final newline as a row too.
+    #[test]
+    fn tabular_rows_ignore_the_final_newline() {
+        let csv = |text: &str| {
+            outline::generate(
+                Path::new("t.csv"),
+                FileType::Tabular,
+                text,
+                text.as_bytes(),
+                false,
+            )
+        };
+        let out = csv("a,b\n1,2\n3,4\n");
+        assert!(out.contains("rows: 2"), "{out}");
+        let unterminated = csv("a,b\n1,2\n3,4");
+        assert!(unterminated.contains("rows: 2"), "{unterminated}");
+    }
+
+    /// The hash-anchored view keeps a byte-order mark: `tilth_write` checks
+    /// anchors against the file as it is on disk, mark included, so a view
+    /// that dropped it would hand out a line-1 anchor that never matches.
+    #[test]
+    fn hashline_view_keeps_the_byte_order_mark() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.py");
+        std::fs::write(&path, "\u{feff}import os\n").unwrap();
+        let cache = OutlineCache::new();
+        let out = read_file(&path, None, true, &cache, true, None).unwrap();
+        let hash = format::line_hash("\u{feff}import os".as_bytes());
+        assert!(out.contains(&format!("1:{hash:03x}|")), "{out}");
+    }
+
+    /// A file under the outline threshold but over the budget was read in
+    /// full and cut at the budget, so it showed `entry_0`'s body and hid
+    /// `entry_1` to `entry_7`. Its outline fits, and lists all eight.
+    #[test]
+    fn a_budget_the_full_file_overflows_gets_the_outline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("medium.rs");
+        let mut src = String::new();
+        for i in 0..8 {
+            writeln!(src, "pub fn entry_{i}() {{").unwrap();
+            src.push_str(&"    let body_only_marker = 123456789;\n".repeat(30));
+            src.push_str("}\n\n");
+        }
+        assert!(estimate_tokens(src.len() as u64) < TOKEN_THRESHOLD);
+        std::fs::write(&path, &src).unwrap();
+        let cache = OutlineCache::new();
+        let unbudgeted = read_file(&path, None, false, &cache, false, None).unwrap();
+        assert!(unbudgeted.contains("[full]"), "{unbudgeted}");
+
+        let out = read_file(&path, None, false, &cache, false, Some(500)).unwrap();
+        assert!(out.contains("[outline]"), "{out}");
+        assert!(out.contains("fn entry_7"), "{out}");
+        assert!(!out.contains("body_only_marker"), "{out}");
+        assert!(estimate_tokens(out.len() as u64) <= 500, "{out}");
+        // Asked for in full, the file is what was asked for.
+        let full = read_file(&path, None, true, &cache, false, Some(500)).unwrap();
+        assert!(full.contains("[full]"), "{full}");
+    }
+
+    /// An outline over the budget was cut mid-entry, so `third` was gone
+    /// and the note gave only a token count. Signatures and docs go first,
+    /// every name stays, and the note says so.
+    #[test]
+    fn an_outline_over_the_budget_keeps_every_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("service.ts");
+        let mut src = String::new();
+        for name in ["first", "second", "third"] {
+            writeln!(src, "/** {} */", "Documented at length. ".repeat(6)).unwrap();
+            let params: Vec<String> = (0..12).map(|i| format!("argument_{i}: string")).collect();
+            writeln!(
+                src,
+                "export function {name}({}): void {{",
+                params.join(", ")
+            )
+            .unwrap();
+            src.push_str(&"  const filler = 'x'.repeat(100);\n".repeat(300));
+            src.push_str("}\n");
+        }
+        assert!(estimate_tokens(src.len() as u64) > TOKEN_THRESHOLD);
+        std::fs::write(&path, &src).unwrap();
+        let cache = OutlineCache::new();
+        let budget = 150;
+        let unbudgeted = read_file(&path, None, false, &cache, false, None).unwrap();
+        assert!(
+            estimate_tokens(unbudgeted.len() as u64) > budget,
+            "{unbudgeted}"
+        );
+
+        let out = read_file(&path, None, false, &cache, false, Some(budget)).unwrap();
+        for name in ["fn first", "fn second", "fn third"] {
+            assert!(out.contains(name), "{name} missing:\n{out}");
+        }
+        assert!(!out.contains("argument_0"), "{out}");
+        assert!(out.contains("signatures and docs left out"), "{out}");
+        assert!(!out.contains("entries shown"), "{out}");
+        assert!(estimate_tokens(out.len() as u64) <= budget, "{out}");
+    }
+
+    /// When even the names do not fit, whole entries go from the end, and
+    /// the note counts them.
+    #[test]
+    fn an_outline_cut_by_entries_counts_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("many.rs");
+        let mut src = String::new();
+        for i in 0..60 {
+            writeln!(src, "pub fn function_number_{i}() {{").unwrap();
+            src.push_str(&"    let filler = 1234567890;\n".repeat(20));
+            src.push_str("}\n");
+        }
+        assert!(estimate_tokens(src.len() as u64) > TOKEN_THRESHOLD);
+        std::fs::write(&path, &src).unwrap();
+        let cache = OutlineCache::new();
+        let budget = 200;
+        let out = read_file(&path, None, false, &cache, false, Some(budget)).unwrap();
+        assert!(out.contains("fn function_number_0\n"), "{out}");
+        assert!(!out.contains("function_number_59"), "{out}");
+        let shown = out.lines().filter(|l| l.starts_with('[')).count();
+        assert!(
+            out.contains(&format!(
+                "signatures and docs left out; {shown} of 60 entries shown"
+            )),
+            "{out}"
+        );
+        assert!(estimate_tokens(out.len() as u64) <= budget, "{out}");
     }
 }

@@ -143,16 +143,24 @@ fn resolve_scope_at(
         // this PR closes: the server cwd is frozen at spawn and may point at the
         // wrong checkout. Use root when available (that IS the caller's checkout);
         // error when there is no safe anchor.
+        //
+        // Both answers name the directory the caller probably meant
+        // (`missing_scope_hint`), the same hint the CLI's refusal carries.
+        let project = root
+            .filter(|r| r.is_absolute())
+            .or(cwd)
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let hint = crate::missing_scope_hint(&raw, &resolved, project);
         return match root {
             Some(r) if r.is_absolute() => Ok((
                 r.to_path_buf(),
                 Some(format!(
-                    "scope \"{raw_str}\" is not a valid directory, searching the root/checkout directory instead.\n\n"
+                    "scope \"{raw_str}\" is not a valid directory, searching the root/checkout directory instead. {hint}\n\n"
                 )),
             )),
             _ => Err(format!(
                 "scope \"{raw_str}\" is not a valid directory and no absolute root was provided to fall back to. \
-                 Pass an absolute scope or set \"root\" to an absolute checkout directory."
+                 Pass an absolute scope or set \"root\" to an absolute checkout directory. {hint}"
             )),
         };
     }
@@ -171,10 +179,7 @@ pub(super) fn resolve_read_path(
 }
 
 pub(super) fn apply_budget(output: &str, budget: Option<u64>) -> String {
-    match budget {
-        Some(b) => crate::budget::apply(output, b),
-        None => crate::budget::apply(output, crate::budget::DEFAULT_BUDGET),
-    }
+    crate::budget::apply(output, budget.unwrap_or(crate::budget::DEFAULT_BUDGET))
 }
 
 #[cfg(test)]
@@ -292,6 +297,39 @@ mod tests {
         assert!(
             warning.is_some() && warning.unwrap().contains("not a valid directory"),
             "a soft warning must be present naming the issue"
+        );
+    }
+
+    /// The fallback keeps searching the root, and now also names the
+    /// directory the caller probably meant, so the next call can narrow.
+    #[test]
+    fn resolve_scope_missing_dir_warning_suggests_the_close_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src/search")).unwrap();
+        let args = serde_json::json!({ "scope": "src/serach" });
+        let (scope, warning) = resolve_scope(&args, Some(tmp.path()), Glob).unwrap();
+        assert_eq!(scope, tmp.path());
+        let warning = warning.unwrap();
+        assert!(
+            warning.contains("searching the root/checkout directory instead")
+                && warning.contains("Did you mean \"src/search\"?"),
+            "{warning}"
+        );
+    }
+
+    #[test]
+    fn resolve_scope_missing_dir_no_root_error_suggests_the_close_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src/search")).unwrap();
+        // A checkout: the hint scans for close names only inside one.
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        let typo = tmp.path().join("src/serach");
+        let args = serde_json::json!({ "scope": typo.to_str().unwrap() });
+        let err = resolve_scope(&args, None, Glob).unwrap_err();
+        let want = tmp.path().join("src/search");
+        assert!(
+            err.contains(&format!("Did you mean \"{}\"?", want.display())),
+            "{err}"
         );
     }
 

@@ -7,16 +7,33 @@ use std::path::Path;
 
 use tilth_core::search::deps::{Dependent, DepsResult, LocalDep, MAX_EXPORTED_SYMBOLS};
 
+/// Dependents listed before the rest are summarised in a count, unless the
+/// caller asks for the full list.
+const MAX_DEPENDENTS: usize = 15;
+
 /// Format a `DepsResult` as a compact, readable string.
+///
+/// `full` lists every dependent; otherwise the first `MAX_DEPENDENTS` are
+/// listed and the rest counted.
 ///
 /// Budget truncation priority (when `budget` tokens is too tight):
 /// 1. Truncate "Used by" entries (keep header count)
 /// 2. Truncate "Uses (external)" to count only
 /// 3. Truncate "Uses (local)" symbol lists to file paths only
 /// 4. Never truncate the header line
-pub fn format_deps(result: &DepsResult, scope: &Path, budget: Option<usize>) -> String {
-    let dep_count = result.total_dependents;
-    let (prod_deps, test_deps): (Vec<_>, Vec<_>) = result.used_by.iter().partition(|d| !d.is_test);
+///
+/// Whenever dependents are left out, a line says how many.
+pub fn format_deps(result: &DepsResult, scope: &Path, budget: Option<usize>, full: bool) -> String {
+    // The result's paths are canonical; shown relative to the same scope.
+    let scope = &scope.canonicalize().unwrap_or_else(|_| scope.to_path_buf());
+    let dep_count = result.used_by.len();
+    let listed = if full {
+        dep_count
+    } else {
+        dep_count.min(MAX_DEPENDENTS)
+    };
+    let (prod_deps, test_deps): (Vec<_>, Vec<_>) =
+        result.used_by[..listed].iter().partition(|d| !d.is_test);
 
     // ── Build sections (full fidelity first) ─────────────────────────────────
 
@@ -27,58 +44,56 @@ pub fn format_deps(result: &DepsResult, scope: &Path, budget: Option<usize>) -> 
         .unwrap_or(&result.target)
         .display()
         .to_string();
+    // A dependent with no import of the target was found by a call to a
+    // name the target defines, which another definition may own.
+    let by_name = result
+        .used_by
+        .iter()
+        .filter(|d| d.import_lines.is_empty())
+        .count();
+    let by_name_count = if by_name > 0 {
+        format!(", {by_name} of them by name only")
+    } else {
+        String::new()
+    };
     let header = format!(
-        "# Deps: {} — {} local, {} external, {} dependent{}",
+        "# Deps: {} — {} local, {} external, {} dependent{}{by_name_count}",
         rel_target,
         result.uses_local.len(),
         result.uses_external.len(),
         dep_count,
         if dep_count == 1 { "" } else { "s" },
     );
+    let by_name_note = if by_name > 0 {
+        "> By name only: the file calls a name the target defines, and no import of the \
+         target was found, so the call may reach another definition of the name."
+    } else {
+        ""
+    };
 
     let uses_local_section = format_uses_local(&result.uses_local, scope, true);
     let uses_external_section = format_uses_external(&result.uses_external);
     let used_by_section = format_used_by(&prod_deps, scope, "## Used by");
     let used_by_tests_section = format_used_by(&test_deps, scope, "## Used by (tests)");
 
-    let barrel_note = if result.exported_count > MAX_EXPORTED_SYMBOLS {
-        format!(
-            "\n\n> ({} of {} exports shown — barrel file detected)",
-            result.searched_count, result.exported_count
-        )
-    } else {
-        String::new()
-    };
+    let unsearched = unsearched_note(result);
 
     // Full output
-    let mut parts: Vec<String> = Vec::new();
-    parts.push(header.clone());
-    if !uses_local_section.is_empty() {
-        parts.push(uses_local_section.clone());
-    }
-    if !uses_external_section.is_empty() {
-        parts.push(uses_external_section.clone());
-    }
-    if !used_by_section.is_empty() {
-        parts.push(used_by_section.clone());
-    }
-    if !used_by_tests_section.is_empty() {
-        parts.push(used_by_tests_section.clone());
-    }
-    let truncated = result.total_dependents.saturating_sub(result.used_by.len());
-    if truncated > 0 {
-        parts.push(format!("... and {truncated} more dependents"));
-    }
-    if !barrel_note.is_empty() {
-        parts.push(barrel_note.clone());
-    }
-
-    let full = parts.join("\n\n");
-    let full_tokens = crate::types::estimate_tokens(full.len() as u64) as usize;
+    let full_output = assemble(&[
+        &header,
+        &uses_local_section,
+        &uses_external_section,
+        &used_by_section,
+        &used_by_tests_section,
+        &unlisted_dependents(dep_count, listed),
+        &unsearched,
+        by_name_note,
+    ]);
+    let full_tokens = crate::types::estimate_tokens(full_output.len() as u64) as usize;
 
     let output = match budget {
-        None => full,
-        Some(b) if full_tokens <= b => full,
+        None => full_output,
+        Some(b) if full_tokens <= b => full_output,
         Some(b) => {
             // Apply truncation in priority order
             apply_budget_truncation(
@@ -86,16 +101,64 @@ pub fn format_deps(result: &DepsResult, scope: &Path, budget: Option<usize>) -> 
                 &uses_local_section,
                 &uses_external_section,
                 &prod_deps,
-                &test_deps,
-                &barrel_note,
+                dep_count,
+                &unsearched,
                 scope,
                 b,
             )
         }
     };
 
+    // Kept under any budget: a skipped file may hold dependents nobody checked.
+    let held = format!("a name from `{rel_target}`");
+    let output = match crate::search::skipped_files_note(&result.skipped_large, &held, scope) {
+        Some(sentence) => format!("{output}\n\n> {sentence}"),
+        None => output,
+    };
+
     let token_est = crate::types::estimate_tokens(output.len() as u64);
     format!("{output}\n\n[~{token_est} tokens]")
+}
+
+/// The note that names what the call-site search left out, or nothing when
+/// it searched every name. Importers are found whatever the cap.
+fn unsearched_note(result: &DepsResult) -> String {
+    /// Left-out names spelled out before the rest are counted.
+    const NAMED: usize = 10;
+    let left_out = &result.unsearched;
+    if left_out.is_empty() {
+        return String::new();
+    }
+    let mut named = left_out
+        .iter()
+        .take(NAMED)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if left_out.len() > NAMED {
+        let _ = write!(named, " and {} more", left_out.len() - NAMED);
+    }
+    format!(
+        "> Callers searched for {MAX_EXPORTED_SYMBOLS} of {} names: first the ones other \
+         files import by name, then the longest. Not searched: {named}.",
+        result.exported_count
+    )
+}
+
+/// The line that counts dependents left out of the listing, or nothing when
+/// all `total` are listed.
+fn unlisted_dependents(total: usize, listed: usize) -> String {
+    match total.saturating_sub(listed) {
+        0 => String::new(),
+        n if listed == 0 => format!(
+            "... {n} dependent{} not listed",
+            if n == 1 { "" } else { "s" }
+        ),
+        n => format!(
+            "... and {n} more dependent{}",
+            if n == 1 { "" } else { "s" }
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -163,83 +226,92 @@ fn format_used_by(deps: &[&Dependent], scope: &Path, heading: &str) -> String {
             .map(|(caller, (line, syms))| (caller, line, syms))
             .collect();
         callers.sort_unstable_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(b.0)));
-        for (caller, line, syms) in callers {
+        for (caller, line, syms) in &callers {
             let loc = format!("{rel}:{line}");
             let joined = syms.join(", ");
             let _ = write!(out, "\n{loc:<30} {caller:<20} \u{2192} {joined}");
+        }
+        // A file that imports the target without calling it.
+        if callers.is_empty() {
+            if let Some(line) = dep.import_lines.first() {
+                let loc = format!("{rel}:{line}");
+                match &dep.via {
+                    Some(via) => {
+                        let via = via.strip_prefix(scope).unwrap_or(via).display();
+                        let _ = write!(out, "\n{loc:<30} imports it through {via}");
+                    }
+                    None => {
+                        let _ = write!(out, "\n{loc:<30} imports it");
+                    }
+                }
+            }
         }
     }
     out
 }
 
 /// Apply progressive budget truncation and reassemble the output.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "renderers become functions of a result model in #311"
+)]
 fn apply_budget_truncation(
     header: &str,
     uses_local_full: &str,
     uses_external_full: &str,
     prod_deps: &[&Dependent],
-    test_deps: &[&Dependent],
-    barrel_note: &str,
+    total_dependents: usize,
+    unsearched: &str,
     scope: &Path,
     budget: usize,
 ) -> String {
-    // Try progressively degraded versions
-    #[allow(clippy::type_complexity)]
-    let candidates: &[fn(
-        &str,
-        &str,
-        &str,
-        &[&Dependent],
-        &[&Dependent],
-        &str,
-        &Path,
-    ) -> String] = &[
-        // Level 0: no tests
-        |hdr, ul, ue, pd, _td, bn, sc| {
-            assemble(&[hdr, ul, ue, &format_used_by(pd, sc, "## Used by"), bn])
-        },
-        // Level 1: no used-by entries at all
-        |hdr, ul, ue, pd, _td, bn, _sc| {
-            let count = pd.len();
-            let note = if count > 0 {
-                format!("\n\n(... {count} more dependents)")
-            } else {
-                String::new()
-            };
-            assemble(&[hdr, ul, ue, &note, bn])
-        },
-        // Level 2: external as count only
-        |hdr, ul, _ue, _pd, _td, bn, _sc| assemble(&[hdr, ul, bn]),
-        // Level 3: local as paths only (no symbols)
-        |hdr, ul, _ue, _pd, _td, _bn, _sc| {
-            // Strip symbol lists: each line is "path_padded  symbols" — take only up to first space run
-            let local_lines: Vec<&str> = ul
-                .lines()
-                .skip(1) // skip heading
-                .map(|l| l.split_whitespace().next().unwrap_or(l))
-                .collect();
-            let paths_only = if local_lines.is_empty() {
-                String::new()
-            } else {
-                format!("## Uses (local)\n{}", local_lines.join("\n"))
-            };
-            assemble(&[hdr, &paths_only])
-        },
-        // Level 4: header only
-        |hdr, _ul, _ue, _pd, _td, _bn, _sc| hdr.to_string(),
-    ];
+    // Local deps as paths only, without their symbol lists. Each line is
+    // "path_padded  symbols": keep the path.
+    let local_paths_only = {
+        let local_lines: Vec<&str> = uses_local_full
+            .lines()
+            .skip(1) // skip heading
+            .map(|l| l.split_whitespace().next().unwrap_or(l))
+            .collect();
+        if local_lines.is_empty() {
+            String::new()
+        } else {
+            format!("## Uses (local)\n{}", local_lines.join("\n"))
+        }
+    };
+    let prod_listed = format_used_by(prod_deps, scope, "## Used by");
+    let prod_unlisted = unlisted_dependents(total_dependents, prod_deps.len());
+    let none_listed = unlisted_dependents(total_dependents, 0);
 
-    for candidate_fn in candidates {
-        let candidate = candidate_fn(
+    // Progressively degraded versions, richest first.
+    let candidates: [Vec<&str>; 5] = [
+        // Level 0: no tests
+        vec![
             header,
             uses_local_full,
             uses_external_full,
-            prod_deps,
-            test_deps,
-            barrel_note,
-            scope,
-        );
+            &prod_listed,
+            &prod_unlisted,
+            unsearched,
+        ],
+        // Level 1: no used-by entries at all
+        vec![
+            header,
+            uses_local_full,
+            uses_external_full,
+            &none_listed,
+            unsearched,
+        ],
+        // Level 2: external as count only
+        vec![header, uses_local_full, &none_listed, unsearched],
+        // Level 3: local as paths only (no symbols)
+        vec![header, &local_paths_only, &none_listed],
+        // Level 4: header only
+        vec![header],
+    ];
+
+    for parts in &candidates {
+        let candidate = assemble(parts);
         let tokens = crate::types::estimate_tokens(candidate.len() as u64) as usize;
         if tokens <= budget {
             return candidate;
@@ -258,4 +330,130 @@ fn assemble(parts: &[&str]) -> String {
         .copied()
         .collect::<Vec<_>>()
         .join("\n\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// 20 dependents, the last 5 of them tests, as `analyze_deps` orders them.
+    fn twenty_dependents() -> DepsResult {
+        let used_by = (0..20)
+            .map(|i| Dependent {
+                path: PathBuf::from(format!("/r/user{i:02}.ts")),
+                symbols: vec![(format!("user{i}"), "libFn".to_string(), 2)],
+                is_test: i >= 15,
+                import_lines: vec![1],
+                via: None,
+            })
+            .collect();
+        DepsResult {
+            target: PathBuf::from("/r/lib.ts"),
+            uses_local: Vec::new(),
+            uses_external: Vec::new(),
+            used_by,
+            skipped_large: Vec::new(),
+            exported_count: 1,
+            unsearched: Vec::new(),
+        }
+    }
+
+    /// A dependent that imports the target without calling it had no line,
+    /// and the old note claimed a barrel file for any file with many names.
+    #[test]
+    fn importers_and_unsearched_names_are_shown() {
+        let dependent = |name: &str, via: Option<&str>| Dependent {
+            path: PathBuf::from(format!("/r/{name}")),
+            symbols: Vec::new(),
+            is_test: false,
+            import_lines: vec![3],
+            via: via.map(|v| PathBuf::from(format!("/r/{v}"))),
+        };
+        let result = DepsResult {
+            target: PathBuf::from("/r/lib.py"),
+            uses_local: Vec::new(),
+            uses_external: Vec::new(),
+            used_by: vec![
+                dependent("a.py", None),
+                dependent("b.py", Some("pkg/__init__.py")),
+            ],
+            skipped_large: Vec::new(),
+            exported_count: 27,
+            unsearched: vec!["get_dependant".to_string(), "x_y".to_string()],
+        };
+        let out = format_deps(&result, Path::new("/r"), None, false);
+        assert!(
+            out.contains("\na.py:3                         imports it\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("\nb.py:3                         imports it through pkg/__init__.py"),
+            "{out}"
+        );
+        assert!(
+            out.contains("> Callers searched for 25 of 27 names: first the ones other files import by name, then the longest. Not searched: get_dependant, x_y."),
+            "{out}"
+        );
+        assert!(!out.contains("barrel file detected"), "{out}");
+    }
+
+    /// A dependent found only because it calls a name the target defines,
+    /// with no import of the target, may call another definition of that
+    /// name: on a short name such as `new`, most of them do. The count says
+    /// how many are of that kind, so it does not read as exact.
+    #[test]
+    fn dependents_matched_by_name_only_are_counted_apart() {
+        let mut result = twenty_dependents();
+        for d in &mut result.used_by[..12] {
+            d.import_lines.clear();
+        }
+        let out = format_deps(&result, Path::new("/r"), None, false);
+        assert!(
+            out.contains("20 dependents, 12 of them by name only"),
+            "{out}"
+        );
+        assert!(out.contains("> By name only:"), "{out}");
+        let all_imported = format_deps(&twenty_dependents(), Path::new("/r"), None, false);
+        assert!(!all_imported.contains("by name only"), "{all_imported}");
+        assert!(!all_imported.contains("By name only"), "{all_imported}");
+    }
+
+    fn listed(out: &str) -> usize {
+        out.lines().filter(|l| l.starts_with("user")).count()
+    }
+
+    #[test]
+    fn default_lists_fifteen_and_counts_the_rest() {
+        let out = format_deps(&twenty_dependents(), Path::new("/r"), None, false);
+        assert!(out.contains("20 dependents"), "{out}");
+        assert_eq!(listed(&out), 15, "{out}");
+        assert!(out.contains("... and 5 more dependents"), "{out}");
+    }
+
+    /// `--full` used to change nothing: the cap sat in the analysis.
+    #[test]
+    fn full_lists_every_dependent() {
+        let out = format_deps(&twenty_dependents(), Path::new("/r"), None, true);
+        assert_eq!(listed(&out), 20, "{out}");
+        assert!(out.contains("## Used by (tests)"), "{out}");
+        assert!(!out.contains("more dependents"), "{out}");
+    }
+
+    /// Under a budget the tests section went first with nothing said, and
+    /// the next level counted the dependents it showed as the ones it hid.
+    #[test]
+    fn a_budget_cut_says_how_many_dependents_are_not_listed() {
+        let result = twenty_dependents();
+        let full = format_deps(&result, Path::new("/r"), None, true);
+        let full_tokens = crate::types::estimate_tokens(full.len() as u64) as usize;
+
+        let no_tests = format_deps(&result, Path::new("/r"), Some(full_tokens - 20), true);
+        assert_eq!(listed(&no_tests), 15, "{no_tests}");
+        assert!(no_tests.contains("... and 5 more dependents"), "{no_tests}");
+
+        let none = format_deps(&result, Path::new("/r"), Some(30), true);
+        assert_eq!(listed(&none), 0, "{none}");
+        assert!(none.contains("... 20 dependents not listed"), "{none}");
+    }
 }

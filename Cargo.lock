@@ -849,20 +849,20 @@ dependencies = [
 
 [[package]]
 name = "tilth"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "clap",
  "clap_complete",
  "crossbeam-channel",
  "dashmap",
  "globset",
+ "grep-matcher",
  "grep-regex",
  "grep-searcher",
  "home",
  "ignore",
  "libc",
  "memchr",
- "memmap2",
  "percent-encoding",
  "rayon",
  "regex-syntax",
@@ -870,6 +870,7 @@ dependencies = [
  "serde_json",
  "streaming-iterator",
  "strsim",
+ "syn 2.0.117",
  "tempfile",
  "terminal_size",
  "tilth-core",
@@ -879,14 +880,15 @@ dependencies = [
 
 [[package]]
 name = "tilth-core"
-version = "0.13.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "726524b85c482e319f21132d89d7b7ab44cf424d01f63a38b22262761623daeb"
+checksum = "e6f6e60a0d907d25498224b9b56de80e48a3415c845d5ce104ea4d43e6d79996"
 dependencies = [
  "dashmap",
  "fastbloom",
  "ignore",
  "memchr",
+ "rustix",
  "streaming-iterator",
  "thiserror",
  "tree-sitter",

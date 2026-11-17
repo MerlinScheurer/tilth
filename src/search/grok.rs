@@ -13,7 +13,7 @@ use tilth_core::index::bloom::BloomFilterCache;
 use tilth_core::lang::detect_file_type;
 use tilth_core::lang::outline::get_outline_entries;
 use tilth_core::search::callees::{extract_callee_names, resolve_callees, ResolvedCallee};
-use tilth_core::search::callers::{find_callers_batch, CallerMatch, BATCH_EARLY_QUIT};
+use tilth_core::search::callers::{find_callers_batch, CallerMatch};
 use tilth_core::types::{is_test_file, FileType, Lang, OutlineEntry, OutlineKind};
 
 /// What grok resolved the user's target string to.
@@ -83,60 +83,31 @@ fn resolve_with_source(
     }
 }
 
+/// Resolve a symbol target to its top-ranked definition. A qualified target
+/// (`Type::method`, `Type.method`) resolves among the definitions its owner
+/// holds. When the owner holds none, the error lists the definitions of the
+/// name there are, so the next call can name one.
 fn resolve_by_name(name: &str, scope: &Path) -> Result<(ResolvedTarget, String, Lang), TilthError> {
-    // The literal spec (`Type::method`) never equals a bare definition name, so
-    // this attempt only fires for genuinely bare targets.
-    if let Some(resolved) = resolve_def_by_query(name, scope)? {
-        return Ok(resolved);
-    }
-    // Qualified target (`Type::method` or `Type.method`): retry with the trailing
-    // segment. The retry is bounded — it fires only when the literal lookup found
-    // no definition, leaving bare-symbol resolution unchanged.
-    let bare = split_qualified(name);
-    if bare != name && !bare.is_empty() {
-        if let Some(resolved) = resolve_def_by_query(bare, scope)? {
-            return Ok(resolved);
-        }
-    }
-    Err(TilthError::NotFound {
-        path: PathBuf::from(name),
-        suggestion: None,
-    })
-}
-
-/// Split a qualified target into its bare trailing name.
-///
-/// `"Type::method"` → `"method"`, `"a::b::method"` → `"method"`,
-/// `"Type.method"` → `"method"`, `"method"` → `"method"`.
-fn split_qualified(name: &str) -> &str {
-    match name.rfind([':', '.']) {
-        Some(idx) => &name[idx + 1..],
-        None => name,
-    }
-}
-
-/// Search for `query` as a symbol and resolve its top-ranked definition to a
-/// full target. Returns `None` when no definition matches `query` at all, so the
-/// caller can retry with a different query.
-fn resolve_def_by_query(
-    query: &str,
-    scope: &Path,
-) -> Result<Option<(ResolvedTarget, String, Lang)>, TilthError> {
-    // full=false keeps grok exactly as it was. It is not a free choice: `full`
-    // also raises the definitions early-quit threshold (50 -> 300), so it
-    // changes which definitions the walker collects and therefore which one
-    // ranks first here. Grok's own caps come from `GrokCaps`.
-    let result = search_symbol_raw(query, scope, None, false)?;
-    let definitions: Vec<_> = result.matches.iter().filter(|m| m.is_definition).collect();
-    let Some(top) = definitions.first() else {
-        return Ok(None);
+    // Only the top-ranked definition is used, so the short match list is
+    // enough; the count of the others comes from the exact total. Grok's own
+    // caps come from `GrokCaps`.
+    let result = search_symbol_raw(name, scope, None, false)?;
+    let Some(top) = result.matches.iter().find(|m| m.is_definition) else {
+        let suggestion = (!result.other_owners.is_empty())
+            .then(|| crate::search::owner_candidates(name, &result.other_owners, scope));
+        return Err(TilthError::NotFound {
+            path: PathBuf::from(name),
+            suggestion,
+        });
     };
-    let other_def_count = definitions.len().saturating_sub(1);
+    // A doc heading that names the symbol is no rival definition.
+    let other_def_count = result.code_definitions.saturating_sub(1);
     let (start, _end) = top.def_range.ok_or_else(|| TilthError::ParseError {
         path: top.path.clone(),
-        reason: format!("definition match for `{query}` had no def_range"),
+        reason: format!("definition match for `{name}` had no def_range"),
     })?;
-    enrich_from_outline(top.path.clone(), start, query.to_string(), other_def_count).map(Some)
+    let def_name = top.def_name.clone().unwrap_or_else(|| name.to_string());
+    enrich_from_outline(top.path.clone(), start, def_name, name, other_def_count)
 }
 
 fn resolve_by_path_line(
@@ -145,6 +116,10 @@ fn resolve_by_path_line(
 ) -> Result<(ResolvedTarget, String, Lang), TilthError> {
     let (content, lang) = read_code_file(path)?;
     let entries = get_outline_entries(&content, lang);
+    // A decorator or attribute line belongs to the definition it decorates,
+    // though that definition's outline entry may start below it.
+    let line = tilth_core::lang::treesitter::decorated_definition_line(&content, lang, line)
+        .unwrap_or(line);
     let entry = find_entry_at_line(&entries, line).ok_or_else(|| TilthError::NotFound {
         path: path.to_path_buf(),
         suggestion: Some(format!("no definition encloses line {line}")),
@@ -181,7 +156,7 @@ fn read_code_file(path: &Path) -> Result<(String, Lang), TilthError> {
             ),
         });
     }
-    let bytes = fs::read(path).map_err(|e| TilthError::IoError {
+    let bytes = tilth_core::source::read(path).map_err(|e| TilthError::IoError {
         path: path.to_path_buf(),
         source: e,
     })?;
@@ -197,30 +172,44 @@ fn read_code_file(path: &Path) -> Result<(String, Lang), TilthError> {
     }
     // Try the strict conversion first: it takes ownership of the buffer, so
     // the (near-universal) valid-UTF-8 case decodes without a second copy.
-    let content = String::from_utf8(bytes)
+    let mut content = String::from_utf8(bytes)
         .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
+    let bom = content.len() - tilth_core::source::strip_bom(&content).len();
+    content.drain(..bom);
+    let lang = tilth_core::lang::refine_lang(lang, path, &content);
     Ok((content, lang))
 }
 
-/// Read the file at `path`, find the outline entry that starts at `start_line`
-/// (or the deepest entry enclosing it), and convert to `ResolvedTarget`.
+/// Read the file at `path`, find the outline entry named `name` that starts
+/// at `start_line` (or else any entry starting there, or the deepest one
+/// enclosing it), and convert to `ResolvedTarget`. `query` is what the user
+/// asked for, which a refusal names.
 fn enrich_from_outline(
     path: PathBuf,
     start_line: u32,
     name: String,
+    query: &str,
     other_def_count: usize,
 ) -> Result<(ResolvedTarget, String, Lang), TilthError> {
-    // On the symbol route the user asked for `name`, not the path the search
+    // On the symbol route the user asked for `query`, not the path the search
     // resolved it to — a refusal must name their query, not our detour.
     let (content, lang) = read_code_file(&path).map_err(|e| match e {
         TilthError::InvalidQuery { reason, .. } => TilthError::InvalidQuery {
-            query: name.clone(),
+            query: query.to_string(),
             reason,
         },
         other => other,
     })?;
     let entries = get_outline_entries(&content, lang);
-    let entry = find_by_start_line(&entries, start_line)
+    // A definition's range opens with the decorators beside it, but its
+    // outline entry starts on its own first line, below them.
+    let start_line =
+        tilth_core::lang::treesitter::decorated_definition_line(&content, lang, start_line)
+            .unwrap_or(start_line);
+    // A one-line class and its first method start on the same line; the
+    // name tells them apart.
+    let entry = find_named_at(&entries, start_line, &name)
+        .or_else(|| find_by_start_line(&entries, start_line))
         .or_else(|| find_entry_at_line(&entries, start_line));
     let target = match entry {
         Some(e) => target_from_entry(e, path, other_def_count),
@@ -267,6 +256,19 @@ fn find_entry_at_line(entries: &[OutlineEntry], line: u32) -> Option<&OutlineEnt
         }
     }
     best
+}
+
+/// Walk the outline tree and return the deepest entry named `name` whose
+/// `start_line == line`.
+fn find_named_at<'a>(
+    entries: &'a [OutlineEntry],
+    line: u32,
+    name: &str,
+) -> Option<&'a OutlineEntry> {
+    entries.iter().find_map(|e| {
+        find_named_at(&e.children, line, name)
+            .or_else(|| (e.start_line == line && e.name == name).then_some(e))
+    })
 }
 
 /// Walk the outline tree and return the first entry whose `start_line == line`.
@@ -317,7 +319,7 @@ fn read_delegate_content(
     if callee_file == target_path {
         Some(target_content.to_string())
     } else if std::fs::metadata(callee_file).is_ok_and(|m| m.len() <= cap) {
-        fs::read_to_string(callee_file).ok()
+        tilth_core::source::read_source(callee_file).ok()
     } else {
         None
     }
@@ -329,7 +331,10 @@ fn read_delegate_content(
 
 /// Per-section truncation caps. Defaults are strict — the point is to save context.
 #[derive(Debug, Clone, Copy)]
-#[allow(clippy::struct_field_names)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "by design: each field is a cap, and max_ names that"
+)]
 pub struct GrokCaps {
     pub max_callees: usize,
     pub max_callers: usize,
@@ -398,6 +403,10 @@ pub struct GrokResult {
     pub body: String,
     pub callees_internal: Vec<ResolvedCallee>,
     pub callees_external: Vec<String>,
+    /// Imported code files over the size limit that hold an extern
+    /// callee's name. Callee resolution does not parse them, so an extern
+    /// callee may be defined there.
+    pub callees_maybe_in: Vec<PathBuf>,
     pub callers: Vec<CallerMatch>,
     pub siblings: Vec<SiblingEntry>,
     pub tests: Vec<TestMatch>,
@@ -410,6 +419,9 @@ pub struct GrokResult {
     /// internal callee with no external callees), this holds that callee and
     /// its sliced body so the formatter can render it inline. `None` otherwise.
     pub delegate_body: Option<(ResolvedCallee, String)>,
+    /// Code files the caller walk skipped for size although they name the
+    /// target.
+    pub skipped_large: Vec<PathBuf>,
 }
 
 /// Top-level entry: resolve the spec, then gather the structural neighborhood.
@@ -419,6 +431,7 @@ pub struct GrokResult {
 /// callees walk happen against the live filesystem — they each carry their own
 /// TOCTOU window, but stitching them into one bundle is bounded by the call
 /// duration and acceptable for an interactive code-intelligence tool.
+#[expect(clippy::too_many_lines, reason = "split by responsibility in #315")]
 pub fn grok(
     target_spec: &str,
     scope: &Path,
@@ -440,6 +453,7 @@ pub fn grok(
         .filter(|n| !resolved_names.contains(n.as_str()))
         .cloned()
         .collect();
+    let callees_maybe_in = oversized_imports_holding(&target.path, &content, &externals);
 
     // The target's path may differ from canonical form (symlinks, `../` segments).
     // The walker hands us canonical absolute paths in match/callee results; we
@@ -475,20 +489,56 @@ pub fn grok(
     };
 
     // --- Callers + tests (one walk, partitioned by is_test_file) ----------
+    // Both are counted in full. The ones kept are spread across files: every
+    // file's first call site, by path, before any file's second, so a few
+    // shown callers name as many places as they can. Each file offers its
+    // first ones by line with their rank in the file, and they are merged
+    // into the running first ones as files arrive; (rank, path, line) is a
+    // total order, so the result does not depend on arrival order. Only the
+    // capped number are held at once, since each holds its file's text.
     let symbols: HashSet<String> = std::iter::once(target.name.clone()).collect();
-    let raw_callers = find_callers_batch(&symbols, scope, bloom, None, BATCH_EARLY_QUIT)?;
-
-    let prod_and_test: Vec<CallerMatch> = raw_callers
-        .into_iter()
-        .map(|(_, m)| m)
-        .filter(|m| !is_recursive_call_site(m, &canonical_target, &target))
-        .collect();
-
-    let (prod_callers, test_callers): (Vec<_>, Vec<_>) = prod_and_test
-        .into_iter()
-        .partition(|m| !is_test_file(&m.path) && !m.in_test);
-    let total_callers = prod_callers.len();
-    let total_tests = test_callers.len();
+    let spread = |a: &(usize, CallerMatch), b: &(usize, CallerMatch)| {
+        a.0.cmp(&b.0)
+            .then_with(|| a.1.path.cmp(&b.1.path))
+            .then_with(|| a.1.line.cmp(&b.1.line))
+    };
+    let split: std::sync::Mutex<CallerSplit> = std::sync::Mutex::new(CallerSplit::default());
+    let walk = find_callers_batch(&symbols, scope, bloom, None, None, |sites| {
+        let mut file = CallerSplit::default();
+        for (_, m) in sites {
+            if is_recursive_call_site(&m, &canonical_target, &target) {
+                continue;
+            }
+            if !is_test_file(&m.path) && !m.in_test {
+                if file.callers.len() < caps.max_callers {
+                    file.callers.push((file.total_callers, m));
+                }
+                file.total_callers += 1;
+            } else {
+                if file.tests.len() < caps.max_tests {
+                    file.tests.push((file.total_tests, m));
+                }
+                file.total_tests += 1;
+            }
+        }
+        let mut all = split
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        all.total_callers += file.total_callers;
+        all.total_tests += file.total_tests;
+        all.callers.extend(file.callers);
+        all.callers.sort_by(spread);
+        all.callers.truncate(caps.max_callers);
+        all.tests.extend(file.tests);
+        all.tests.sort_by(spread);
+        all.tests.truncate(caps.max_tests);
+    })?;
+    let all = split
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let total_callers = all.total_callers;
+    let total_tests = all.total_tests;
+    let prod_callers: Vec<CallerMatch> = all.callers.into_iter().map(|(_, m)| m).collect();
 
     // --- Siblings ----------------------------------------------------------
     let siblings_all = collect_siblings(&entries, &target);
@@ -507,9 +557,10 @@ pub fn grok(
     let mut siblings = siblings_all;
     siblings.truncate(caps.max_siblings);
 
-    let mut tests: Vec<TestMatch> = test_callers
+    let mut tests: Vec<TestMatch> = all
+        .tests
         .into_iter()
-        .map(|m| TestMatch {
+        .map(|(_, m)| TestMatch {
             path: m.path,
             line: m.line,
             test_name: m.calling_function,
@@ -554,7 +605,7 @@ pub fn grok(
                 &callee.file,
                 &target.path,
                 &content,
-                tilth_core::search::bloom_walk::MAX_FILE_SIZE,
+                tilth_core::source::MAX_FILE_SIZE,
             );
             callee_content.map(|cc| {
                 // Build a minimal ResolvedTarget so body_with_dedup can handle dedup.
@@ -586,6 +637,7 @@ pub fn grok(
         body,
         callees_internal,
         callees_external,
+        callees_maybe_in,
         callers,
         siblings,
         tests,
@@ -595,7 +647,22 @@ pub fn grok(
         total_siblings,
         total_tests,
         delegate_body,
+        skipped_large: walk.skipped_large,
     })
+}
+
+/// The code files `path` imports that are over the size limit and hold
+/// one of `names` as a word, each read once. Callee resolution skips such
+/// files, so a callee they define resolves nowhere and shows as extern.
+fn oversized_imports_holding(path: &Path, content: &str, names: &[String]) -> Vec<PathBuf> {
+    if names.is_empty() {
+        return Vec::new();
+    }
+    let words: Vec<&str> = names.iter().map(String::as_str).collect();
+    tilth_core::imports::resolve_related_files_with_content(path, content)
+        .into_iter()
+        .filter(|p| tilth_core::search::callers::oversized_code_holding(p, &words))
+        .collect()
 }
 
 /// Slice the target's source body out of `content`. Caps at `max_lines` total
@@ -695,6 +762,10 @@ fn slice_body(content: &str, start_line: u32, end_line: u32, max_lines: usize) -
 /// Sections are skipped when empty. Pre-truncation totals are surfaced in the
 /// section heading when capping happened (e.g. `## callers (5 of 23)`).
 #[must_use]
+#[expect(
+    clippy::too_many_lines,
+    reason = "renderers become functions of a result model in #311"
+)]
 pub fn format_grok(result: &GrokResult, scope: &Path) -> String {
     let mut out = String::new();
     let target_rel = display_rel(&result.target.path, scope);
@@ -796,6 +867,14 @@ pub fn format_grok(result: &GrokResult, scope: &Path) -> String {
         if shown < total {
             let _ = writeln!(out, "... and {} more", total - shown);
         }
+        for file in &result.callees_maybe_in {
+            let _ = writeln!(
+                out,
+                "callees may be defined in {} (over {}, not parsed)",
+                display_rel(file, scope),
+                tilth_core::source::max_file_size_label()
+            );
+        }
     }
 
     // Callers
@@ -868,6 +947,12 @@ pub fn format_grok(result: &GrokResult, scope: &Path) -> String {
         }
     }
 
+    // The walk looked for the target's bare name, whatever qualified it.
+    let held = crate::search::names_phrase([result.target.name.as_str()]);
+    if let Some(sentence) = crate::search::skipped_files_note(&result.skipped_large, &held, scope) {
+        let _ = writeln!(out, "\n\n> {sentence}");
+    }
+
     out
 }
 
@@ -913,6 +998,17 @@ fn is_self_definition(
     callee.file == canonical_target && callee.start_line == target.start_line
 }
 
+/// A target's callers split into production code and tests, counted in
+/// full, with only the first ones kept up to the grok caps. Each kept site
+/// carries its rank among its file's sites of the same kind.
+#[derive(Default)]
+struct CallerSplit {
+    total_callers: usize,
+    total_tests: usize,
+    callers: Vec<(usize, CallerMatch)>,
+    tests: Vec<(usize, CallerMatch)>,
+}
+
 /// Is this caller match a recursive call from inside the target's own body?
 /// Both the call site and the enclosing function must match the target.
 fn is_recursive_call_site(
@@ -923,10 +1019,13 @@ fn is_recursive_call_site(
     // Edge case: a legitimately distinct same-named call site nested inside the
     // target body (e.g. a recursive closure with the same name) would also be
     // filtered here. Acceptable tradeoff — true self-recursion is the common case.
-    m.path == canonical_target
+    // The walker's paths keep the scope's spelling, which is the target's
+    // own path when the scope sits behind a symlink. The label carries the
+    // owner (`Walker.walk`); the target's name does not.
+    (m.path == canonical_target || m.path == target.path)
         && m.line >= target.start_line
         && m.line <= target.end_line
-        && m.calling_function == target.name
+        && tilth_core::search::scope::split_qualified(&m.calling_function).1 == target.name
 }
 
 /// Collect siblings of the target: peer methods if the target is a method,
@@ -941,14 +1040,10 @@ fn collect_siblings(entries: &[OutlineEntry], target: &ResolvedTarget) -> Vec<Si
             .any(|c| c.start_line == target.start_line && c.name == target.name)
     });
 
-    let candidates: Vec<&OutlineEntry> = if let Some(p) = parent {
-        p.children.iter().collect()
-    } else {
-        entries.iter().collect()
-    };
+    let candidates = parent.map_or(entries, |p| p.children.as_slice());
 
     let mut out: Vec<SiblingEntry> = candidates
-        .into_iter()
+        .iter()
         .filter(|e| !matches!(e.kind, OutlineKind::Import | OutlineKind::Export))
         .filter(|e| !(e.start_line == target.start_line && e.name == target.name))
         .map(|e| SiblingEntry {
@@ -1046,54 +1141,288 @@ mod tests {
         );
     }
 
-    // -- split_qualified ---------------------------------------------------
+    // -- qualified names ---------------------------------------------------
 
-    #[test]
-    fn split_qualified_double_colon() {
-        assert_eq!(split_qualified("Type::method"), "method");
+    fn grok_target(dir: &Path, spec: &str) -> Result<ResolvedTarget, TilthError> {
+        let bloom = BloomFilterCache::default();
+        let session = crate::session::Session::default();
+        grok(spec, dir, &bloom, &session, GrokCaps::default()).map(|r| r.target)
     }
 
+    /// A qualified target resolves to the definition its owner holds, with
+    /// either separator, and not to another owner's definition of the name.
     #[test]
-    fn split_qualified_dot() {
-        assert_eq!(split_qualified("Type.method"), "method");
+    fn grok_resolves_a_qualified_name_by_its_owner() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fixture(
+            tmp.path(),
+            "m.rs",
+            "pub struct A;\npub struct B;\nimpl A {\n    pub fn run(&self) {}\n}\nimpl B {\n    pub fn run(&self) {}\n}\n",
+        );
+        write_fixture(
+            tmp.path(),
+            "q.ts",
+            "class Target { foo() { return 1; } }\nclass Other { foo() { return 2; } }\n",
+        );
+        write_fixture(
+            tmp.path(),
+            "store.py",
+            "class Store:\n    def get(self, key):\n        return key\n\nclass Cache:\n    def get(self, key):\n        return 1\n",
+        );
+        write_fixture(
+            tmp.path(),
+            "render.go",
+            "package render\n\nfunc (r JSON) Render() error { return nil }\n\nfunc (r XML) Render() error { return nil }\n",
+        );
+        for (spec, file, line, name) in [
+            ("B::run", "m.rs", 7, "run"),
+            ("B.run", "m.rs", 7, "run"),
+            ("A::run", "m.rs", 4, "run"),
+            ("Other.foo", "q.ts", 2, "foo"),
+            ("Target.foo", "q.ts", 1, "foo"),
+            ("Cache.get", "store.py", 6, "get"),
+            ("XML.Render", "render.go", 5, "Render"),
+        ] {
+            let target = grok_target(tmp.path(), spec).unwrap();
+            assert_eq!(
+                (
+                    target.path.file_name().unwrap().to_str().unwrap(),
+                    target.start_line,
+                    target.name.as_str()
+                ),
+                (file, line, name),
+                "{spec}"
+            );
+            assert_eq!(target.other_def_count, 0, "{spec} has one definition");
+        }
     }
 
+    /// A qualifier naming a package, a module or `Self`/`self`/`this` finds
+    /// the definition by its name, as grok's bare-name retry did before
+    /// #296, and an Elixir dotted module is found by its full name.
     #[test]
-    fn split_qualified_multi_segment_double_colon() {
-        // Only the trailing segment matters — the retry is bounded to one hop.
-        assert_eq!(split_qualified("a::b::method"), "method");
+    fn grok_resolves_names_qualified_by_a_module_or_self() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fixture(
+            tmp.path(),
+            "gin.go",
+            "package gin\n\nfunc New() int {\n\treturn 1\n}\n",
+        );
+        write_fixture(
+            tmp.path(),
+            "runner.rs",
+            "pub struct Runner;\nimpl Runner {\n    pub fn new() -> Self {\n        Runner\n    }\n    pub fn run(&self) {}\n}\n",
+        );
+        write_fixture(tmp.path(), "symbol.rs", "pub fn search() {}\n");
+        write_fixture(
+            tmp.path(),
+            "accounts.ex",
+            "defmodule MyApp.Accounts do\n  def get_user(id), do: id\nend\n",
+        );
+        for (spec, file, line) in [
+            ("gin.New", "gin.go", 3),
+            ("Self::new", "runner.rs", 3),
+            ("self.run", "runner.rs", 6),
+            ("crate::search::symbol::search", "symbol.rs", 1),
+            ("MyApp.Accounts", "accounts.ex", 1),
+            ("MyApp.Accounts.get_user", "accounts.ex", 2),
+        ] {
+            let target = grok_target(tmp.path(), spec).unwrap_or_else(|e| panic!("{spec}: {e}"));
+            assert_eq!(
+                (
+                    target.path.file_name().unwrap().to_str().unwrap(),
+                    target.start_line
+                ),
+                (file, line),
+                "{spec}"
+            );
+        }
     }
 
+    /// grok and search mark an expanded definition in the session under one
+    /// line, so each shows the other's body as shown earlier. A definition
+    /// whose annotations, decorators or return type sit above its name line
+    /// was marked under two lines and inlined twice.
     #[test]
-    fn split_qualified_no_separator_is_identity() {
-        assert_eq!(split_qualified("method"), "method");
+    fn grok_and_search_share_the_expansion_of_an_annotated_definition() {
+        // Twenty lines in each body, past the length grok degrades on repeat.
+        let lines = |indent: &str, end: &str| -> String {
+            (0..20).fold(String::new(), |mut out, i| {
+                let _ = writeln!(out, "{indent}v{i} = {i}{end}");
+                out
+            })
+        };
+        let body = lines("        int ", ";");
+        let java = format!("class Svc {{\n    @Override\n    public String run() {{\n{body}        return \"x\";\n    }}\n}}\n");
+        let py_body = lines("    ", "");
+        let py = format!("@app.get(\"/r\")\ndef route():\n{py_body}    return 1\n");
+        let c_body = lines("  int ", ";");
+        let c = format!("static int\nrun_c(void)\n{{\n{c_body}  return 0;\n}}\n");
+        for (file, fixture, query) in [
+            ("Svc.java", java.as_str(), "run"),
+            ("app.py", py.as_str(), "route"),
+            ("r.c", c.as_str(), "run_c"),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            write_fixture(tmp.path(), file, fixture);
+            let bloom = BloomFilterCache::default();
+            let cache = tilth_core::cache::OutlineCache::new();
+            let search = |session: &crate::session::Session| {
+                crate::search::search_symbol_expanded(
+                    query,
+                    tmp.path(),
+                    &cache,
+                    session,
+                    &bloom,
+                    1,
+                    None,
+                    None,
+                    false,
+                    None,
+                )
+                .unwrap()
+            };
+
+            let session = crate::session::Session::default();
+            grok(query, tmp.path(), &bloom, &session, GrokCaps::default()).unwrap();
+            let out = search(&session);
+            assert!(
+                out.contains("[shown earlier]"),
+                "{file}: grok, then search: {out}"
+            );
+
+            let session = crate::session::Session::default();
+            search(&session);
+            let again = grok(query, tmp.path(), &bloom, &session, GrokCaps::default()).unwrap();
+            assert!(
+                again.body.contains("body shown earlier"),
+                "{file}: search, then grok: {}",
+                again.body
+            );
+        }
     }
 
+    /// A qualified target whose owner holds no definition of the name is not
+    /// found, and the error names the definitions there are.
     #[test]
-    fn split_qualified_trailing_separator_yields_empty() {
-        // `rfind` matches the last char in the string; the caller (`resolve_by_name`)
-        // guards on `!bare.is_empty()` so this never triggers a second lookup.
-        assert_eq!(split_qualified("Type::"), "");
-        assert_eq!(split_qualified("Type."), "");
+    fn grok_names_the_owners_when_the_qualifier_matches_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fixture(
+            tmp.path(),
+            "m.rs",
+            "pub struct A;\nimpl A {\n    pub fn run(&self) {}\n}\npub fn run() {}\n",
+        );
+        match grok_target(tmp.path(), "Gamma::run").unwrap_err() {
+            TilthError::NotFound { path, suggestion } => {
+                assert_eq!(path, PathBuf::from("Gamma::run"));
+                assert_eq!(suggestion.as_deref(), Some("A::run (m.rs:3), run (m.rs:5)"));
+            }
+            other => panic!("expected NotFound, got {other}"),
+        }
     }
 
+    /// `path:line` on a decorator or attribute line resolves to the
+    /// definition it decorates, not to the class or module around it.
     #[test]
-    fn split_qualified_mixed_separators_uses_rightmost() {
-        // `rfind` scans for either separator and takes the last match overall,
-        // not the last match of a single separator kind.
-        assert_eq!(split_qualified("a.b::method"), "method");
-        assert_eq!(split_qualified("a::b.method"), "method");
+    fn grok_path_line_on_a_decorator_resolves_to_the_decorated_definition() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ts = write_fixture(
+            tmp.path(),
+            "service.ts",
+            "@Injectable()\nclass Service {\n  @First()\n  @Second()\n  method() {\n    return 1;\n  }\n}\n",
+        );
+        let py = write_fixture(
+            tmp.path(),
+            "s.py",
+            "class S:\n    @property\n    @other\n    def run(self):\n        return 1\n",
+        );
+        let rs = write_fixture(
+            tmp.path(),
+            "t.rs",
+            "mod t {\n    #[test]\n    #[ignore]\n    fn case() {\n        go();\n    }\n}\n",
+        );
+        for (path, line, name) in [
+            (&ts, 1, "Service"),
+            (&ts, 3, "method"),
+            (&ts, 4, "method"),
+            (&py, 2, "run"),
+            (&py, 3, "run"),
+            (&rs, 2, "case"),
+            (&rs, 3, "case"),
+        ] {
+            let (target, _, _) = resolve_by_path_line(path, line).unwrap();
+            assert_eq!(target.name, name, "{}:{line}", path.display());
+        }
     }
 
+    /// A recursive method call is the method calling itself, not a caller,
+    /// though its label carries the owner (`Walker.walk`).
     #[test]
-    fn split_qualified_non_ascii_byte_boundary_safe() {
-        // The separator search is byte-based (`rfind` over `[':', '.']`, both
-        // single-byte ASCII), so slicing at `idx + 1` always lands on a UTF-8
-        // char boundary even when the segments themselves are multi-byte.
-        assert_eq!(split_qualified("café::méthode"), "méthode");
-        assert_eq!(split_qualified("类型.方法"), "方法");
-        // No separator at all — identity, and no panic on multi-byte input.
-        assert_eq!(split_qualified("メソッド"), "メソッド");
+    fn grok_does_not_list_a_recursive_method_as_its_own_caller() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fixture(
+            tmp.path(),
+            "w.ts",
+            "class Walker {\n  walk(n: number): number {\n    return n ? this.walk(n - 1) : 0;\n  }\n}\n\
+             export function start(w: Walker) { return w.walk(3); }\n",
+        );
+        let bloom = BloomFilterCache::default();
+        let session = crate::session::Session::default();
+        let result = grok(
+            "Walker.walk",
+            tmp.path(),
+            &bloom,
+            &session,
+            GrokCaps::default(),
+        )
+        .unwrap();
+        let callers: Vec<&str> = result
+            .callers
+            .iter()
+            .map(|c| c.calling_function.as_str())
+            .collect();
+        assert_eq!(callers, ["start"]);
+        assert_eq!(result.total_callers, 1);
+    }
+
+    /// Many callers in test files fill the tests section; the callers section
+    /// still lists the production callers.
+    #[test]
+    fn grok_keeps_its_callers_when_test_callers_outnumber_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fixture(
+            tmp.path(),
+            "src/lib.rs",
+            "pub fn target_fn() -> u32 { 1 }\n",
+        );
+        let mut prod = String::new();
+        for i in 0..75 {
+            let _ = writeln!(prod, "pub fn c{i}() -> u32 {{ target_fn() }}");
+        }
+        write_fixture(tmp.path(), "src/callers.rs", &prod);
+        let mut tests = String::new();
+        for i in 0..65 {
+            let _ = writeln!(
+                tests,
+                "#[test]\nfn t{i}() {{ assert_eq!(target_fn(), 1); }}"
+            );
+        }
+        write_fixture(tmp.path(), "src/cases_test.rs", &tests);
+        let bloom = BloomFilterCache::default();
+        let session = crate::session::Session::default();
+        let result = grok(
+            "target_fn",
+            tmp.path(),
+            &bloom,
+            &session,
+            GrokCaps::default(),
+        )
+        .unwrap();
+        assert_eq!((result.callers.len(), result.total_callers), (5, 75));
+        assert_eq!((result.tests.len(), result.total_tests), (8, 65));
+        let text = format_grok(&result, tmp.path());
+        assert!(text.contains("## callers (5 of 75)"), "{text}");
+        assert!(text.contains("## tests (8 of 65)"), "{text}");
     }
 
     // -- find_entry_at_line ----------------------------------------------
@@ -1165,6 +1494,38 @@ mod tests {
         let mut f = fs::File::create(&path).unwrap();
         f.write_all(body.as_bytes()).unwrap();
         path
+    }
+
+    /// A Markdown heading that names the symbol counts as a definition in
+    /// search, but it is no rival for grok to pick: only code definitions
+    /// make the target ambiguous.
+    #[test]
+    fn doc_headings_do_not_make_a_target_ambiguous() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fixture(
+            tmp.path(),
+            "lib.rs",
+            "pub fn render_page() -> u32 {\n    1\n}\n",
+        );
+        write_fixture(
+            tmp.path(),
+            "README.md",
+            "# Docs\n\n## render_page\n\nText.\n",
+        );
+        write_fixture(
+            tmp.path(),
+            "GUIDE.md",
+            "# More\n\n## render_page\n\nMore.\n",
+        );
+        let target = grok_target(tmp.path(), "render_page").unwrap();
+        assert_eq!(target.other_def_count, 0);
+        write_fixture(
+            tmp.path(),
+            "other.rs",
+            "pub fn render_page() -> u32 {\n    2\n}\n",
+        );
+        let target = grok_target(tmp.path(), "render_page").unwrap();
+        assert_eq!(target.other_def_count, 1);
     }
 
     #[test]
@@ -1529,6 +1890,49 @@ pub fn caller_fn() {
         assert_eq!(caller_names, ["caller_fn"]);
     }
 
+    /// The caller walk quit at 50 call sites, so grok's caller total was
+    /// wherever the threads stopped, and the callers shown changed between
+    /// runs. 60 files with two callers each: the total is exact, and the five
+    /// shown name five files, the same five every run.
+    #[test]
+    fn grok_caller_totals_are_exact_and_spread_across_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fixture(tmp.path(), "src/lib.rs", "pub fn target_fn() {}\n");
+        for i in 0..60 {
+            write_fixture(
+                tmp.path(),
+                &format!("src/c{i:02}.rs"),
+                &format!("pub fn a{i}() {{ target_fn(); }}\npub fn b{i}() {{ target_fn(); }}\n"),
+            );
+        }
+        let bloom = BloomFilterCache::default();
+        let run = || {
+            let session = crate::session::Session::default();
+            grok(
+                "target_fn",
+                tmp.path(),
+                &bloom,
+                &session,
+                GrokCaps::default(),
+            )
+            .unwrap()
+        };
+        let first = run();
+        assert_eq!(first.total_callers, 120);
+        let shown = |r: &GrokResult| -> Vec<String> {
+            r.callers
+                .iter()
+                .map(|c| c.calling_function.clone())
+                .collect()
+        };
+        assert_eq!(shown(&first), ["a0", "a1", "a2", "a3", "a4"]);
+        for _ in 0..3 {
+            let again = run();
+            assert_eq!(again.total_callers, 120);
+            assert_eq!(shown(&again), shown(&first));
+        }
+    }
+
     /// Rust tests live in `tests/` and in `#[test]` functions, not in
     /// `.test.`/`.spec.` files: both are tests, not callers.
     #[test]
@@ -1635,6 +2039,7 @@ pub fn target() {
             body: String::new(),
             callees_internal: Vec::new(),
             callees_external: Vec::new(),
+            callees_maybe_in: Vec::new(),
             callers: Vec::new(),
             siblings: Vec::new(),
             tests: Vec::new(),
@@ -1644,6 +2049,7 @@ pub fn target() {
             total_siblings: 0,
             total_tests: 0,
             delegate_body: None,
+            skipped_large: Vec::new(),
         };
         let out = format_grok(&result, Path::new("."));
         assert!(out.contains("ambiguous: 3 other definitions match"));
@@ -1667,6 +2073,7 @@ pub fn target() {
             body: String::new(),
             callees_internal: Vec::new(),
             callees_external: Vec::new(),
+            callees_maybe_in: Vec::new(),
             callers: Vec::new(),
             siblings: vec![SiblingEntry {
                 name: "peer".into(),
@@ -1682,6 +2089,7 @@ pub fn target() {
             total_siblings: 17,
             total_tests: 0,
             delegate_body: None,
+            skipped_large: Vec::new(),
         };
         let out = format_grok(&result, Path::new("."));
         assert!(out.contains("... and 16 more"));
@@ -2308,5 +2716,95 @@ impl OutlineCache {
                 "{name}: expected NewServer among siblings, got {sibling_names:?}"
             );
         }
+    }
+
+    fn assert_test_callers(fixtures: [(&str, &str); 3]) {
+        let tmp = tempfile::tempdir().unwrap();
+        for (path, source) in fixtures {
+            write_fixture(tmp.path(), path, source);
+        }
+        let bloom = BloomFilterCache::default();
+        let session = crate::session::Session::default();
+        let result = grok("target", tmp.path(), &bloom, &session, GrokCaps::default()).unwrap();
+        assert_eq!(result.total_callers, 1);
+        assert_eq!(result.total_tests, 1);
+        assert!(result.callers[0].path.ends_with(fixtures[1].0));
+        assert!(result.tests[0].path.ends_with(fixtures[2].0));
+    }
+
+    #[test]
+    fn grok_recognizes_go_test_callers() {
+        assert_test_callers([
+            ("main.go", "package example\nfunc target() {}\n"),
+            (
+                "test_support.go",
+                "package example\nfunc caller() { target() }\n",
+            ),
+            (
+                "main_test.go",
+                "package example\nfunc TestTarget() { target() }\n",
+            ),
+        ]);
+    }
+
+    #[test]
+    fn grok_recognizes_python_test_callers() {
+        assert_test_callers([
+            ("main.py", "def target():\n    pass\n"),
+            ("test_support/worker.py", "def caller():\n    target()\n"),
+            ("test_main.py", "def test_target():\n    target()\n"),
+        ]);
+    }
+
+    /// Every unresolved callee whose name a big imported file held was
+    /// pinned on that file, so `log` was "defined" in `big.js`. Callees
+    /// stay extern, and the block names once each big imported file that
+    /// holds one of their names: they may be defined there.
+    #[test]
+    fn an_imported_file_over_the_size_limit_is_named_under_the_callees() {
+        let tmp = tempfile::tempdir().unwrap();
+        let limit = usize::try_from(tilth_core::source::MAX_FILE_SIZE).unwrap();
+        let filler = "// padding line to push the file over the size limit\n";
+        let pad = filler.repeat(limit / filler.len() + 1);
+        write_fixture(
+            tmp.path(),
+            "big.js",
+            &format!("export function bigHelper(x) {{ log(x); return x; }}\n{pad}"),
+        );
+        write_fixture(tmp.path(), "unused.js", &pad);
+        write_fixture(
+            tmp.path(),
+            "small.js",
+            "export function small(x) { return x; }\n",
+        );
+        write_fixture(
+            tmp.path(),
+            "a.js",
+            "import { bigHelper } from './big';\nimport { small } from './small';\n\
+             import './unused';\n\
+             export function target() {\n  log(1);\n  return bigHelper(small(1)) + outside(2);\n}\n",
+        );
+        let bloom = BloomFilterCache::default();
+        let session = crate::session::Session::default();
+        let result = grok("target", tmp.path(), &bloom, &session, GrokCaps::default()).unwrap();
+        let rendered = format_grok(&result, tmp.path());
+        assert!(
+            rendered.contains("## callees (1 internal, 3 extern)"),
+            "{rendered}"
+        );
+        for name in ["bigHelper", "log", "outside"] {
+            assert!(
+                rendered.contains(&format!("{name:<20} extern")),
+                "{rendered}"
+            );
+        }
+        assert_eq!(
+            rendered
+                .matches("callees may be defined in big.js (over 500 KB, not parsed)")
+                .count(),
+            1,
+            "{rendered}"
+        );
+        assert!(!rendered.contains("unused.js"), "{rendered}");
     }
 }

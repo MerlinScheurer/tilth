@@ -14,7 +14,6 @@ pub mod truncate;
 
 use std::collections::HashSet;
 use std::fmt::Write;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -30,6 +29,75 @@ use crate::format::rel;
 
 const EXPAND_FULL_FILE_THRESHOLD: u64 = 800;
 
+#[derive(Debug)]
+struct Expansion {
+    path: PathBuf,
+    line: u32,
+    mtime: SystemTime,
+    end: usize,
+}
+
+/// Preserve dedup within the response without updating the shared session
+/// until the final budget is known.
+struct RenderSession<'a> {
+    previous: Option<&'a Session>,
+    staged: HashSet<(PathBuf, u32, SystemTime)>,
+}
+
+impl<'a> RenderSession<'a> {
+    fn new(previous: Option<&'a Session>) -> Self {
+        Self {
+            previous,
+            staged: HashSet::new(),
+        }
+    }
+
+    fn is_expanded(&self, path: &Path, line: u32, mtime: SystemTime) -> bool {
+        self.previous
+            .is_some_and(|session| session.is_expanded(path, line, mtime))
+            || self.staged.contains(&(path.to_path_buf(), line, mtime))
+    }
+}
+
+/// Record only definitions whose closing fence survives the final position
+/// cut. The caller uses the same prefix when it applies the response budget.
+fn record_visible_expansions(
+    session: &Session,
+    output: &str,
+    budget: Option<u64>,
+    expansions: impl IntoIterator<Item = Expansion>,
+) {
+    let end = budget.map_or(output.len(), |tokens| {
+        crate::budget::retained_prefix_len(output, tokens)
+    });
+    for expansion in expansions {
+        if expansion.end <= end {
+            session.record_expand(&expansion.path, expansion.line, expansion.mtime);
+        }
+    }
+}
+
+/// The line a definition's expansion is marked under in the session, which
+/// grok marks too: the first line of the definition's own node, where its
+/// outline entry starts. That is `start`, the first line of its range,
+/// unless decorators beside the node open the range (a Python decorator, a
+/// TypeScript member's, a Rust attribute).
+fn expansion_line(m: &Match, start: u32) -> u32 {
+    if start == m.line {
+        return start;
+    }
+    let decorated = || {
+        let content = tilth_core::source::read_source(&m.path).ok()?;
+        let FileType::Code(lang) =
+            tilth_core::lang::detect_file_type_with_content(&m.path, &content)
+        else {
+            return None;
+        };
+        tilth_core::lang::treesitter::decorated_definition_line(&content, lang, start)
+    };
+    decorated().unwrap_or(start)
+}
+
 /// Cap for inlined markdown section bodies in the default preview slot.
 /// Long sections get a tail "… (N more lines — pass --expand to see the full
 /// section)" so the user knows to expand for the rest.
@@ -44,22 +112,173 @@ fn parse_pattern(query: &str) -> (&str, bool) {
     }
 }
 
-/// Get `file_lines` estimate and mtime from metadata. One `stat()` per file.
-pub(crate) fn file_metadata(path: &Path) -> (u32, SystemTime) {
-    match std::fs::metadata(path) {
-        Ok(meta) => {
-            let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-            let est_lines = (meta.len() / 40).max(1) as u32;
-            (est_lines, mtime)
-        }
-        Err(_) => (0, SystemTime::UNIX_EPOCH),
+/// Does a file over the size limit hold a match of `check`? The walkers
+/// skip such a file without parsing it, and this check is what lets the
+/// result name it instead of leaving it out in silence. It streams the
+/// file through [`tilth_core::source::file_holds`]. `check` comes from
+/// [`size_check_matcher`], so it matches within a line, as the line search
+/// does; a match longer than `REGEX_OVERLAP` across a window's cut is not
+/// seen.
+pub(crate) fn oversized_holds(path: &Path, check: &grep_regex::RegexMatcher) -> bool {
+    use grep_matcher::Matcher as _;
+    tilth_core::source::file_holds(path, REGEX_OVERLAP, |window, from| {
+        let found = check.find_at(window, from).ok().flatten()?;
+        Some(found.start()..found.end())
+    })
+}
+
+/// The longest regex match the size check finds across a window's cut.
+const REGEX_OVERLAP: usize = 64 << 10;
+
+/// `pattern` as the size check runs it: over a window of many lines, with
+/// `^` and `$` at each line's ends and no match across a newline, which is
+/// how the line search reads it. `None` when the pattern needs a newline,
+/// which no line holds.
+pub(crate) fn size_check_matcher(pattern: &str) -> Option<grep_regex::RegexMatcher> {
+    grep_regex::RegexMatcherBuilder::new()
+        .multi_line(true)
+        .line_terminator(Some(b'\n'))
+        .build(pattern)
+        .ok()
+}
+
+/// Add `path` to a walker's shared list.
+pub(crate) fn record(list: &std::sync::Mutex<Vec<PathBuf>>, path: &Path) {
+    list.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(path.to_path_buf());
+}
+
+/// A walker's shared list, taken and sorted so the output does not depend on
+/// thread timing.
+pub(crate) fn sorted(list: std::sync::Mutex<Vec<PathBuf>>) -> Vec<PathBuf> {
+    let mut paths = list
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    paths.sort();
+    paths
+}
+
+/// The notes under a result: where else a qualified name is defined, and
+/// the files the walk skipped for size although they hold what it looked
+/// for. Empty when there is nothing to say.
+fn skipped_large_note(result: &SearchResult) -> String {
+    let mut note = other_owners_note(result);
+    let held = names_phrase([result.skipped_for.as_str()]);
+    if let Some(skipped) = skipped_files_note(&result.skipped_large, &held, &result.scope) {
+        note.push_str("\n\n> ");
+        note.push_str(&skipped);
+    }
+    note
+}
+
+/// The note for a qualified query whose owner holds no definition of the
+/// name: where the name is defined instead. Empty when there is nothing to
+/// say.
+fn other_owners_note(result: &SearchResult) -> String {
+    let (Some(owner), name) = tilth_core::search::scope::split_qualified(&result.query) else {
+        return String::new();
+    };
+    // Only free definitions of the name: the qualifier is no type that holds
+    // the wrong one (`res` in `res.send` is a variable), so there is no
+    // owner to correct.
+    if result.other_owners.iter().all(|o| o.owner.is_none()) {
+        return String::new();
+    }
+    format!(
+        "\n\n> No `{name}` is defined in `{owner}`. Definitions of `{name}`: {}",
+        owner_candidates(&result.query, &result.other_owners, &result.scope)
+    )
+}
+
+/// The definitions in `others`, each written as the qualified name the
+/// query's own separator would give it, with its place: `A::run (m.rs:3)`,
+/// or `run (m.rs:5)` for one at the top level. The first five are listed.
+pub(crate) fn owner_candidates(
+    query: &str,
+    others: &[crate::types::OtherOwner],
+    scope: &Path,
+) -> String {
+    const SHOWN: usize = 5;
+    let name = tilth_core::search::scope::split_qualified(query).1;
+    let sep = if query.ends_with(&format!("::{name}")) {
+        "::"
+    } else {
+        "."
+    };
+    let mut listed: Vec<String> = others
+        .iter()
+        .take(SHOWN)
+        .map(|o| {
+            let place = format!("{}:{}", rel(&o.path, scope), o.line);
+            o.owner.as_ref().map_or_else(
+                || format!("{name} ({place})"),
+                |owner| format!("{owner}{sep}{name} ({place})"),
+            )
+        })
+        .collect();
+    if others.len() > SHOWN {
+        listed.push(format!("and {} more", others.len() - SHOWN));
+    }
+    listed.join(", ")
+}
+
+/// The sentence that names the files a walk skipped for size although they
+/// contain `held`, relative to `scope`: "1 file over 500 KB contains `run`
+/// and was not searched: big.rs". `None` when there are none. Each caller
+/// sets the sentence in its own output.
+pub(crate) fn skipped_files_note(skipped: &[PathBuf], held: &str, scope: &Path) -> Option<String> {
+    const SHOWN: usize = 5;
+    if skipped.is_empty() {
+        return None;
+    }
+    let mut files: Vec<String> = skipped.iter().take(SHOWN).map(|p| rel(p, scope)).collect();
+    if skipped.len() > SHOWN {
+        files.push(format!("and {} more", skipped.len() - SHOWN));
+    }
+    let (count, contains, was) = match skipped.len() {
+        1 => ("1 file".to_string(), "contains", "was"),
+        n => (format!("{n} files"), "contain", "were"),
+    };
+    Some(format!(
+        "{count} over {} {contains} {held} and {was} not searched: {}",
+        tilth_core::source::max_file_size_label(),
+        files.join(", ")
+    ))
+}
+
+/// `names`, sorted, as a phrase in backticks: "`a`", "`a` or `b`",
+/// "`a`, `b` or `c`", and past three, "`a`, `b`, `c` or 2 other names".
+pub(crate) fn names_phrase<'a>(names: impl IntoIterator<Item = &'a str>) -> String {
+    const SHOWN: usize = 3;
+    let mut names: Vec<&str> = names.into_iter().collect();
+    names.sort_unstable();
+    names.dedup();
+    let mut quoted: Vec<String> = names.iter().take(SHOWN).map(|n| format!("`{n}`")).collect();
+    let last = match names.len().saturating_sub(SHOWN) {
+        0 => quoted.pop(),
+        1 => Some("1 other name".to_string()),
+        others => Some(format!("{others} other names")),
+    };
+    match last {
+        Some(last) if quoted.is_empty() => last,
+        Some(last) => format!("{} or {last}", quoted.join(", ")),
+        None => String::new(),
     }
 }
 
+/// Get `file_lines` estimate and mtime from metadata. One `stat()` per file.
+pub(crate) fn file_metadata(path: &Path) -> (u32, SystemTime) {
+    std::fs::metadata(path).map_or((0, SystemTime::UNIX_EPOCH), |meta| {
+        let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+        let est_lines = (meta.len() / 40).max(1) as u32;
+        (est_lines, mtime)
+    })
+}
+
 /// Dispatch search by query type. `full` is the caller's `--full`, with the
-/// same meaning here and in the five siblings below: it raises both the match
-/// cap and the walker's early-quit thresholds, so the reported totals move as
-/// well as the number of matches shown.
+/// same meaning here and in the five siblings below: it raises the match cap.
+/// The totals are exact either way.
 pub fn search_symbol(
     query: &str,
     scope: &Path,
@@ -72,6 +291,10 @@ pub fn search_symbol(
     format_search_result(&result, cache, None, &bloom, 0, None)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "per-call options become one Request in #307"
+)]
 pub fn search_symbol_expanded(
     query: &str,
     scope: &Path,
@@ -88,6 +311,10 @@ pub fn search_symbol_expanded(
     format_search_result(&result, cache, Some(session), bloom, expand, budget)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "per-call options become one Request in #307"
+)]
 pub fn search_multi_symbol_expanded(
     queries: &[&str],
     scope: &Path,
@@ -108,7 +335,9 @@ pub fn search_multi_symbol_expanded(
         expand.max(queries.len())
     };
     let mut expanded_files = HashSet::new();
-    let mut sections = Vec::with_capacity(queries.len());
+    let mut render_session = RenderSession::new(Some(session));
+    let mut combined = String::new();
+    let mut expansions = Vec::new();
 
     for query in queries {
         let result = symbol::search(query, scope, context, glob, full)?;
@@ -120,12 +349,12 @@ pub fn search_multi_symbol_expanded(
             result.definitions,
             result.usages,
         );
-        let mut segments: Vec<(i64, usize, usize)> = Vec::new();
+        let mut segments: Vec<alloc::Block> = Vec::new();
         format_matches(
             &result.matches,
             &result.scope,
             cache,
-            Some(session),
+            &mut render_session,
             bloom,
             &mut expand_remaining,
             &mut expanded_files,
@@ -139,14 +368,25 @@ pub fn search_multi_symbol_expanded(
                 "\n\n... and {omitted} more matches. Narrow with scope."
             );
         }
+        out.push_str(&skipped_large_note(&result));
         // budget.unwrap_or(DEFAULT_BUDGET): keeps the no-budget path byte-
         // identical to before this fix (see format_search_result's own comment).
         let budget_tokens = budget.unwrap_or(crate::budget::DEFAULT_BUDGET);
-        out = crate::search::alloc::fit_to_budget(&out, &segments, budget_tokens);
-        sections.push(out);
+        out = alloc::fit_to_budget(&out, &mut segments, budget_tokens);
+        if !combined.is_empty() {
+            combined.push_str("\n\n---\n");
+        }
+        let offset = combined.len();
+        expansions.extend(segments.into_iter().filter_map(|block| {
+            let mut expansion = block.expansion?;
+            expansion.end += offset;
+            Some(expansion)
+        }));
+        combined.push_str(&out);
     }
 
-    Ok(sections.join("\n\n---\n"))
+    record_visible_expansions(session, &combined, budget, expansions);
+    Ok(combined)
 }
 
 pub fn search_content(
@@ -174,6 +414,10 @@ pub fn search_regex(
     format_search_result(&result, cache, None, &bloom, 0, None)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "per-call options become one Request in #307"
+)]
 pub fn search_content_expanded(
     query: &str,
     scope: &Path,
@@ -192,6 +436,10 @@ pub fn search_content_expanded(
 }
 
 /// Expanded regex search — takes raw pattern, no slash wrapping needed.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "per-call options become one Request in #307"
+)]
 pub fn search_regex_expanded(
     pattern: &str,
     scope: &Path,
@@ -278,16 +526,20 @@ fn write_hidden_tail(out: &mut String, shown: usize, total: usize, kind: &str) {
 /// Format match entries with optional expansion.
 /// Groups consecutive usage matches in the same enclosing function to reduce token noise.
 /// Shared expand state enables cross-query dedup in multi-symbol search.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "renderers become functions of a result model in #311"
+)]
 fn format_matches(
     matches: &[Match],
     scope: &Path,
     cache: &OutlineCache,
-    session: Option<&Session>,
+    session: &mut RenderSession<'_>,
     bloom: &tilth_core::index::bloom::BloomFilterCache,
     expand_remaining: &mut usize,
     expanded_files: &mut HashSet<PathBuf>,
     out: &mut String,
-    segments: &mut Vec<(i64, usize, usize)>,
+    segments: &mut Vec<alloc::Block>,
 ) {
     // Multi-file: one expand per unique file. Single-file: sequential per-match.
     // expanded_files may contain entries from prior queries (cross-query dedup).
@@ -303,7 +555,7 @@ fn format_matches(
         if group.len() == 1 {
             // Single match — format as before
             let start = out.len();
-            format_single_match(
+            let (body_start, expansion) = format_single_match(
                 group[0],
                 scope,
                 cache,
@@ -314,7 +566,13 @@ fn format_matches(
                 multi_file,
                 out,
             );
-            segments.push((i64::from(group[0].def_weight), start, out.len()));
+            segments.push(alloc::Block {
+                value: i64::from(group[0].def_weight),
+                start,
+                body_start,
+                end: out.len(),
+                expansion,
+            });
         } else {
             // Multiple usages collapsed into one entry
             let start = out.len();
@@ -324,7 +582,13 @@ fn format_matches(
                 .map(|m| i64::from(m.def_weight))
                 .max()
                 .unwrap_or(0);
-            segments.push((value, start, out.len()));
+            segments.push(alloc::Block {
+                value,
+                start,
+                body_start: out.len(),
+                end: out.len(),
+                expansion: None,
+            });
         }
     }
 }
@@ -457,17 +721,22 @@ fn boost_query(m: &Match) -> Option<&str> {
 }
 
 /// Format a single match entry (unchanged from original behavior).
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "renderers become functions of a result model in #311"
+)]
 fn format_single_match(
     m: &Match,
     scope: &Path,
     cache: &OutlineCache,
-    session: Option<&Session>,
+    session: &mut RenderSession<'_>,
     bloom: &tilth_core::index::bloom::BloomFilterCache,
     expand_remaining: &mut usize,
     expanded_files: &mut HashSet<PathBuf>,
     multi_file: bool,
     out: &mut String,
-) {
+) -> (usize, Option<Expansion>) {
     let kind = if m.impl_target.is_some() {
         "impl"
     } else if m.is_definition {
@@ -517,7 +786,7 @@ fn format_single_match(
     // the existing outline / single-line preview branches.
     if m.is_definition && m.def_weight == 30 {
         if let Some((heading_line_1, section_end_1)) = m.def_range {
-            if let Ok(content) = fs::read_to_string(&m.path) {
+            if let Ok(content) = tilth_core::source::read_source(&m.path) {
                 let lines: Vec<&str> = content.lines().collect();
                 // def_range is `(heading_line, section_end)` in 1-indexed
                 // inclusive form (see `find_defs_markdown_buf`). The body
@@ -540,7 +809,7 @@ fn format_single_match(
                             "… ({truncated} more lines — pass --expand to see the full section)"
                         );
                     }
-                    return;
+                    return (out.len(), None);
                 }
             }
         }
@@ -552,13 +821,15 @@ fn format_single_match(
     let current_mtime = std::fs::metadata(&m.path)
         .ok()
         .and_then(|md| md.modified().ok());
-    let deduped = m.is_definition
-        && m.def_range.is_some()
-        && session
-            .is_some_and(|s| current_mtime.is_some_and(|t| s.is_expanded(&m.path, m.line, t)));
-    // expand_match always prints a range containing m.line (def_range starts
-    // at m.line for definitions; the ±10 fallback for def_range: None / usages
-    // trivially contains it), so the raw "-> [line] text" preview would
+    let marked_line = m
+        .def_range
+        .filter(|_| m.is_definition && session.previous.is_some())
+        .map(|(start, _)| expansion_line(m, start));
+    let deduped = marked_line
+        .is_some_and(|line| current_mtime.is_some_and(|t| session.is_expanded(&m.path, line, t)));
+    // expand_match always prints a range containing m.line (a definition's
+    // def_range holds its name line; the ±10 fallback for def_range: None /
+    // usages trivially contains it), so the raw "-> [line] text" preview would
     // reprint m.text byte-for-byte inside the fence below. Only the
     // structural outline_context (neighboring entries' signatures, not the
     // matched line's own source) survives alongside an expansion.
@@ -576,6 +847,11 @@ fn format_single_match(
         let _ = write!(out, "\n-> [{}]   {}", m.line, m.text);
     }
 
+    // Everything from here on is the expansion, which a tight budget can
+    // drop while keeping the lines above.
+    let body_start = out.len();
+    let mut expansion = None;
+
     if *expand_remaining > 0 {
         if deduped {
             if let Some((start, end)) = m.def_range {
@@ -592,13 +868,8 @@ fn format_single_match(
             let skip = multi_file && expanded_files.contains(&m.path);
             if !skip {
                 if let Some((code, content)) = expand_match(m, scope) {
-                    if m.is_definition && m.def_range.is_some() {
-                        if let (Some(s), Some(t)) = (session, current_mtime) {
-                            s.record_expand(&m.path, m.line, t);
-                        }
-                    }
-
-                    let file_type = tilth_core::lang::detect_file_type(&m.path);
+                    let file_type =
+                        tilth_core::lang::detect_file_type_with_content(&m.path, &content);
                     let mut skip_lines = strip::strip_noise(&content, &m.path, m.def_range);
 
                     if let Some((def_start, def_end)) = m.def_range {
@@ -629,6 +900,15 @@ fn format_single_match(
                     out.push_str(&stripped_code);
 
                     if m.is_definition && m.def_range.is_some() {
+                        if let (Some(line), Some(mtime)) = (marked_line, current_mtime) {
+                            session.staged.insert((m.path.clone(), line, mtime));
+                            expansion = Some(Expansion {
+                                path: m.path.clone(),
+                                line,
+                                mtime,
+                                end: out.len(),
+                            });
+                        }
                         if let tilth_core::types::FileType::Code(lang) = file_type {
                             let callee_names = tilth_core::search::callees::extract_callee_names(
                                 &content,
@@ -730,6 +1010,7 @@ fn format_single_match(
             }
         }
     }
+    (body_start, expansion)
 }
 
 /// Format a symbol/content search result.
@@ -864,8 +1145,8 @@ fn basename_file_outline(
         .or_else(|| find_basename_fallback(scope, &query_lower))?;
 
     // Read file and generate outline
-    let content = std::fs::read_to_string(&matched_path).ok()?;
-    let file_type = tilth_core::lang::detect_file_type(&matched_path);
+    let content = tilth_core::source::read_source(&matched_path).ok()?;
+    let file_type = tilth_core::lang::detect_file_type_with_content(&matched_path, &content);
     let mtime = std::fs::metadata(&matched_path)
         .and_then(|m| m.modified())
         .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
@@ -891,6 +1172,11 @@ fn basename_file_outline(
     ))
 }
 
+#[expect(
+    clippy::too_many_lines,
+    clippy::unnecessary_wraps,
+    reason = "renderers become functions of a result model in #311"
+)]
 fn format_search_result(
     result: &SearchResult,
     cache: &OutlineCache,
@@ -908,9 +1194,10 @@ fn format_search_result(
         result.usages,
     );
     let mut out = header;
+    let mut render_session = RenderSession::new(session);
     let mut expand_remaining = expand;
     let mut expanded_files = HashSet::new();
-    let mut segments: Vec<(i64, usize, usize)> = Vec::new();
+    let mut segments: Vec<alloc::Block> = Vec::new();
 
     // File-level retrieval: when a file basename matches the query exactly,
     // prepend a compact outline so the agent gets file-level context first.
@@ -941,7 +1228,7 @@ fn format_search_result(
                 &faceted.definitions,
                 &result.scope,
                 cache,
-                session,
+                &mut render_session,
                 bloom,
                 &mut expand_remaining,
                 &mut expanded_files,
@@ -966,7 +1253,7 @@ fn format_search_result(
                 &faceted.implementations,
                 &result.scope,
                 cache,
-                session,
+                &mut render_session,
                 bloom,
                 &mut expand_remaining,
                 &mut expanded_files,
@@ -1010,7 +1297,7 @@ fn format_search_result(
                 &faceted.usages_local,
                 &result.scope,
                 cache,
-                session,
+                &mut render_session,
                 bloom,
                 &mut expand_remaining,
                 &mut expanded_files,
@@ -1035,7 +1322,7 @@ fn format_search_result(
                 &faceted.usages_cross,
                 &result.scope,
                 cache,
-                session,
+                &mut render_session,
                 bloom,
                 &mut expand_remaining,
                 &mut expanded_files,
@@ -1072,7 +1359,7 @@ fn format_search_result(
             &result.matches,
             &result.scope,
             cache,
-            session,
+            &mut render_session,
             bloom,
             &mut expand_remaining,
             &mut expanded_files,
@@ -1092,18 +1379,24 @@ fn format_search_result(
         }
     }
 
+    out.push_str(&skipped_large_note(result));
+
     // Apply value-based budget allocation before appending the token footer.
     // Under-budget: byte-identical. Over-budget: drops lowest-value match blocks.
     // budget.unwrap_or(DEFAULT_BUDGET) keeps the no-budget path byte-identical
     // to before this fix — DEFAULT_BUDGET remains the default, it is simply no
     // longer a hardcode that shadows a real caller-supplied budget.
     let budget_tokens = budget.unwrap_or(crate::budget::DEFAULT_BUDGET);
-    out = crate::search::alloc::fit_to_budget(&out, &segments, budget_tokens);
+    out = alloc::fit_to_budget(&out, &mut segments, budget_tokens);
 
     let tokens = estimate_tokens(out.len() as u64);
     let token_str = format_token_count(tokens);
     let _ = write!(out, "\n\n({token_str} tokens)");
 
+    if let Some(session) = session {
+        let expansions = segments.into_iter().filter_map(|block| block.expansion);
+        record_visible_expansions(session, &out, budget, expansions);
+    }
     Ok(out)
 }
 
@@ -1114,7 +1407,7 @@ fn format_search_result(
 /// For definitions: use tree-sitter node range (`def_range`).
 /// For usages: ±10 lines around the match.
 fn expand_match(m: &Match, scope: &Path) -> Option<(String, String)> {
-    let content = fs::read_to_string(&m.path).ok()?;
+    let content = tilth_core::source::read_source(&m.path).ok()?;
     let lines: Vec<&str> = content.lines().collect();
     let total = lines.len() as u32;
 
@@ -1123,7 +1416,7 @@ fn expand_match(m: &Match, scope: &Path) -> Option<(String, String)> {
     } else {
         let (s, e) = m
             .def_range
-            .unwrap_or((m.line.saturating_sub(10), m.line.saturating_add(10)));
+            .unwrap_or_else(|| (m.line.saturating_sub(10), m.line.saturating_add(10)));
         (s.max(1), e.min(total))
     };
 
@@ -1226,19 +1519,22 @@ fn flush_gap_marker(kept: &mut Vec<String>, consecutive_skipped: &mut u32) {
 
 /// Get cached outline string for a file. Returns None for non-code or huge files.
 fn get_outline_str(path: &std::path::Path, cache: &OutlineCache) -> Option<std::sync::Arc<str>> {
-    let file_type = tilth_core::lang::detect_file_type(path);
-    if !matches!(file_type, FileType::Code(_)) {
+    if !matches!(tilth_core::lang::detect_file_type(path), FileType::Code(_)) {
         return None;
     }
     let meta = std::fs::metadata(path).ok()?;
     let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-    if meta.len() > 500_000 {
+    if meta.len() > tilth_core::source::MAX_FILE_SIZE {
         return None;
     }
+    // The cache is shared with read and map, so the language comes from the
+    // content as theirs does: a `.h` holding C++ is C++.
     Some(cache.get_or_compute(path, mtime, || {
-        let content = std::fs::read_to_string(path).unwrap_or_default();
-        let buf = content.as_bytes();
-        read::outline::generate(path, file_type, &content, buf, false)
+        // An unreadable file gets an empty outline, so its matches show no
+        // outline context; the matches themselves are reported either way.
+        let content = tilth_core::source::read_source(path).unwrap_or_default();
+        let file_type = tilth_core::lang::detect_file_type_with_content(path, &content);
+        read::outline::generate(path, file_type, &content, content.as_bytes(), false)
     }))
 }
 
@@ -1312,7 +1608,7 @@ fn markdown_enclosing_scope(path: &std::path::Path, match_line: u32) -> Option<S
     if match_line == 0 {
         return None;
     }
-    let content = std::fs::read_to_string(path).ok()?;
+    let content = tilth_core::source::read_source(path).ok()?;
     let tree = tilth_core::lang::outline::parse_markdown(&content)?;
     let lines: Vec<&str> = content.lines().collect();
     let mut best: Option<(tree_sitter::Node, u32)> = None;
@@ -1393,6 +1689,10 @@ fn extract_line_range(line: &str) -> Option<(u32, u32)> {
 }
 
 /// Format glob search results (file list with previews).
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "renderers become functions of a result model in #311"
+)]
 fn format_glob_result(result: &glob::GlobResult, scope: &Path) -> Result<String, TilthError> {
     let header = format!(
         "# Glob: \"{}\" in {} — {} files",
@@ -1426,6 +1726,10 @@ fn format_glob_result(result: &glob::GlobResult, scope: &Path) -> Result<String,
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "by design: tests read the files they check directly"
+)]
 mod tests {
     use super::*;
     use std::collections::HashSet;
@@ -1487,29 +1791,29 @@ mod tests {
         let bloom = tilth_core::index::bloom::BloomFilterCache::new();
         let single: std::collections::HashSet<String> =
             std::iter::once("walker".to_string()).collect();
-        let rs_callers = tilth_core::find_callers_batch(
-            &single,
-            &scope,
-            &bloom,
-            Some("*.rs"),
-            tilth_core::search::callers::BATCH_EARLY_QUIT,
-        )
-        .expect("callers failed");
+        let rs_callers =
+            tilth_core::find_callers_batch(&single, &scope, &bloom, Some("*.rs"), None, |sites| {
+                sites
+            })
+            .expect("callers failed");
         let toml_callers = tilth_core::find_callers_batch(
             &single,
             &scope,
             &bloom,
             Some("*.toml"),
-            tilth_core::search::callers::BATCH_EARLY_QUIT,
+            None,
+            |sites| sites,
         )
         .expect("callers toml failed");
+        let rs_callers: Vec<_> = rs_callers.per_file.into_iter().flatten().collect();
+        let toml_has_callers = toml_callers.per_file.into_iter().flatten().next().is_some();
 
         assert!(
             !rs_callers.is_empty(),
             "*.rs should find callers of 'walker'"
         );
         assert!(
-            toml_callers.is_empty(),
+            !toml_has_callers,
             "*.toml should not find callers of 'walker'"
         );
         for (_, c) in &rs_callers {
@@ -1675,7 +1979,7 @@ mod tests {
         std::fs::write(&p, "class Foo {\n  bar() {\n    const x = 1;\n  }\n}\n").unwrap();
 
         let m = Match {
-            path: p.clone(),
+            path: p,
             line: 3,
             text: "    const x = 1;".to_string(),
             is_definition: false,
@@ -1697,7 +2001,7 @@ mod tests {
             &m,
             tmp.path(),
             &cache,
-            None,
+            &mut RenderSession::new(None),
             &bloom,
             &mut expand_remaining,
             &mut expanded_files,
@@ -1726,7 +2030,7 @@ mod tests {
         std::fs::write(&p, src).unwrap();
 
         let m = Match {
-            path: p.clone(),
+            path: p,
             line: 4,
             text: "    pub fn exit_code(&self) -> i32 {".to_string(),
             is_definition: true,
@@ -1748,7 +2052,7 @@ mod tests {
             &m,
             tmp.path(),
             &cache,
-            None,
+            &mut RenderSession::new(None),
             &bloom,
             &mut expand_remaining,
             &mut expanded_files,
@@ -1846,7 +2150,7 @@ mod tests {
         // Mimic the `Match` `find_defs_markdown_buf` would produce for a
         // markdown-heading def: weight 30, def_range covers the section span.
         let m = Match {
-            path: p.clone(),
+            path: p,
             line: 3, // `## Session 50`
             text: "## Session 50".to_string(),
             is_definition: true,
@@ -1868,7 +2172,7 @@ mod tests {
             &m,
             tmp.path(),
             &cache,
-            None,
+            &mut RenderSession::new(None),
             &bloom,
             &mut expand_remaining,
             &mut expanded_files,
@@ -1904,7 +2208,7 @@ mod tests {
         std::fs::write(&p, &content).unwrap();
 
         let m = Match {
-            path: p.clone(),
+            path: p,
             line: 1,
             text: "## Big Section".to_string(),
             is_definition: true,
@@ -1926,7 +2230,7 @@ mod tests {
             &m,
             tmp.path(),
             &cache,
-            None,
+            &mut RenderSession::new(None),
             &bloom,
             &mut expand_remaining,
             &mut expanded_files,
@@ -1976,7 +2280,7 @@ mod tests {
         std::fs::write(&p, &content).unwrap();
 
         let m = Match {
-            path: p.clone(),
+            path: p,
             line: 1,
             text: "## Big Section".to_string(),
             is_definition: true,
@@ -1999,7 +2303,7 @@ mod tests {
             &m,
             tmp.path(),
             &cache,
-            None,
+            &mut RenderSession::new(None),
             &bloom,
             &mut expand_remaining,
             &mut expanded_files,
@@ -2115,7 +2419,7 @@ mod tests {
         let cache = OutlineCache::new();
         let bloom = BloomFilterCache::new();
         let mut out = String::from("HEADER");
-        let mut segments: Vec<(i64, usize, usize)> = Vec::new();
+        let mut segments: Vec<alloc::Block> = Vec::new();
         let mut expand_remaining = 0usize;
         let mut expanded_files = HashSet::new();
 
@@ -2123,7 +2427,7 @@ mod tests {
             &matches,
             tmp.path(),
             &cache,
-            None,
+            &mut RenderSession::new(None),
             &bloom,
             &mut expand_remaining,
             &mut expanded_files,
@@ -2135,14 +2439,19 @@ mod tests {
         assert_eq!(segments.len(), 3, "expected one segment per match");
 
         // Values must match def_weight casts.
-        assert_eq!(segments[0].0, 30i64);
-        assert_eq!(segments[1].0, 10i64);
-        assert_eq!(segments[2].0, 50i64);
+        assert_eq!(segments[0].value, 30i64);
+        assert_eq!(segments[1].value, 10i64);
+        assert_eq!(segments[2].value, 50i64);
 
         // Ranges must be valid, non-empty, and non-overlapping.
         let mut cursor = "HEADER".len();
-        for (i, &(_, start, end)) in segments.iter().enumerate() {
+        for (i, b) in segments.iter().enumerate() {
+            let (start, end) = (b.start, b.end);
             assert!(start >= cursor, "segment {i} start < cursor");
+            assert!(
+                (start..=end).contains(&b.body_start),
+                "segment {i} body start outside the block"
+            );
             assert!(end > start, "segment {i} is empty");
             assert!(end <= out.len(), "segment {i} end out of bounds");
             // Slice must not panic (validates char-boundary alignment).
@@ -2161,7 +2470,7 @@ mod tests {
     /// explicit budget, the positional tail-cut (`budget::apply`) keeps
     /// whatever rendered first (the low-value usage) and severs the
     /// definition; value-based selection (`fit_to_budget`) keeps the
-    /// definition (highest value) and drops the usage instead.
+    /// definition (highest value) and cuts the usage's expansion instead.
     #[test]
     fn search_symbol_expanded_threads_real_budget_into_value_selection() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2174,8 +2483,8 @@ mod tests {
         // definition's own boosts (def_weight*10 + definition_name_boost) so
         // this usage renders FIRST in the linear (<=5 match) format path.
         // Padded with filler lines so its expanded block is large enough that
-        // budget 400 must drop ONE of the two blocks — proving which one a
-        // real budget drops (positional: whichever renders last; value-based:
+        // budget 400 must cut ONE of the two blocks — proving which one a
+        // real budget cuts (positional: whichever renders last; value-based:
         // the lower-value one, regardless of render order).
         let mut usage_body = String::from("fn calls_it() {\n    budget_probe_target();\n");
         for i in 0..60 {
@@ -2207,9 +2516,11 @@ mod tests {
             "value-based selection must keep the highest-value block (the \
              definition) even though it rendered last: {out}"
         );
+        // The lower-value usage keeps its location and loses its expansion.
         assert!(
-            out.contains("lower-value match(es) omitted to fit budget"),
-            "must show fit_to_budget's value-based omission marker, not \
+            out.contains("### budget_probe_target.rs:2 [usage in function calls_it]")
+                && out.contains("expansion omitted to fit budget"),
+            "must show fit_to_budget's value-based cut, not \
              budget::apply's positional \"... truncated\" marker: {out}"
         );
         assert!(
@@ -2217,6 +2528,44 @@ mod tests {
             "positional tail-cut marker must not appear — the real budget \
              was supposed to reach fit_to_budget directly: {out}"
         );
+    }
+
+    /// A block was kept or dropped whole, so a definition whose expanded
+    /// body alone overran the budget vanished, and the note called it the
+    /// "lower-value" match while the usage stayed. The definition must keep
+    /// its location and lose only its body.
+    #[test]
+    fn a_tight_budget_keeps_the_definition_without_its_body() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut body = String::from("pub fn big_target() {\n");
+        for i in 0..400 {
+            let _ = writeln!(body, "    let v{i} = {i} + 1;");
+        }
+        body.push_str("}\n\nfn user() {\n    big_target();\n}\n");
+        std::fs::write(tmp.path().join("big.rs"), body).unwrap();
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = tilth_core::index::bloom::BloomFilterCache::new();
+        let out = search_symbol_expanded(
+            "big_target",
+            tmp.path(),
+            &cache,
+            &session,
+            &bloom,
+            1,
+            None,
+            None,
+            false,
+            Some(300),
+        )
+        .unwrap();
+
+        assert!(out.contains("### big.rs:1-402 [definition]"), "{out}");
+        assert!(out.contains("expansion omitted to fit budget"), "{out}");
+        assert!(out.contains("[usage in function user]"), "{out}");
+        assert!(!out.contains("lower-value match(es) omitted"), "{out}");
+        assert!(!out.contains("let v399"), "{out}");
     }
 
     /// Regression guard: omitting the budget (`None`) must produce byte-
@@ -2379,5 +2728,278 @@ mod tests {
             multi.contains("10 of 15 matches"),
             "each multi-symbol section header must disclose its own cap: {multi}"
         );
+    }
+
+    /// A byte-order mark must not reach search output: a match on line 1
+    /// printed a stray U+FEFF in front of the code, and a definition there
+    /// carried it in its signature.
+    #[test]
+    fn a_byte_order_mark_stays_out_of_search_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("m.py"),
+            "\u{feff}def bom_func():\n    return 1\n\nbom_func()\n",
+        )
+        .unwrap();
+        let cache = OutlineCache::new();
+        for out in [
+            search_symbol("bom_func", tmp.path(), &cache, None, false).unwrap(),
+            search_content("bom_func", tmp.path(), &cache, None, false).unwrap(),
+            search_regex("bom_f.nc", tmp.path(), &cache, None, false).unwrap(),
+        ] {
+            assert!(out.contains("bom_func"), "{out}");
+            assert!(!out.contains('\u{feff}'), "stray BOM in: {out}");
+        }
+    }
+
+    /// A file over the size limit that contains the query used to vanish:
+    /// "0 matches" and no word about the file. Search names it now, and
+    /// stays quiet about big files that do not contain the query.
+    #[test]
+    fn a_file_over_the_size_limit_is_named_when_it_holds_the_query() {
+        let tmp = tempfile::tempdir().unwrap();
+        let limit = usize::try_from(tilth_core::source::MAX_FILE_SIZE).unwrap();
+        let filler = "// padding line to push the file over the size limit\n";
+        let pad = filler.repeat(limit / filler.len() + 1);
+        std::fs::write(
+            tmp.path().join("big.rs"),
+            format!("{pad}pub fn needle_target_fn() {{}}\n"),
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("other_big.rs"), &pad).unwrap();
+        std::fs::write(tmp.path().join("small.rs"), "fn unrelated() {}\n").unwrap();
+        let cache = OutlineCache::new();
+        for (query, out) in [
+            (
+                "needle_target_fn",
+                search_symbol("needle_target_fn", tmp.path(), &cache, None, false).unwrap(),
+            ),
+            (
+                "needle_target_fn",
+                search_content("needle_target_fn", tmp.path(), &cache, None, false).unwrap(),
+            ),
+            (
+                "needle_t.rget_fn",
+                search_regex("needle_t.rget_fn", tmp.path(), &cache, None, false).unwrap(),
+            ),
+        ] {
+            let note =
+                format!("\n> 1 file over 500 KB contains `{query}` and was not searched: big.rs");
+            assert!(out.contains(&note), "the skipped file must be named: {out}");
+            assert!(!out.contains("other_big.rs"), "{out}");
+        }
+        let quiet = search_symbol("unrelated", tmp.path(), &cache, None, false).unwrap();
+        assert!(!quiet.contains("not searched"), "{quiet}");
+    }
+
+    /// A big binary file (a database, an archive) was read whole on every
+    /// search to look for the query in it, and was named when its bytes
+    /// happened to spell it. Search never reads binary files, so the note
+    /// must not name one either.
+    #[test]
+    fn a_big_binary_file_is_not_named_as_holding_the_query() {
+        let tmp = tempfile::tempdir().unwrap();
+        let limit = usize::try_from(tilth_core::source::MAX_FILE_SIZE).unwrap();
+        let mut bytes = b"SQLite format 3\0".to_vec();
+        bytes.resize(limit + 1, 0);
+        bytes.extend_from_slice(b"\nneedle_target_fn\n");
+        std::fs::write(tmp.path().join("data.db"), bytes).unwrap();
+        let cache = OutlineCache::new();
+        for out in [
+            search_symbol("needle_target_fn", tmp.path(), &cache, None, false).unwrap(),
+            search_content("needle_target_fn", tmp.path(), &cache, None, false).unwrap(),
+        ] {
+            assert!(!out.contains("not searched"), "{out}");
+        }
+    }
+
+    /// A minified bundle is one line. The check held a line of at most
+    /// 1 MiB, so a 2 MB one-line file that holds the query near its start
+    /// errored, the error was dropped, and the file was no longer named.
+    #[test]
+    fn a_big_one_line_file_is_named_when_it_holds_the_query() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut bytes = b"var a=1;function needle_target_fn(){return a};".to_vec();
+        bytes.resize(2_000_000, b'a');
+        std::fs::write(tmp.path().join("bundle.js"), bytes).unwrap();
+        let cache = OutlineCache::new();
+        for out in [
+            search_symbol("needle_target_fn", tmp.path(), &cache, None, false).unwrap(),
+            search_content("needle_target_fn", tmp.path(), &cache, None, false).unwrap(),
+            search_regex("needle_t.rget_fn", tmp.path(), &cache, None, false).unwrap(),
+        ] {
+            assert!(out.contains("not searched: bundle.js"), "{out}");
+        }
+    }
+
+    /// A text file is binary to tilth only when a NUL byte sits in its
+    /// first 512 bytes, the rule the read path uses. The check stopped at
+    /// any NUL, so a big log with one stray NUL in the middle was not named.
+    #[test]
+    fn a_big_log_with_a_stray_nul_is_named_when_it_holds_the_query() {
+        let tmp = tempfile::tempdir().unwrap();
+        let limit = usize::try_from(tilth_core::source::MAX_FILE_SIZE).unwrap();
+        let filler = "2026-11-11 12:00:00 INFO a log line\n";
+        let pad = filler.repeat(limit / filler.len() + 1);
+        std::fs::write(
+            tmp.path().join("app.log"),
+            format!("{pad}\0stray\n{pad}needle_target_fn failed\n"),
+        )
+        .unwrap();
+        let cache = OutlineCache::new();
+        for out in [
+            search_symbol("needle_target_fn", tmp.path(), &cache, None, false).unwrap(),
+            search_content("needle_target_fn", tmp.path(), &cache, None, false).unwrap(),
+        ] {
+            assert!(out.contains("not searched: app.log"), "{out}");
+        }
+    }
+
+    /// The caller walk skipped big files with no word, so callers, grok and
+    /// deps answered as if the big file did not exist. They name it now.
+    #[test]
+    fn caller_walks_name_a_big_file_that_holds_the_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let limit = usize::try_from(tilth_core::source::MAX_FILE_SIZE).unwrap();
+        let filler = "// padding line to push the file over the size limit\n";
+        let pad = filler.repeat(limit / filler.len() + 1);
+        std::fs::write(
+            tmp.path().join("lib.rs"),
+            "pub fn big_callee() {}\nfn small_caller() { big_callee(); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("big.rs"),
+            format!("{pad}fn big_caller() {{ crate::big_callee(); }}\n"),
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("other_big.rs"), &pad).unwrap();
+        let bloom = tilth_core::index::bloom::BloomFilterCache::new();
+
+        let callers = callers::search_callers_expanded(
+            "big_callee",
+            tmp.path(),
+            &bloom,
+            0,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let multi = callers::search_callers_multi_expanded(
+            &["big_callee", "small_caller"],
+            tmp.path(),
+            &bloom,
+            0,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let grok = crate::run_grok("big_callee", tmp.path(), false).unwrap();
+        let deps = crate::run_deps(&tmp.path().join("lib.rs"), tmp.path(), None, false).unwrap();
+        for (held, out) in [
+            ("`big_callee`", callers),
+            ("`big_callee` or `small_caller`", multi),
+            ("`big_callee`", grok),
+            ("a name from `lib.rs`", deps),
+        ] {
+            let note =
+                format!("\n> 1 file over 500 KB contains {held} and was not searched: big.rs");
+            assert!(out.contains(&note), "the skipped file must be named: {out}");
+            assert!(!out.contains("other_big.rs"), "{out}");
+        }
+    }
+
+    /// The names a skipped file was checked for read as one phrase, and a
+    /// long list ends in a count.
+    #[test]
+    fn names_read_as_one_phrase() {
+        assert_eq!(names_phrase([]), "");
+        assert_eq!(names_phrase(["a"]), "`a`");
+        assert_eq!(names_phrase(["b", "a", "b"]), "`a` or `b`");
+        assert_eq!(names_phrase(["c", "a", "b"]), "`a`, `b` or `c`");
+        assert_eq!(
+            names_phrase(["a", "b", "c", "d"]),
+            "`a`, `b`, `c` or 1 other name"
+        );
+        assert_eq!(
+            names_phrase(["a", "b", "c", "d", "e"]),
+            "`a`, `b`, `c` or 2 other names"
+        );
+    }
+
+    /// The outline cache is shared by read, search and map, keyed by path
+    /// and mtime. Search's outline context read a `.h` by its path alone,
+    /// as C, so the outline cached for a C++ header depended on which tool
+    /// reached it first.
+    #[test]
+    fn search_outline_context_reads_a_cpp_header_as_cpp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("shape.h");
+        std::fs::write(
+            &path,
+            "#pragma once\nclass Shape {\n public:\n  int area() const { return 0; }\n  int sides() { return 4; }\n};\n",
+        )
+        .unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        let file_type = tilth_core::lang::detect_file_type_with_content(&path, &content);
+        assert_eq!(file_type, FileType::Code(tilth_core::types::Lang::Cpp));
+        let expected =
+            read::outline::generate(&path, file_type, &content, content.as_bytes(), false);
+        let cache = OutlineCache::new();
+        assert_eq!(
+            get_outline_str(&path, &cache).as_deref(),
+            Some(expected.as_str())
+        );
+    }
+
+    /// A qualified query's notes say what they know. A big file was named as
+    /// holding "the query" when it held only the bare name, and dotted text
+    /// such as `res.send` got "No `send` is defined in `res`" when nothing
+    /// but free definitions of `send` exist: `res` is a variable, not an
+    /// owner. The owner note stays for a qualifier that names the wrong type.
+    #[test]
+    fn a_qualified_query_notes_only_what_holds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let limit = usize::try_from(tilth_core::source::MAX_FILE_SIZE).unwrap();
+        let filler = "// padding line to push the file over the size limit\n";
+        let pad = filler.repeat(limit / filler.len() + 1);
+        std::fs::write(tmp.path().join("big.rs"), format!("{pad}fn run() {{}}\n")).unwrap();
+        std::fs::write(
+            tmp.path().join("m.rs"),
+            "pub struct A;\nimpl A {\n    pub fn run(&self) {}\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("response.js"),
+            "var send = require('send');\nfunction reply(res) {\n  res.send('ok');\n}\n",
+        )
+        .unwrap();
+        let cache = OutlineCache::new();
+
+        let out = search_symbol("B::run", tmp.path(), &cache, None, false).unwrap();
+        assert!(out.contains("not searched: big.rs"), "{out}");
+        assert!(out.contains("contains `run` and was"), "{out}");
+        assert!(out.contains("No `run` is defined in `B`"), "{out}");
+
+        let out = search_symbol("res.send", tmp.path(), &cache, None, false).unwrap();
+        assert!(out.contains("response.js:3"), "{out}");
+        assert!(!out.contains("is defined in"), "{out}");
+
+        // A multi-target walk looks for each target's bare name, once.
+        let bloom = tilth_core::index::bloom::BloomFilterCache::new();
+        let out = callers::search_callers_multi_expanded(
+            &["A.run", "start", "B::run"],
+            tmp.path(),
+            &bloom,
+            0,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(out.contains("not searched: big.rs"), "{out}");
+        assert!(out.contains("contains `run` or `start` and was"), "{out}");
     }
 }
