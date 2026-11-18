@@ -1097,7 +1097,7 @@ mod tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let info = parse_cargo_toml(root).expect("should parse Cargo.toml");
 
-        assert_eq!(info.name.as_deref(), Some("tilth"));
+        assert_eq!(info.name.as_deref(), Some("tilth-fork"));
         assert!(info.version.is_some(), "should have a version");
         assert!(
             info.deps.iter().any(|d| d == "clap"),
