@@ -102,7 +102,10 @@ fn only_the_runner_starts_git() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut files = Vec::new();
     for package in PACKAGES {
-        rust_files(&root.join(package).join("src"), &mut files).expect("list the source files");
+        let source = root.join(package).join("src");
+        if source.is_dir() {
+            rust_files(&source, &mut files).expect("list the source files");
+        }
     }
 
     let mut in_runner = 0;
