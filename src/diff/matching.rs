@@ -65,7 +65,10 @@ fn pair_overloads(
         let twin = new_indices
             .iter()
             .enumerate()
-            .find(|(slot, &ni)| !new_used[*slot] && old[oi].content_hash == new[ni].content_hash);
+            .find(|entry| {
+                let (slot, ni) = *entry;
+                !new_used[slot] && old[oi].content_hash == new[*ni].content_hash
+            });
         if let Some((slot, &ni)) = twin {
             new_used[slot] = true;
             pairs.push((oi, ni));

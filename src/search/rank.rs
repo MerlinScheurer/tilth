@@ -210,7 +210,7 @@ fn context_proximity(
         let match_root = pkg_cache.entry(match_dir).or_insert_with_key(|dir| {
             tilth_core::lang::package_root(dir).map(std::path::Path::to_path_buf)
         });
-        if let Some(ref mr) = match_root {
+        if let Some(mr) = match_root.as_ref() {
             if mr == cp_root {
                 score += 75;
             }

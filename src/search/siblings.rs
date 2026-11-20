@@ -99,7 +99,7 @@ pub fn extract_sibling_references(content: &str, lang: Lang, def_range: (u32, u3
 
         // For Go: verify @recv matches the receiver parameter name
         if lang == Lang::Go {
-            if let (Some(ri), Some(ref recv_name)) = (recv_idx, &go_receiver) {
+            if let (Some(ri), Some(recv_name)) = (recv_idx, go_receiver.as_ref()) {
                 let recv_ok = m.captures().iter().any(|c| {
                     c.index == ri
                         && c.node

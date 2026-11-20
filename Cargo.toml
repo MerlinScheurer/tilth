@@ -10,9 +10,9 @@
 # See Cargo.toml.orig for the original contents.
 
 [package]
-edition = "2021"
+edition = "2024"
 name = "tilth-fork"
-version = "0.15.2"
+version = "0.15.3"
 build = false
 autolib = false
 autobins = false
