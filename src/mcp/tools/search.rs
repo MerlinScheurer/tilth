@@ -143,9 +143,33 @@ pub(in crate::mcp) fn tool_search(
     }
     .map_err(|e| e.to_string())?;
 
+    let output = without_token_usage_footer(&output);
     let mut result = scope_warning.unwrap_or_default();
-    result.push_str(&apply_budget(&output, budget));
+    result.push_str(&apply_budget(output, budget));
     Ok(result)
+}
+
+/// Search formatters append an estimate of their own response size for CLI
+/// use. It is not useful in the MCP result, where the host handles token
+/// accounting, so omit only that final generated footer.
+fn without_token_usage_footer(output: &str) -> &str {
+    let Some((body, footer)) = output.rsplit_once("\n\n(") else {
+        return output;
+    };
+    let Some(count) = footer.strip_suffix(" tokens)") else {
+        return output;
+    };
+    let Some(count) = count.strip_prefix('~') else {
+        return output;
+    };
+    if count.is_empty()
+        || !count
+            .bytes()
+            .all(|b| b.is_ascii_digit() || matches!(b, b'.' | b'k'))
+    {
+        return output;
+    }
+    body
 }
 
 #[cfg(test)]
@@ -154,6 +178,23 @@ mod tests {
     use crate::session::Session;
     use tilth_core::cache::OutlineCache;
     use tilth_core::index::bloom::BloomFilterCache;
+
+    #[test]
+    fn mcp_search_omits_only_the_generated_token_usage_footer() {
+        assert_eq!(
+            without_token_usage_footer("results\n\n(~507 tokens)"),
+            "results"
+        );
+        assert_eq!(
+            without_token_usage_footer("results\n\n(~1.2k tokens)"),
+            "results"
+        );
+        assert_eq!(
+            without_token_usage_footer("results mention tokens\n\n(custom footer)"),
+            "results mention tokens\n\n(custom footer)"
+        );
+        assert_eq!(without_token_usage_footer("results"), "results");
+    }
 
     /// Regression: `kind=callers` with a comma query must search each target
     /// separately, not for a literal symbol named "alpha,beta". Before the
