@@ -12,7 +12,7 @@
 [package]
 edition = "2021"
 name = "tilth-fork"
-version = "0.15.1"
+version = "0.15.2"
 build = false
 autolib = false
 autobins = false
